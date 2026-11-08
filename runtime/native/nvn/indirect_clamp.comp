@@ -1,0 +1,29 @@
+// Validates indirect arguments on the GPU (see Dispatch and DrawMeshTasksIndirect in render.cpp).
+// Regenerate with
+//   glslangValidator -V --target-env vulkan1.2 --vn indirect_clamp_spv indirect_clamp.comp -o indirect_clamp_spv.h
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference : require
+layout(local_size_x = 1) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Grid { uint x; uint y; uint z; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer MeshTasks { uint count; uint first; };
+// destination bit 0: the source is NVN's mesh-task command {task count, first task} (the order of
+// VK_NV_mesh_shader's indirect command; the game's culling writes counts to the first word), written as
+// Vulkan's {count, 1, 1} (a nonzero first task, which Vulkan cannot express, draws nothing).
+layout(push_constant) uniform Parameters { uint64_t source; uint64_t destination; } p;
+void main() {
+    uint x, y, z;
+    if ((p.destination & 1ul) != 0ul) {
+        MeshTasks s = MeshTasks(p.source);
+        x = s.first == 0u ? s.count : 0u; y = 1u; z = 1u;
+        if (x > 4194303u) x = 0u;
+    } else {
+        Grid s = Grid(p.source);
+        x = s.x; y = s.y; z = s.z;
+        // Counts from unfinished or garbage data would make a dispatch run for seconds (device lost):
+        // dispatch nothing instead.
+        if (x > 65535u || y > 65535u || z > 65535u || uint64_t(x) * uint64_t(y) * uint64_t(z) > 4194304ul) { x = 0u; y = 0u; z = 0u; }
+    }
+    Grid d = Grid(p.destination & ~uint64_t(15));
+    d.x = x; d.y = y; d.z = z;
+}

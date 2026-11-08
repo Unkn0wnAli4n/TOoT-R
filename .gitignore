@@ -1,0 +1,7 @@
+.dev/
+build/
+build-*/
+work/
+*.log
+__pycache__/
+dist/
