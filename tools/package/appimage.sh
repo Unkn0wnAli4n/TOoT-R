@@ -4,18 +4,19 @@
 set -euo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 work="$root/.dev/package"; app="$work/AppDir"; dist="$root/dist"
-python_url="https://github.com/astral-sh/python-build-standalone/releases/download/20250317/cpython-3.12.9+20250317-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+python_url="https://github.com/astral-sh/python-build-standalone/releases/download/20261013/cpython-3.12.15+20261013-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
 tool_url="https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"
 runtime_url="https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64"
 mkdir -p "$work" "$dist"
 fetch() { [[ -s "$2" ]] || { curl -fL --retry 8 --retry-delay 5 --retry-all-errors -o "$2.part" "$1" && mv "$2.part" "$2"; }; }
-fetch "$python_url" "$work/python.tar.gz"
+# (Tk 9: the Tk 8.6 of earlier builds aborted in Xlib as soon as a text entry was shown)
+fetch "$python_url" "$work/python-20261013.tar.gz"
 fetch "$tool_url" "$work/appimagetool"
 fetch "$runtime_url" "$work/runtime-x86_64"
 chmod +x "$work/appimagetool"
 
 rm -rf "$app"; mkdir -p "$app/usr" "$app/source"
-tar -xzf "$work/python.tar.gz" -C "$app/usr"   # -> usr/python
+tar -xzf "$work/python-20261013.tar.gz" -C "$app/usr"   # -> usr/python
 rm -rf "$app/usr/python/lib/python3.12/"{test,idlelib,ensurepip,turtledemo,lib2to3,pydoc_data} \
        "$app/usr/python/include" "$app/usr/python/share"
 # The source tree as committed (no build outputs or development files).
@@ -23,7 +24,7 @@ rm -rf "$app/usr/python/lib/python3.12/"{test,idlelib,ensurepip,turtledemo,lib2t
 cat > "$app/AppRun" <<'RUN'
 #!/bin/sh
 here="$(dirname "$(readlink -f "$0")")"
-export TOOTR_SOURCE="$here/source" TCL_LIBRARY="$here/usr/python/lib/tcl8.6" TK_LIBRARY="$here/usr/python/lib/tk8.6"
+export TOOTR_SOURCE="$here/source"
 exec "$here/usr/python/bin/python3" "$here/source/installer/gui.py" "$@"
 RUN
 chmod +x "$app/AppRun"
