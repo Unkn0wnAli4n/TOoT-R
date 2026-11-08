@@ -1,0 +1,38 @@
+// GPU-side NVN sample counters and render predicates (see render.cpp). Regenerate the header with
+//   glslangValidator -V --target-env vulkan1.2 --vn occlusion_spv occlusion.comp -o occlusion_spv.h
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference : require
+layout(local_size_x = 1) in;
+layout(std430, binding = 0) readonly buffer Results { uint64_t results[]; };  // copied query results
+layout(std430, binding = 1) buffer Total { uint64_t total; };                   // running sample count
+layout(std430, binding = 2) buffer Guest { uint words[]; };                     // guest memory window (mode 2)
+layout(std430, binding = 3) buffer Predicates { uint predicates[]; };           // conditional rendering
+struct Entry { uint64_t address; uint end; uint slot; uint kind; uint pad; };
+layout(std430, binding = 4) readonly buffer Entries { Entry entries[]; };       // reports to process (mode 3)
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Report { uint low; uint high; };
+layout(push_constant) uniform Parameters {
+    uint mode;   // 2: predicate; 3: process `count` report entries, query results from `first`
+    uint first;  // first unprocessed query result (mode 3) / predicate slot (mode 2)
+    uint count;  // entry count (mode 3) / render-if-equal (mode 2)
+    uint word;   // guest word index of the predicate operands (mode 2)
+} p;
+void main() {
+    if (p.mode == 3u) {
+        uint s = p.first;
+        uint64_t t = total;
+        for (uint i = 0u; i < p.count; ++i) {
+            const Entry e = entries[i];
+            if (e.kind == 2u) { s = max(s, e.end); t = 0ul; continue; }     // counter reset
+            uint64_t d = 0ul;
+            if (e.kind == 0u) { for (; s < e.end; ++s) d += results[s]; t += d; }
+            if (e.address != 0ul) { Report r = Report(e.address); const uint64_t v = e.kind == 0u ? t : 0ul; r.low = uint(v); r.high = uint(v >> 32); }
+            if (e.slot != 0xffffffffu) predicates[e.slot] = d != 0ul ? 1u : 0u;  // samples since the previous report
+        }
+        total = t;
+        return;
+    }
+    // NVN conditional render: compare the 64-bit values at +0 and +16 of the predicate operands.
+    const bool equal = words[p.word] == words[p.word + 4u] && words[p.word + 1u] == words[p.word + 5u];
+    predicates[p.first] = (equal == (p.count != 0u)) ? 1u : 0u;
+}
