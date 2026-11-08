@@ -1,4 +1,4 @@
-# TOoT:R
+# TOoT:R (The Ocarina of Time: Recomp)
 
 A native PC port of **The Legend of Zelda: Ocarina of Time** (Nintendo Switch 2 release), made by
 static recompilation: the game's AArch64 code is translated to C++ and compiled for x86-64, and the

@@ -1,3 +1,4 @@
+#include <unordered_set>
 // NVN command buffers: recording into host command lists, and the executor.
 //
 // A command buffer records host Command entries; EndRecording returns a handle, which (as on the
@@ -33,7 +34,11 @@ std::mutex event_mutex;
 u64 current_queue = 0;
 namespace {
 std::unordered_map<u32*, u32> pending_events;
+std::mutex cpu_events_mutex;
+std::unordered_set<u32*> cpu_events; // events the CPU signals (nvnEventSignal)
 }
+void NoteCpuEvent(u32* value) { std::lock_guard lock{cpu_events_mutex}; cpu_events.insert(value); }
+bool IsCpuEvent(u32* value) { std::lock_guard lock{cpu_events_mutex}; return cpu_events.count(value) != 0; }
 namespace {
 
 struct CommandBufferState {
@@ -132,10 +137,25 @@ void SwitchTo(u64 queue) {
     if (c.state) RestoreRenderState(c.state); // (a new queue starts from the current state)
     active_queue = queue;
 }
+// The GPU starts on recorded work while the rest is recorded: a submission every ~1 ms of recording
+// (OoT releases a whole frame at once, ~9 ms to record in busy scenes; submitted at the end, the GPU
+// waited for all of it). OOT_SUBMIT_EVERY_US=<us> (0: only at the end, as before).
+void SubmitWhileRecording() {
+    static const u64 every = std::getenv("OOT_SUBMIT_EVERY_US") ? std::strtoull(std::getenv("OOT_SUBMIT_EVERY_US"), nullptr, 10) * 1000 : 1'000'000;
+    if (!every) return;
+    static auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    static u64 flushes_seen = 0;
+    if (nvn::FlushCount() != flushes_seen) { flushes_seen = nvn::FlushCount(); last = now; return; } // (submitted meanwhile)
+    if ((u64)std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count() < every) return;
+    nvn::Submit();
+    flushes_seen = nvn::FlushCount(); last = now;
+}
 void Run(u64 queue) {
     SwitchTo(queue);
     auto& c = queues[queue];
     while (!c.work.empty()) {
+        SubmitWhileRecording();
         Work w = std::move(c.work.front()); c.work.pop_front();
         size_t i = w.next; std::vector<u64> children; EventWait wait;
         const Step step = ExecuteFrom(*w.list, i, w.end, children, wait);
@@ -182,7 +202,7 @@ void ResumeQueues() {
 // Submissions are executed (translated to Vulkan) by one executor thread, in arrival order: the
 // submitting game thread continues at once, as the console's GPU front end works on its own.
 // Command lists are immutable once looked up, so the arrival snapshots them (calls resolved).
-std::atomic<u64> executor_idle_ns{0}, executor_parked_ns{0}; // (slow-frame diagnosis, render.cpp)
+std::atomic<u64> executor_idle_ns{0}, executor_parked_ns{0}, executor_busy_ns{0}; // (slow-frame diagnosis, render.cpp)
 namespace {
 std::mutex incoming_mutex;
 std::condition_variable incoming_cv, drained_cv;
@@ -215,10 +235,12 @@ void ExecutorLoop() {
             items.swap(incoming);
         }
         {
+            const auto busy_from = std::chrono::steady_clock::now();
             std::lock_guard lock{execution_mutex};
             for (auto& [queue, work] : items) { current_queue = queue; Execute(queue, std::move(work)); }
             ResumeQueues();
             nvn::Submit(); // the work starts on the GPU now
+            executor_busy_ns += (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - busy_from).count();
         }
         if (!items.empty()) { std::lock_guard lock{incoming_mutex}; executed += items.size(); drained_cv.notify_all(); }
     }
@@ -421,6 +443,8 @@ Step ExecuteFrom(const CommandList& list, size_t& index, size_t end, std::vector
             const u64* e = reinterpret_cast<const u64*>(x[0]);
             EventWait w{static_cast<u32*>(ResolveAddress(PoolOf(e[0])->address + e[1], 4)), (u32)x[2], x[1] == 0};
             if (EventSatisfied(w)) break;
+            static const bool prerecord = std::getenv("OOT_PRERECORD") != nullptr; // (experiment: CPU-event gates ignored)
+            if (prerecord && IsCpuEvent(w.value)) break;
             { static u32 shown = 0; if (std::getenv("OOT_EVENT_TRACE") && shown++ < 30) RT_LOG("queue %#llx parks for event %#llx = %u (now %u)", (unsigned long long)current_queue, (unsigned long long)x[0], w.wanted, __atomic_load_n(w.value, __ATOMIC_ACQUIRE)); }
             wait = w; ++index;
             return Step::Wait;
@@ -436,7 +460,9 @@ Step ExecuteFrom(const CommandList& list, size_t& index, size_t end, std::vector
             if (early) { __atomic_store_n(sync, 1u, __ATOMIC_RELEASE); break; }
             __atomic_store_n(sync, 0u, __ATOMIC_RELEASE);
             { std::lock_guard lock{event_mutex}; pending_events[sync] = 1; }
+            if (TimelineOn()) RT_LOG("T %.2f fence %p recorded", TimelineMs(), (void*)sync);
             AfterFlush([sync] { __atomic_store_n(sync, 1u, __ATOMIC_RELEASE);
+                if (TimelineOn()) RT_LOG("T %.2f fence %p signalled", TimelineMs(), (void*)sync);
                 std::lock_guard lock{event_mutex}; pending_events.erase(sync); });
             break;
         }

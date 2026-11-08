@@ -1,5 +1,11 @@
 #ifndef _WIN32
 #include <dlfcn.h>
+#include <thread>
+#include <condition_variable>
+#include <pthread.h>
+#include <mutex>
+#include <execinfo.h>
+#include <string>
 #endif
 #include <algorithm>
 #include <atomic>
@@ -7,11 +13,14 @@
 #include <cstdlib>
 #include <deque>
 #include <map>
+#include <set>
 #include <vector>
 
 #include "../../native.h"
 #include "batch.h"
+#include "../../platform.h"
 #include "memory.h"
+#include "commands.h"
 
 namespace nvn {
 namespace {
@@ -137,8 +146,60 @@ VkSemaphore Timeline() {
     return timeline;
 }
 
+// Accesses recorded since the last full barrier (see PassAccess).
+namespace {
+struct Unsynced {
+    std::vector<const void*> read_textures, written_textures;
+    std::vector<std::pair<u64, u64>> reads, writes;
+    bool global_read = false, global_write = false, unknown = false;
+    void Clear() { read_textures.clear(); written_textures.clear(); reads.clear(); writes.clear(); global_read = global_write = unknown = false; }
+    static bool Overlap(const std::vector<std::pair<u64, u64>>& a, const std::vector<std::pair<u64, u64>>& b) {
+        for (const auto& x : a) for (const auto& y : b) if (x.first < y.second && y.first < x.second) return true;
+        return false;
+    }
+    static bool Common(const std::vector<const void*>& a, const std::vector<const void*>& b) {
+        for (auto* x : a) for (auto* y : b) if (x == y) return true;
+        return false;
+    }
+    bool Conflicts(const PassAccess& a) const {
+        if (unknown) return true;
+        if (Common(a.read_textures, written_textures) || Common(a.written_textures, written_textures) || Common(a.written_textures, read_textures)) return true;
+        const bool any_writes = !writes.empty() || global_write, any_reads = !reads.empty() || global_read;
+        if (a.global_read && any_writes) return true;
+        if (a.global_write && (any_writes || any_reads)) return true;
+        if ((global_write && (!a.reads.empty() || !a.writes.empty())) || (global_read && !a.writes.empty())) return true;
+        return Overlap(a.reads, writes) || Overlap(a.writes, writes) || Overlap(a.writes, reads);
+    }
+    void Add(const PassAccess& a) {
+        constexpr size_t Cap = 4096; // (past this many, everything conflicts: the next pass takes a barrier)
+        if (reads.size() + writes.size() + read_textures.size() + written_textures.size() > Cap) { unknown = true; return; }
+        read_textures.insert(read_textures.end(), a.read_textures.begin(), a.read_textures.end());
+        written_textures.insert(written_textures.end(), a.written_textures.begin(), a.written_textures.end());
+        reads.insert(reads.end(), a.reads.begin(), a.reads.end());
+        writes.insert(writes.end(), a.writes.begin(), a.writes.end());
+        global_read |= a.global_read; global_write |= a.global_write;
+    }
+} unsynced;
+u64 stat_passes_unbarriered = 0;
+} // namespace
 void EndPassLocked() {
     if (!batch.pass_open) return;
+    static const bool trace = std::getenv("OOT_PASS_TRACE") != nullptr; // (what ends render passes: callers by offset)
+    if (trace) {
+        static std::map<std::string, u64> callers; static u64 n = 0;
+        void* frames[6]; const int k = backtrace(frames, 6);
+        Dl_info info{}; dladdr(reinterpret_cast<void*>(&BatchMutex), &info);
+        std::string key;
+        for (int i = 1; i < k && i < 6; ++i) { char t[24]; std::snprintf(t, sizeof t, " %#llx", (unsigned long long)(reinterpret_cast<u64>(frames[i]) - reinterpret_cast<u64>(info.dli_fbase) - 1)); key += t; }
+        ++callers[key];
+        if (++n % 30000 == 0) {
+            std::vector<std::pair<u64, std::string>> top;
+            for (auto& [kk, c] : callers) top.push_back({c, kk});
+            std::sort(top.rbegin(), top.rend());
+            for (size_t i = 0; i < top.size() && i < 12; ++i) RT_LOG("pass ended by%s: %llu", top[i].second.c_str(), (unsigned long long)top[i].first);
+            callers.clear();
+        }
+    }
     if (batch.pass_end_hook) { auto hook = std::move(batch.pass_end_hook); batch.pass_end_hook = nullptr; hook(batch.cmd); }
     vkCmdEndRendering(batch.cmd);
     batch.pass_open = false;
@@ -198,9 +259,11 @@ void BeginWork() {
         vkCmdWriteTimestamp(batch.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, batch.timer, 0);
         batch.light_only = false;
         batch.ended_pass_key.clear();
+        unsynced.Clear();
     } else {
         // Each piece of work sees everything recorded before it.
         work_kind=0;
+        unsynced.Clear();
         ++stat_full_barriers;
         batch.light_only = false;
         VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -216,8 +279,10 @@ bool PassOpenWithKey(const std::vector<u64>& key) {
     return batch.cmd && batch.pass_open && batch.pass_key == key && !GpuProfiling();
 }
 
+void NoteUnorderedWork() { std::lock_guard lock{BatchMutex()}; unsynced.unknown = true; }
+
 void PassDraw(const std::vector<u64>& key, const std::function<void(VkCommandBuffer)>& begin,
-              const std::function<void(VkCommandBuffer)>& draw, u64 profile_key) {
+              const std::function<void(VkCommandBuffer)>& draw, u64 profile_key, const PassAccess* access) {
     std::lock_guard lock{BatchMutex()};
     if (GpuProfiling()) { // per-item timing needs separate items
         Immediate([&](VkCommandBuffer cmd) {
@@ -240,7 +305,14 @@ void PassDraw(const std::vector<u64>& key, const std::function<void(VkCommandBuf
             batch.light_only = false;
             reopen_light = true;
             ++stat_reopens;
-        } else { work_kind = 2; BeginWork(); }
+        } else {
+            static const bool no_barrier = std::getenv("OOT_PASS_NO_BARRIER") != nullptr; // (measurement only: unsafe)
+            static const bool always_barrier = std::getenv("OOT_PASS_HAZARDS") == nullptr; // (dependency tracking: no gain measured yet)
+            if (batch.cmd && (no_barrier || (!always_barrier && access && !unsynced.Conflicts(*access)))) {
+                // (independent of everything since the last full barrier: no drain)
+                EndPassLocked(); ++record_serial; ++other_serial; ++stat_passes_unbarriered;
+            } else { work_kind = 2; BeginWork(); }
+        }
         begin(batch.cmd);
         ++stat_passes;
         reopen_light = false;
@@ -249,6 +321,8 @@ void PassDraw(const std::vector<u64>& key, const std::function<void(VkCommandBuf
     }
     draw(batch.cmd);
     ++record_serial;
+    static const bool tracking = std::getenv("OOT_PASS_HAZARDS") != nullptr;
+    if (tracking) { if (access) unsynced.Add(*access); else unsynced.unknown = true; }
 }
 
 u64 RecordSerial() { std::lock_guard lock{BatchMutex()}; return record_serial; }
@@ -259,6 +333,7 @@ bool ImmediateUnordered(const std::function<void(VkCommandBuffer)>& record, u64 
     if (GpuProfiling() || !batch.cmd || batch.pass_open || serial != record_serial) return false;
     ++stat_items; ++stat_unordered;
     batch.light_only = false;
+    unsynced.unknown = true;
     record(batch.cmd);
     ++record_serial;
     ++other_serial;
@@ -271,6 +346,7 @@ void ImmediateLight(const std::function<void(VkCommandBuffer)>& record) {
     if (GpuProfiling() || !batch.cmd) { Immediate(record); return; }
     const bool light = batch.pass_open || batch.light_only;
     EndPassLocked();
+    unsynced.unknown = true;
     ++record_serial;
     ++other_serial;
     batch.light_only = light;
@@ -329,11 +405,15 @@ void ReportGpuProfile() {
 
 std::atomic<u64> flush_count{0};
 u64 FlushCount() { return flush_count.load(); }
+void ReportDeviceAhead();
 void ReportBatchStats() {
     RT_LOG("batch structure per frame: %.1f render passes (%.1f reopened cheaply), %.1f full barriers (%.1f compute dispatches recorded without one), %.1f other items",
            stat_passes / 300.0, stat_reopens / 300.0, stat_full_barriers / 300.0, stat_unordered / 300.0, stat_items / 300.0);
     stat_unordered = 0;
     ReportPoolStats();
+    ReportDeviceAhead();
+    RT_LOG("guest blocked on the GPU per frame: %.2f ms in sync waits, %.2f ms in readbacks, %.2f ms in queue finishes",
+           cpu_wait_ns[0].exchange(0) / 300e6, cpu_wait_ns[1].exchange(0) / 300e6, cpu_wait_ns[2].exchange(0) / 300e6);
     stat_passes = stat_full_barriers = stat_items = stat_reopens = 0;
 }
 bool ReopeningAfterLightWork() { return reopen_light; }
@@ -346,7 +426,9 @@ namespace {
 bool RetireOne(bool wait) {
     auto& vk = Vk();
     if (in_flight.empty()) return false;
-    static const bool unlocked_waits = std::getenv("OOT_UNLOCKED_GPU_WAITS") != nullptr; // (no measured gain yet)
+    // (the game's sync waits held the batch lock while the GPU worked: the executor, blocked behind it 23% of
+    // its time in Kokiri, could not record the next frame meanwhile. OOT_LOCKED_GPU_WAITS=1: as before.)
+    static const bool unlocked_waits = std::getenv("OOT_LOCKED_GPU_WAITS") == nullptr;
     if (wait && unlocked_waits && BatchMutex().depth == 1 && vkGetFenceStatus(vk.device, in_flight.front().fence) != VK_SUCCESS) {
         const u64 serial = in_flight.front().serial;
         const VkSemaphore timeline = Timeline();
@@ -373,8 +455,30 @@ bool RetireOne(bool wait) {
     VK_CHECK(vkResetFences(vk.device, 1, &f.fence));
     spare_fences.push_back(f.fence);
     u64 stamps[3]{};
+    if (TimelineOn() && vkGetQueryPoolResults(vk.device, f.timer, 0, 3, sizeof stamps, stamps, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && vk.calibrated_timestamps) {
+        // (GPU start and end of the batch on the timeline's clock)
+        static auto calibrate = reinterpret_cast<PFN_vkGetCalibratedTimestampsKHR>(vkGetDeviceProcAddr(vk.device, vk.calibrated_timestamps));
+        static double offset_ms = 0; static auto calibrated = std::chrono::steady_clock::time_point{};
+        if (std::chrono::steady_clock::now() - calibrated > std::chrono::seconds(2)) {
+            VkCalibratedTimestampInfoKHR info[2]{{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR}, {VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR}};
+            info[0].timeDomain = VK_TIME_DOMAIN_DEVICE_KHR; info[1].timeDomain = VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
+            u64 t[2]{}, deviation = 0;
+            if (calibrate(vk.device, 2, info, t, &deviation) == VK_SUCCESS) {
+                const double mono_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                const double base_ms = mono_ms - TimelineMs(); // (the timeline's zero on the monotonic clock)
+                offset_ms = t[1] / 1e6 - t[0] * (double)vk.properties.limits.timestampPeriod / 1e6 - base_ms;
+                calibrated = std::chrono::steady_clock::now();
+            }
+        }
+        const double period = vk.properties.limits.timestampPeriod / 1e6;
+        RT_LOG("T %.2f GPU batch %llu ran %.2f-%.2f", TimelineMs(), (unsigned long long)f.serial, stamps[0] * period + offset_ms, stamps[1] * period + offset_ms);
+    }
     if (vkGetQueryPoolResults(vk.device, f.timer, 0, 3, sizeof stamps, stamps, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && stamps[1] > stamps[0]) {
-        batch.gpu_ns += (u64)((stamps[1] - stamps[0]) * (double)vk.properties.limits.timestampPeriod);
+        // (batches overlap on the GPU timeline when one starts before the previous ends: only new time counts)
+        static u64 last_end = 0;
+        const u64 from = std::max(stamps[0], last_end);
+        if (stamps[1] > from) batch.gpu_ns += (u64)((stamps[1] - from) * (double)vk.properties.limits.timestampPeriod);
+        last_end = std::max(last_end, stamps[1]);
         if (stamps[1] >= stamps[2] && stamps[2] >= stamps[0]) batch.writeback_ns += (u64)((stamps[1] - stamps[2]) * (double)vk.properties.limits.timestampPeriod);
     }
     spare_timers.push_back(f.timer);
@@ -403,19 +507,34 @@ bool RetireOne(bool wait) {
 
 namespace {
 // OOT_WAIT_TRACE: which callers block on the GPU, by time waited.
-void TraceWait(void* caller, u64 waited_ns) {
+void TraceWait(void*, u64 waited_ns) {
+    // (by thread and the four callers up, as offsets in the executable: addr2line -f -C -e tootr <offsets>)
     static const bool trace = std::getenv("OOT_WAIT_TRACE") != nullptr;
-    if (!trace) return;
-    static std::map<void*, u64> callers; static u64 total = 0;
-    callers[caller] += waited_ns; total += waited_ns;
-    if (total > 5'000'000'000ull) {
-        std::vector<std::pair<u64, void*>> top;
-        for (auto& [a, n] : callers) top.push_back({n, a});
+    if (!trace || waited_ns < 20'000) return;
+    static std::mutex m; static std::map<std::string, std::pair<u64, u64>> callers; static auto since = std::chrono::steady_clock::now();
+    void* frames[7]; const int n = backtrace(frames, 7);
+    Dl_info info{}; dladdr(reinterpret_cast<void*>(&BatchMutex), &info);
+    char name[32] = "?"; pthread_getname_np(pthread_self(), name, sizeof name);
+    std::string key = name;
+    for (int i = 2; i < n && i < 7; ++i) { char t[24]; std::snprintf(t, sizeof t, " %#llx", (unsigned long long)(reinterpret_cast<u64>(frames[i]) - reinterpret_cast<u64>(info.dli_fbase) - 1)); key += t; }
+    std::lock_guard lock{m};
+    auto& e = callers[key]; e.first += waited_ns; ++e.second;
+    if (std::chrono::steady_clock::now() - since > std::chrono::seconds(10)) {
+        since = std::chrono::steady_clock::now();
+        std::vector<std::pair<u64, std::string>> top;
+        for (auto& [k, v] : callers) top.push_back({v.first, k});
         std::sort(top.rbegin(), top.rend());
-        for (size_t i = 0; i < top.size() && i < 8; ++i) RT_LOG("wait caller %p: %.0f ms", top[i].second, top[i].first / 1e6);
-        callers.clear(); total = 0;
+        for (size_t i = 0; i < top.size() && i < 10; ++i) RT_LOG("waits %.0f ms (%llu) %s", top[i].first / 1e6, (unsigned long long)callers[top[i].second].second, top[i].second.c_str());
+        callers.clear();
     }
 }
+} // namespace
+
+namespace {
+std::atomic<u64> submitted_atomic{0};
+std::mutex retire_mutex;
+std::condition_variable retire_cv;
+void StartRetirer();
 } // namespace
 
 void Submit() {
@@ -427,13 +546,18 @@ void Submit() {
     { static const bool t = std::getenv("OOT_TIMELINE") != nullptr; if (t) { static const auto t0 = std::chrono::steady_clock::now(); (void)t0; } }
     static const bool trace = std::getenv("OOT_FLUSH_TRACE") != nullptr;
     if (trace) {
-        static std::map<void*, u64> callers;
-        ++callers[__builtin_return_address(1)];
-        if (flush_count % 5000 == 0) {
-            std::vector<std::pair<u64, void*>> top;
-            for (auto& [a, n] : callers) top.push_back({n, a});
+        // (three callers up, as offsets in the executable: addr2line -f -e tootr <offsets>)
+        static std::map<std::string, u64> callers;
+        void* frames[6]; const int n = backtrace(frames, 6);
+        Dl_info info{}; dladdr(reinterpret_cast<void*>(&BatchMutex), &info);
+        std::string key;
+        for (int i = 1; i < n && i < 5; ++i) { char t[24]; std::snprintf(t, sizeof t, " %#llx", (unsigned long long)(reinterpret_cast<u64>(frames[i]) - reinterpret_cast<u64>(info.dli_fbase) - 1)); key += t; }
+        ++callers[key];
+        if (flush_count % 3000 == 0) {
+            std::vector<std::pair<u64, std::string>> top;
+            for (auto& [k, c] : callers) top.push_back({c, k});
             std::sort(top.rbegin(), top.rend());
-            for (size_t i = 0; i < top.size() && i < 8; ++i) RT_LOG("flush caller %p: %llu", top[i].second, (unsigned long long)top[i].first);
+            for (size_t i = 0; i < top.size() && i < 10; ++i) RT_LOG("flush callers%s: %llu", top[i].second.c_str(), (unsigned long long)top[i].first);
             callers.clear();
         }
     }
@@ -475,7 +599,14 @@ void Submit() {
         si.pNext = &ti; si.signalSemaphoreCount = 1; si.pSignalSemaphores = &timeline;
         si.commandBufferCount = any_uploads ? 2 : 1;
         si.pCommandBuffers = any_uploads ? buffers : &batch.cmd;
-        VK_CHECK(vkQueueSubmit(vk.queue, 1, &si, f.fence));
+        {   // (time in vkQueueSubmit: on amdgpu it grows with the imported memory)
+            const auto t0 = std::chrono::steady_clock::now();
+            VK_CHECK(vkQueueSubmit(vk.queue, 1, &si, f.fence));
+            if (TimelineOn()) RT_LOG("T %.2f submit batch %llu", TimelineMs(), (unsigned long long)f.serial);
+            static double total = 0; static u64 n = 0;
+            total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (++n % 500 == 0) { RT_LOG("vkQueueSubmit: %.2f ms each (last 500)", total / 500); total = 0; }
+        }
         if (!any_uploads) { vkFreeCommandBuffers(vk.device, vk.command_pool, 1, &f.uploads); f.uploads = VK_NULL_HANDLE; }
         if (!pending_pages.empty()) { // (the write-back copy: after the batch, which completes without it)
             const VkSemaphore wb = WritebackTimeline();
@@ -510,6 +641,9 @@ void Submit() {
     batch.pending_writes.clear(); batch.pending_reports.clear(); batch.pending_writeback.clear();
     in_flight.push_back(std::move(f));
     ++submitted_serial;
+    submitted_atomic.store(submitted_serial, std::memory_order_release);
+    StartRetirer();
+    retire_cv.notify_one();
     if (GpuProfiling()) { while (RetireOne(true)) {} return; } // per-item timings share one query pool
     const u64 before = batch.wait_ns;
     while (in_flight.size() > MaxInFlight) RetireOne(true);
@@ -528,8 +662,42 @@ void WaitForBatches(u64 count) {
     TraceWait(reinterpret_cast<void*>(2), batch.wait_ns - before); // (frame pacing)
 }
 
+// Retires batches as the GPU completes them (OOT_NO_RETIRE_THREAD=1: only when a game thread polls or waits).
+// The game polls GPU-signalled events and syncs with short sleeps; their values land when the batch writing
+// them is retired, which otherwise happened only on such a poll, late.
+namespace {
+void RetireLoop() {
+    rt::SetThreadName("nvn-retire");
+    auto& vk = Vk();
+    for (u64 done = 0;;) {
+        const u64 target = submitted_atomic.load(std::memory_order_acquire);
+        if (target <= done) {
+            std::unique_lock lock{retire_mutex};
+            retire_cv.wait_for(lock, std::chrono::milliseconds(20), [&] { return submitted_atomic.load() > done; });
+            continue;
+        }
+        const VkSemaphore timeline = Timeline();
+        const u64 next = done + 1;
+        VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+        wi.semaphoreCount = 1; wi.pSemaphores = &timeline; wi.pValues = &next;
+        if (vkWaitSemaphores(vk.device, &wi, 20'000'000) != VK_SUCCESS) continue;
+        VK_CHECK(vkGetSemaphoreCounterValue(vk.device, timeline, &done));
+        std::lock_guard lock{BatchMutex()};
+        while (RetireOne(false)) {}
+        ReapWritebacks();
+    }
+}
+void StartRetirer() {
+    static const bool off = std::getenv("OOT_NO_RETIRE_THREAD") != nullptr;
+    static std::once_flag once;
+    if (!off) std::call_once(once, [] { std::thread(RetireLoop).detach(); });
+}
+} // namespace
+
 void Poll() {
-    std::lock_guard lock{BatchMutex()};
+    // (event polls come often: while the executor records, nothing is retired from here)
+    std::unique_lock lock{BatchMutex(), std::try_to_lock};
+    if (!lock.owns_lock()) return;
     while (RetireOne(false)) {}
     ReapWritebacks();
 }
@@ -574,6 +742,51 @@ void NoteWriteBack(u64 address, u64 size) {
     std::lock_guard lock{BatchMutex()};
     AddRange(batch.pending_writeback, address, address + size);
 }
+// ---- GPU storage writes copied back when read ---------------------------------------------------
+// Storage results reach guest memory only when something reads them: the game invalidates the range (its
+// readback), or the runtime looks at it (HasPendingWrite guards those reads). Until then they stay in the
+// pool's device copy (OoT writes ~78 MiB a frame on the GPU and reads back ~8 of it). A binding read back
+// once is copied back eagerly from then on. OOT_EAGER_WRITEBACK=1: every batch copies all back (as before).
+namespace {
+std::map<u64, u64> device_ahead; // binding start -> end: GPU-written, not yet in guest memory
+std::set<u64> read_back;         // binding starts the CPU reads
+u64 deferred_bytes = 0, recalled_bytes = 0;
+bool DeferWriteBack() { static const bool on = std::getenv("OOT_EAGER_WRITEBACK") == nullptr; return on; }
+// (batch lock held) Ranges overlapping [address, address + size) are copied back by the open batch.
+bool RecallDeviceAhead(u64 address, u64 size) {
+    if (device_ahead.empty()) return false;
+    bool any = false;
+    for (auto it = device_ahead.begin(); it != device_ahead.end() && it->first < address + size;) {
+        if (it->second <= address) { ++it; continue; }
+        if (!batch.cmd) BeginWork();
+        AddRange(batch.pending_writes, it->first, it->second);
+        AddRange(batch.pending_writeback, it->first, it->second);
+        read_back.insert(it->first);
+        recalled_bytes += it->second - it->first;
+        SettleDeviceAhead(it->first, it->second);
+        static int shown = 0;
+        if (shown++ < 24) RT_LOG("GPU results %#llx+%#llx are read on the CPU: copied back from now on",
+                                 (unsigned long long)it->first, (unsigned long long)(it->second - it->first));
+        it = device_ahead.erase(it);
+        any = true;
+    }
+    return any;
+}
+} // namespace
+void DropDeviceAhead(u64 address, u64 size) { // (a pool goes: its results are not wanted)
+    std::lock_guard lock{BatchMutex()};
+    for (auto it = device_ahead.lower_bound(address); it != device_ahead.end() && it->first < address + size;) {
+        SettleDeviceAhead(it->first, it->second);
+        it = device_ahead.erase(it);
+    }
+}
+void ReportDeviceAhead() {
+    std::lock_guard lock{BatchMutex()};
+    if (!DeferWriteBack()) return;
+    RT_LOG("GPU results kept on the GPU: %.2f MiB per frame (%.2f MiB copied back when read; %zu bindings read back)",
+           deferred_bytes / 300.0 / 1048576.0, recalled_bytes / 300.0 / 1048576.0, read_back.size());
+    deferred_bytes = recalled_bytes = 0;
+}
 void NotePendingWrite(u64 address, u64 size, bool write_back) {
     if (!size) return;
     static const u64 watch = std::getenv("OOT_WRITE_WATCH") ? std::strtoull(std::getenv("OOT_WRITE_WATCH"), nullptr, 16) : 0;
@@ -583,7 +796,11 @@ void NotePendingWrite(u64 address, u64 size, bool write_back) {
     }
     std::lock_guard lock{BatchMutex()};
     AddRange(batch.pending_writes, address, address + size);
-    if (write_back) AddRange(batch.pending_writeback, address, address + size);
+    if (write_back && DeferWriteBack() && !read_back.count(address)) {
+        u64& end = device_ahead[address];
+        if (end < address + size) { end = address + size; ProtectDeviceAhead(address, end); }
+        deferred_bytes += size;
+    } else if (write_back) AddRange(batch.pending_writeback, address, address + size);
 }
 
 namespace {
@@ -596,6 +813,7 @@ bool Overlaps(const std::map<u64, u64>& ranges, u64 address, u64 size) {
 } // namespace
 bool PendingWriteRange(u64 address, u64 size, u64* start, u64* end) {
     std::lock_guard lock{BatchMutex()};
+    RecallDeviceAhead(address, size);
     const auto find = [&](const std::map<u64, u64>& ranges) {
         auto it = ranges.upper_bound(address + size - 1);
         if (it == ranges.begin()) return false;
@@ -610,21 +828,40 @@ bool PendingWriteRange(u64 address, u64 size, u64* start, u64* end) {
 // is; here they arrive with the write-back at the end of the batch. (OoT's auto-exposure sums brightness on
 // the GPU and the CPU reads and clears the sum: read early, it stepped up and down, the white flashes.)
 // OOT_NO_READBACK_WAIT=1: not.
+std::atomic<u64> cpu_wait_ns[3];
 void WaitForWrites(u64 address, u64 size) {
     static const bool off = std::getenv("OOT_NO_READBACK_WAIT") != nullptr;
     if (off || !size) return;
+    struct Timed { std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        ~Timed() { cpu_wait_ns[1] += (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(); } } timed;
+    static const bool trace = std::getenv("OOT_INVALIDATE_TRACE") != nullptr;
+    if (trace) { static std::map<std::pair<u64,u64>, u64> seen; static u64 n = 0; ++seen[{address, size}];
+        if (++n % 3000 == 0) { for (auto& [k, c] : seen) RT_LOG("invalidate %#llx+%#llx: %llu", (unsigned long long)k.first, (unsigned long long)k.second, (unsigned long long)c); seen.clear(); } }
     std::lock_guard lock{BatchMutex()};
+    RecallDeviceAhead(address, size);
+    static const bool trace_waits = std::getenv("OOT_READBACK_TRACE") != nullptr;
+    const auto show = [&](const char* what, const std::map<u64, u64>& ranges) {
+        if (!trace_waits) return;
+        static std::atomic<u32> shown{0}; if (shown++ >= 20000) return;
+        auto it = ranges.upper_bound(address + size - 1); if (it == ranges.begin()) return; --it;
+        RT_LOG("readback %#llx+%#llx waits for %s: pending %#llx-%#llx", (unsigned long long)address, (unsigned long long)size, what,
+               (unsigned long long)it->first, (unsigned long long)it->second);
+    };
+    if (Overlaps(batch.pending_writes, address, size)) show("the open batch's writes", batch.pending_writes);
+    else if (Overlaps(batch.pending_reports, address, size)) show("the open batch's reports", batch.pending_reports);
     if (Overlaps(batch.pending_writes, address, size) || Overlaps(batch.pending_reports, address, size)) Submit();
     for (;;) {
         size_t last = in_flight.size();
         for (size_t i = in_flight.size(); i-- > 0;)
             if (Overlaps(in_flight[i].writes, address, size) || Overlaps(in_flight[i].reports, address, size)) { last = i; break; }
         if (last == in_flight.size()) break;
+        if (trace_waits) show("a submitted batch", Overlaps(in_flight[last].writes, address, size) ? in_flight[last].writes : in_flight[last].reports);
         RetireOne(true); // (oldest first, up to the last batch writing the range)
     }
 }
 bool HasPendingWrite(u64 address, u64 size) {
     std::lock_guard lock{BatchMutex()};
+    RecallDeviceAhead(address, size); // (the runtime reads it: its results come back with the open batch)
     if (Overlaps(batch.pending_writes, address, size)) return true;
     for (const auto& f : in_flight) if (Overlaps(f.writes, address, size)) return true;
     return false;

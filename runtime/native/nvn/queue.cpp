@@ -5,6 +5,10 @@
 // before returning from nvnQueueFlush/Finish and FenceSync.
 
 #include <atomic>
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 #include <map>
 #include <chrono>
 #include <thread>
@@ -50,7 +54,11 @@ NATIVE("nvnQueueSubmitCommands") {
     nvn::Submit();
 }
 NATIVE("nvnQueueFlush") { nvn::Submit(); }
-NATIVE("nvnQueueFinish") { Executor().Finish(); }
+NATIVE("nvnQueueFinish") {
+    const auto t0 = std::chrono::steady_clock::now();
+    Executor().Finish();
+    nvn::cpu_wait_ns[2] += (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+}
 NATIVE("nvnQueueFenceSync") {
     if (nvn::TimelineOn()) RT_LOG("T %.2f fence %#llx on queue %#llx", nvn::TimelineMs(), (unsigned long long)c->x[1], (unsigned long long)c->x[0]);
     // FenceSync(queue, sync, condition, flags): signalled when the queue's prior work completes.
@@ -92,6 +100,8 @@ NATIVE("nvnSyncWait") {
     if (trace) { static std::map<std::pair<u64, bool>, u64> calls; static u64 n = 0; ++calls[{c->x[1] == 0 ? 0 : c->x[1] < 1000000 ? 1 : 2, __atomic_load_n(state, __ATOMIC_ACQUIRE) != 0}];
         if (++n % 2000 == 0) { for (auto& [k, v] : calls) RT_LOG("sync wait timeout class %llu signalled %d: %llu (lr %#llx)", (unsigned long long)k.first, (int)k.second, (unsigned long long)v, (unsigned long long)c->x[30]); calls.clear(); } }
     if (__atomic_load_n(state, __ATOMIC_ACQUIRE)) return Ret(c, 0);
+    struct Timed { std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        ~Timed() { nvn::cpu_wait_ns[0] += (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(); } } timed;
     if (nvn::TimelineOn()) RT_LOG("T %.2f sync wait %#llx start", nvn::TimelineMs(), (unsigned long long)c->x[0]);
     struct End { u64 s; ~End() { if (nvn::TimelineOn()) RT_LOG("T %.2f sync wait %#llx end", nvn::TimelineMs(), (unsigned long long)s); } } end{c->x[0]};
     // Retire submitted batches (oldest first) until the sync is signalled. Its fence may still be
@@ -121,10 +131,17 @@ static u32* EventValue(u64 event) {
     return reinterpret_cast<u32*>(PoolOf(e[0])->address + e[1]);
 }
 NATIVE("nvnEventGetValue") { Poll(); Ret(c, __atomic_load_n(EventValue(c->x[0]), __ATOMIC_ACQUIRE)); }
+#ifdef __linux__
+std::atomic<int> profile_signal_tid{0}; // (profiler.cpp: OOT_PROFILE_WALL=signal)
+#endif
 NATIVE("nvnEventSignal") {
     { static u32 shown = 0; if (std::getenv("OOT_EVENT_TRACE") && shown++ < 30) RT_LOG("CPU signals event %#llx mode %llu value %llu", (unsigned long long)c->x[0], (unsigned long long)c->x[1], (unsigned long long)c->x[2]); }
     // Signal(event, mode, value): mode 0 writes, 1 adds
     u32* v = EventValue(c->x[0]);
+#ifdef __linux__
+    { extern std::atomic<int> profile_signal_tid; static thread_local const int tid = (int)syscall(SYS_gettid); profile_signal_tid.store(tid, std::memory_order_relaxed); }
+#endif
+    nvn::NoteCpuEvent(v);
     if (c->x[1] == 1) __atomic_fetch_add(v, (u32)c->x[2], __ATOMIC_ACQ_REL);
     else __atomic_store_n(v, (u32)c->x[2], __ATOMIC_RELEASE);
     if (nvn::TimelineOn()) RT_LOG("T %.2f CPU signal %p = %llu", nvn::TimelineMs(), (void*)v, (unsigned long long)c->x[2]);

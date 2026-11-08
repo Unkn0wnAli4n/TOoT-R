@@ -13,6 +13,8 @@
 #include <unistd.h>
 #endif
 #include <vector>
+#include <mutex>
+#include <map>
 
 #include "../../native.h"
 #include "memory.h"
@@ -40,8 +42,22 @@ Pool*& HostPool(u64 object) { return *reinterpret_cast<Pool**>(object); }
 // released with the last pool using it.
 std::mutex imports_mutex;
 std::map<u64, std::weak_ptr<HostImport>> imports; // base -> import
+// ---- pools in GPU memory (AMD) -------------------------------------------------------------------
+// amdgpu checks every page of every imported (userptr) range at each submission: ~11 ms per GiB on the Steam
+// Deck, and this game imports ~5 GiB (30-50 ms a submission). Pools of 1 MiB and more are moved into exported
+// GPU memory instead, mapped over the guest range (the contents are copied in; pointers stay valid): the
+// GPU uses it directly, nothing is checked per submission (0.03 ms measured). Smaller pools are imported.
+// When the last pool goes, the contents go back into ordinary memory. OOT_IMPORT_POOLS=1: imports only.
+bool BackPools();
+std::shared_ptr<HostImport> CreateBacked(u64 base, u64 size);
 std::shared_ptr<HostImport> CreateImport(u64 base, u64 size) {
     auto& vk = Vk();
+    // (an import of pages GPU memory is mapped over would get every submission rejected)
+    for (auto& [b, w] : imports) if (auto i = w.lock(); i && i->backed && i->base < base + size && base < i->base + i->size) {
+        RT_LOG("import %#llx+%#llx overlaps GPU memory at %#llx+%#llx: not imported", (unsigned long long)base, (unsigned long long)size,
+               (unsigned long long)i->base, (unsigned long long)i->size);
+        return nullptr;
+    }
     static auto get_props = reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
         vkGetDeviceProcAddr(vk.device, "vkGetMemoryHostPointerPropertiesEXT"));
     VkMemoryHostPointerPropertiesEXT props{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
@@ -89,6 +105,74 @@ std::shared_ptr<HostImport> CreateImport(u64 base, u64 size) {
     return imp;
 }
 namespace track { bool UnprotectForImport(u64 base, u64 size); }
+bool BackPools() {
+#ifdef __linux__
+    static const bool on = [] {
+        const bool v = Vk().dma_buf && !PageProtectionUsable() && !std::getenv("OOT_IMPORT_POOLS");
+        if (v) RT_LOG("memory pools: 1 MiB and larger ones in GPU memory mapped in place (no imports to check per submission)");
+        return v;
+    }();
+    return on;
+#else
+    return false;
+#endif
+}
+std::shared_ptr<HostImport> CreateBacked(u64 base, u64 size) {
+#ifdef __linux__
+    auto& vk = Vk();
+    static auto get_fd = reinterpret_cast<PFN_vkGetMemoryFdKHR>(vkGetDeviceProcAddr(vk.device, "vkGetMemoryFdKHR"));
+    auto imp = std::make_shared<HostImport>();
+    imp->base = base; imp->size = size; imp->backed = true;
+    VkExternalMemoryBufferCreateInfo ext{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+    ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.pNext = &ext; bi.size = size;
+    bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+               VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    if (vkCreateBuffer(vk.device, &bi, nullptr, &imp->buffer) != VK_SUCCESS) { imp->backed = false; return nullptr; }
+    VkMemoryRequirements req; vkGetBufferMemoryRequirements(vk.device, imp->buffer, &req);
+    // (CPU-cached and coherent: the game reads what the GPU wrote; not device-local where a cached type exists)
+    u32 type = ~0u;
+    for (u32 pass = 0; pass < 2 && type == ~0u; ++pass)
+        for (u32 t = 0; t < vk.memory_properties.memoryTypeCount; ++t) {
+            const auto f = vk.memory_properties.memoryTypes[t].propertyFlags;
+            const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | (pass == 0 ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0);
+            if ((req.memoryTypeBits >> t & 1) && (f & want) == want && !(f & 0xc0)) { type = t; break; } // (0xc0: AMD device-coherent/uncached)
+        }
+    VkExportMemoryAllocateInfo export_info{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};
+    export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    flags.pNext = &export_info; flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.pNext = &flags; ai.allocationSize = req.size; ai.memoryTypeIndex = type;
+    int fd = -1;
+    VkMemoryGetFdInfoKHR gi{VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};
+    void* staging = MAP_FAILED;
+    if (type == ~0u || vkAllocateMemory(vk.device, &ai, nullptr, &imp->memory) != VK_SUCCESS ||
+        vkBindBufferMemory(vk.device, imp->buffer, imp->memory, 0) != VK_SUCCESS ||
+        (gi.memory = imp->memory, gi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, get_fd(vk.device, &gi, &fd)) != VK_SUCCESS ||
+        (staging = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)) == MAP_FAILED) {
+        RT_LOG("pool %#llx+%#llx: GPU memory unavailable, imported instead", (unsigned long long)base, (unsigned long long)size);
+        if (fd >= 0) close(fd);
+        imp->backed = false; // (the destructor frees what was made)
+        return nullptr;
+    }
+    // The contents so far, then the GPU memory in place of the guest pages.
+    std::memcpy(staging, reinterpret_cast<const void*>(base), size);
+    munmap(staging, size);
+    if (mmap(reinterpret_cast<void*>(base), size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED)
+        Fatal("cannot map GPU memory over pool %#llx+%#llx", (unsigned long long)base, (unsigned long long)size);
+    close(fd);
+    static std::atomic<u64> total{0};
+    total += size;
+    static std::atomic<u32> shown{0};
+    if (shown++ < 12) RT_LOG("pool %#llx+%#llx in GPU memory (%.0f MiB so far)", (unsigned long long)base, (unsigned long long)size, total / 1048576.0);
+    return imp;
+#else
+    (void)base; (void)size; return nullptr;
+#endif
+}
 void ImportPool(Pool& p) {
     auto& vk = Vk();
     const u64 align = vk.host_import_alignment;
@@ -105,6 +189,16 @@ void ImportPool(Pool& p) {
     }
     // A new import of exactly the range. (Imports must not overlap: the driver refuses pages already
     // imported. Larger shared chunks were tried: a later pool across a chunk's end could not be imported.)
+    if (BackPools() && p.import_size >= (1u << 20)) {
+        bool overlap = false;
+        for (auto& [b, w] : imports) if (auto i = w.lock(); i && i->base < end && p.import_base < i->base + i->size) overlap = true;
+        if (!overlap) if (auto backed = CreateBacked(p.import_base, p.import_size)) {
+            ++imports_live;
+            imports[backed->base] = backed;
+            p.host_import = backed; p.buffer = backed->buffer; p.buffer_offset = 0;
+            return;
+        }
+    }
     // Write-protected pages (CPU-write tracking) cannot be imported, and the NVIDIA driver then also refuses
     // every later import of the same size, wherever it is: the pages are made writable first.
     track::UnprotectForImport(p.import_base, p.import_size);
@@ -271,8 +365,29 @@ void SettleRun(u64 first, u64 end) {
     flush(end);
 }
 // Write-protection faults of tracked pages; false: not ours (a real crash).
+// GPU results not yet copied back (batch.cpp, device_ahead): their pages are inaccessible; a CPU access copies
+// the binding back (and waits for it), then proceeds. Page-aligned outward; start -> end.
+std::mutex ahead_mutex;
+std::map<u64, u64> ahead_pages;
+bool AheadAt(u64 address, u64* start, u64* end) {
+    std::lock_guard lock{ahead_mutex};
+    auto it = ahead_pages.upper_bound(address);
+    if (it == ahead_pages.begin()) return false;
+    --it;
+    if (it->second <= address) return false;
+    *start = it->first; *end = it->second;
+    return true;
+}
 bool HandleFault(u64 address, u64 host_pc) {
     const u64 page = address & ~(PageSize - 1);
+    if (u64 start, end; AheadAt(address, &start, &end)) {
+        static std::atomic<u32> shown{0};
+        if (shown++ < 40) RT_LOG("CPU reads GPU results at %#llx (pages %#llx-%#llx, host pc %#llx): copying them back",
+                                 (unsigned long long)address, (unsigned long long)start, (unsigned long long)end, (unsigned long long)host_pc);
+        nvn::WaitForWrites(start, end - start); // (copies the bindings there back; their pages are settled on the way)
+        nvn::SettleDeviceAhead(start, end);     // (in case another thread recalled it meanwhile)
+        return true;
+    }
     if (u64* back = BackSerial(page); back && __atomic_load_n(back, __ATOMIC_ACQUIRE)) {
         for (;;) {
             const u64 value = __atomic_load_n(back, __ATOMIC_ACQUIRE);
@@ -443,13 +558,28 @@ bool UnprotectForImport(u64 base, u64 size) {
 }
 } // namespace track
 
-bool MirrorEnabled() { static const bool enabled = std::getenv("OOT_HOST_POOLS") == nullptr; return enabled; }
+// (not on GPUs sharing system memory, such as the Steam Deck's: their "device memory" is the same RAM, so a
+// mirror only doubles the memory used. OOT_MIRROR_POOLS=1 mirrors there too; OOT_HOST_POOLS=1 never mirrors.)
+bool MirrorEnabled() {
+    static const bool enabled = [] {
+        if (std::getenv("OOT_HOST_POOLS") || !PageProtectionUsable()) return false; // (mirrors find CPU writes by protection)
+        if (std::getenv("OOT_MIRROR_POOLS")) return true;
+        VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(Vk().physical, &p);
+        const bool integrated = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+        if (integrated) RT_LOG("memory pools: shared system memory, used in place (no device copies)");
+        return !integrated;
+    }();
+    return enabled;
+}
 std::atomic<u64> mirrored_bytes{0};
 
 bool CopyEligible(const Pool& p) {
     static const bool uncached = std::getenv("OOT_MIRROR_UNCACHED") != nullptr;
+    // (shader-code pools hold data too: OoT keeps a light-culling counter there that ~130k threads add to each frame;
+    // read across the bus that was 2.7 ms of GPU time. OOT_NO_MIRROR_SHADER_POOLS=1: left in place)
+    static const bool shader_pools = std::getenv("OOT_NO_MIRROR_SHADER_POOLS") == nullptr;
     return MirrorEnabled() && !p.copy_failed && (uncached || (p.flags & PoolGpuCached)) && p.buffer &&
-           !(p.flags & ((uncached ? 0 : PoolCpuUncached) | PoolShaderCode | PoolGpuNoAccess | PoolVirtual));
+           !(p.flags & ((uncached ? 0 : PoolCpuUncached) | (shader_pools ? 0 : PoolShaderCode) | PoolGpuNoAccess | PoolVirtual));
 }
 // Gives a pool its device-memory copy (on its first use as a GPU buffer: pools holding only
 // texture data never get one). Earlier work of the open batch may have used the imported pages;
@@ -495,12 +625,53 @@ bool CreateDeviceCopy(Pool& p) {
 VkBuffer GpuBuffer(const Pool& p) { return p.device_buffer ? p.device_buffer : p.buffer; }
 
 } // namespace
+void ProtectDeviceAhead(u64 start, u64 end) {
+    static const bool off = std::getenv("OOT_AHEAD_NO_PROTECT") != nullptr;
+    if (off || !MirrorEnabled()) return;
+    track::InstallHandler();
+    const u64 first = start & ~(track::PageSize - 1), last = (end + track::PageSize - 1) & ~(track::PageSize - 1);
+    {
+        std::lock_guard lock{track::ahead_mutex};
+        auto it = track::ahead_pages.upper_bound(first);
+        if (it != track::ahead_pages.begin() && std::prev(it)->second > first) return; // (already)
+        if (it != track::ahead_pages.end() && it->first < last) return;               // (overlaps another: left unprotected)
+        track::ahead_pages[first] = last;
+    }
+    track::Guard guard;
+    mprotect(reinterpret_cast<void*>(first), last - first, PROT_NONE);
+}
+void SettleDeviceAhead(u64 start, u64 end) {
+    const u64 first = start & ~(track::PageSize - 1), last = (end + track::PageSize - 1) & ~(track::PageSize - 1);
+    std::vector<std::pair<u64, u64>> settle;
+    {
+        std::lock_guard lock{track::ahead_mutex};
+        for (auto it = track::ahead_pages.begin(); it != track::ahead_pages.end();) {
+            if (it->first < last && first < it->second) { settle.push_back(*it); it = track::ahead_pages.erase(it); }
+            else ++it;
+        }
+    }
+    if (settle.empty()) return;
+    track::Guard guard;
+    for (auto [a, b] : settle) track::SettleRun(a, b);
+}
 
 std::atomic<u64> imports_live{0};
 HostImport::~HostImport() {
     auto& vk = Vk();
     { std::lock_guard lock{vk.queue_mutex}; VK_CHECK(vkQueueWaitIdle(vk.queue)); } // (presentation may still be queued)
     if (vk.copy_queue != vk.queue) { std::lock_guard copy{vk.copy_mutex}; VK_CHECK(vkQueueWaitIdle(vk.copy_queue)); } // (write-back copies)
+#ifdef __linux__
+    if (backed) { // the contents back into ordinary memory at the same addresses
+        void* keep = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (keep == MAP_FAILED) Fatal("cannot keep a pool's contents");
+        std::memcpy(keep, reinterpret_cast<void*>(base), size);
+        if (mmap(reinterpret_cast<void*>(base), size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0) == MAP_FAILED)
+            Fatal("cannot give a pool's memory back");
+        madvise(reinterpret_cast<void*>(base), size, MADV_NOHUGEPAGE);
+        std::memcpy(reinterpret_cast<void*>(base), keep, size);
+        munmap(keep, size);
+    }
+#endif
     if (buffer) vkDestroyBuffer(vk.device, buffer, nullptr);
     if (memory) vkFreeMemory(vk.device, memory, nullptr);
     --imports_live;
@@ -825,8 +996,8 @@ std::shared_lock<std::shared_mutex> RecordPoolTransfers(VkCommandBuffer uploads,
                     else pending->push_back({a, b});
                 }
                 static const bool trace = std::getenv("OOT_WRITEBACK_TRACE") != nullptr;
-                if (trace) { static std::map<std::pair<u32, u64>, u64> sizes; static u64 n = 0; sizes[{p.flags, hi - lo}]++;
-                    if (++n % 2000 == 0) { for (auto& [k, c] : sizes) if (k.second * c > (4u << 20)) RT_LOG("write-back flags %#x size %#llx: %llu", k.first, (unsigned long long)k.second, (unsigned long long)c); sizes.clear(); } }
+                if (trace) { static std::map<std::pair<u64, u64>, u64> sizes; static u64 n = 0; sizes[{lo, hi - lo}]++;
+                    if (++n % 2000 == 0) { for (auto& [k, c] : sizes) if (k.second * c > (4u << 20)) RT_LOG("write-back %#llx+%#llx: %llu", (unsigned long long)k.first, (unsigned long long)k.second, (unsigned long long)c); sizes.clear(); } }
             });
     };
     const auto record = [&](VkCommandBuffer into, std::map<Pool*, std::vector<VkBufferCopy>>& copies) {
@@ -907,10 +1078,19 @@ void PrepareHostWrite(u64 address, u64 size) {
     }
 }
 
+bool PageProtectionUsable() {
+    static const bool usable = [] {
+        VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(Vk().physical, &p);
+        const bool amd = p.vendorID == 0x1002;
+        if (amd) RT_LOG("CPU writes: AMD GPU, no page protection of imported memory (textures checked by content)");
+        return !amd;
+    }();
+    return usable;
+}
 u32 ArmTextureMemory(u64 address, u64 size) {
     const u32 sequence = track::write_sequence.load(std::memory_order_acquire);
     static const bool disabled = std::getenv("OOT_NO_TEXTURE_WATCH") != nullptr;
-    if (disabled || !size) return sequence;
+    if (disabled || !size || !PageProtectionUsable()) return sequence;
     track::InstallHandler();
     const u64 first = address & ~(track::PageSize - 1), end = (address + size + track::PageSize - 1) & ~(track::PageSize - 1);
     for (u64 page = first; page < end; page += track::PageSize) track::ArmState(page, true);
@@ -941,6 +1121,11 @@ u32 TextureWriteSequence() { return track::write_sequence.load(std::memory_order
 
 std::atomic<u64> cpu_reuploads{0}; // (texture_data.cpp counts)
 void ReportPoolStats() {
+    {   // (each import is a userptr object on amdgpu, whose pages the kernel checks at every submission)
+        std::lock_guard lock{imports_mutex}; u64 bytes = 0, n = 0;
+        for (auto& [b0, w] : imports) if (auto i = w.lock()) { bytes += i->size; ++n; }
+        RT_LOG("imports: %llu live, %.0f MiB", (unsigned long long)n, bytes / 1048576.0);
+    }
     if (const u64 n = track::pending_faults.exchange(0)) RT_LOG("write-back: %llu CPU accesses waited for copies (%.2f ms per frame)",
         (unsigned long long)n, track::pending_wait_ns.exchange(0) / 1e6 / 300.0);
     if (const u64 faults = track::texture_write_faults.exchange(0)) RT_LOG("texture memory: %llu CPU-written pages, %llu re-uploads in 300 frames",
@@ -1019,6 +1204,7 @@ NATIVE("nvnMemoryPoolFinalize") {
     Pool* p = HostPool(c->x[0]);
     if (std::getenv("OOT_POOL_TRACE")) RT_LOG("memory pool finalize %#llx", p ? (unsigned long long)p->address : 0ull);
     if (!p) return;
+    DropDeviceAhead(p->address, p->size);
     std::shared_ptr<Pool> retired;
     {
         std::unique_lock lock{pools_mutex};

@@ -4,8 +4,12 @@
 
 #include "../../native.h"
 #include "memory.h"
+#include <algorithm>
+#include <cstring>
 #include <list>
 #include <map>
+#include <set>
+#include <array>
 #include <tuple>
 #include <memory>
 #include <mutex>
@@ -21,6 +25,11 @@ using namespace nvn;
 namespace nvn {
 namespace {
 std::atomic<u64> image_live_bytes{0},image_cached_bytes{0};
+// (OOT_IMAGE_TRACE: live images by kind)
+std::mutex live_kinds_mutex; std::map<std::tuple<u32,u32,u32,bool,bool>,std::pair<s64,s64>> live_kinds;
+void NoteLive(const Texture& t,s64 sign){ static const bool on=std::getenv("OOT_IMAGE_TRACE")!=nullptr; if(!on)return;
+    std::lock_guard l{live_kinds_mutex}; auto& k=live_kinds[{t.width,t.height,t.format,(t.usage&(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))!=0,t.decoded_astc}];
+    k.first+=sign; k.second+=sign*(s64)t.allocation_size; }
 // GPU-written images kept for re-created texture objects (history buffers, transient targets).
 // 256 MiB / 512 entries evicted this game's per-frame targets (2560x1440 RGBA16F alone is 29 MiB):
 // temporal effects (volume fog, anti-aliasing and exposure history) restarted from empty images.
@@ -130,6 +139,67 @@ FormatInfo GetFormat(u32 f) {
     return info;
 }
 
+// ---- image memory in shared blocks ---------------------------------------------------------------
+// A vkAllocateMemory of its own for every image cost the executor ~15% of its time while new scenery came
+// into view (driver ioctls, up to ~1 ms each). Images up to 4 MiB share 64 MiB device-local blocks (all
+// optimal tiling: no granularity conflicts); larger ones keep their own allocation. Empty blocks beyond one
+// spare are freed. OOT_DEDICATED_IMAGES=1: every image its own allocation.
+namespace {
+struct ImageBlock { VkDeviceMemory memory = VK_NULL_HANDLE; u32 type = 0; u64 size = 0, used = 0; std::map<u64, u64> free; };
+std::mutex blocks_mutex;
+std::vector<ImageBlock*> image_blocks;
+constexpr u64 BlockSize = 64ull << 20, BlockMax = 4ull << 20;
+bool TakeFrom(ImageBlock& b, const VkMemoryRequirements& req, u64* offset) {
+    for (auto it = b.free.begin(); it != b.free.end(); ++it) {
+        const u64 start = it->first, end = it->first + it->second;
+        const u64 at = (start + req.alignment - 1) / req.alignment * req.alignment;
+        if (at + req.size > end) continue;
+        b.free.erase(it);
+        if (at > start) b.free[start] = at - start;
+        if (at + req.size < end) b.free[at + req.size] = end - (at + req.size);
+        b.used += req.size; *offset = at;
+        return true;
+    }
+    return false;
+}
+bool SubAllocate(const VkMemoryRequirements& req, u32 type, Texture& t) {
+    static const bool off = std::getenv("OOT_DEDICATED_IMAGES") != nullptr;
+    if (off || req.size > BlockMax || !(req.memoryTypeBits >> type & 1)) return false;
+    std::lock_guard lock{blocks_mutex};
+    for (ImageBlock* b : image_blocks)
+        if (b->type == type && b->size - b->used >= req.size && TakeFrom(*b, req, &t.memory_offset)) { t.memory = b->memory; t.block = b; return true; }
+    auto* b = new ImageBlock;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = BlockSize; ai.memoryTypeIndex = type;
+    if (vkAllocateMemory(Vk().device, &ai, nullptr, &b->memory) != VK_SUCCESS) { delete b; return false; }
+    b->type = type; b->size = BlockSize; b->free[0] = BlockSize;
+    image_blocks.push_back(b);
+    if (!TakeFrom(*b, req, &t.memory_offset)) return false; // (cannot happen: req.size <= BlockMax)
+    t.memory = b->memory; t.block = b;
+    return true;
+}
+void SubFree(Texture& t) {
+    std::lock_guard lock{blocks_mutex};
+    auto* b = static_cast<ImageBlock*>(t.block);
+    VkMemoryRequirements req; vkGetImageMemoryRequirements(Vk().device, t.image, &req); // (the image still exists here)
+    u64 start = t.memory_offset, size = req.size;
+    b->used -= size;
+    auto next = b->free.lower_bound(start);
+    if (next != b->free.end() && next->first == start + size) { size += next->second; next = b->free.erase(next); }
+    if (next != b->free.begin()) { auto prev = std::prev(next); if (prev->first + prev->second == start) { start = prev->first; size += prev->second; b->free.erase(prev); } }
+    b->free[start] = size;
+    t.block = nullptr; t.memory = VK_NULL_HANDLE;
+    if (b->used == 0) {
+        u32 empty = 0; for (ImageBlock* o : image_blocks) empty += o->used == 0;
+        if (empty > 1) {
+            vkFreeMemory(Vk().device, b->memory, nullptr);
+            image_blocks.erase(std::find(image_blocks.begin(), image_blocks.end(), b));
+            delete b;
+        }
+    }
+}
+} // namespace
+
 Texture* HostTexture(u64 object) { return *reinterpret_cast<Texture**>(object + TextureBuilderSize); }
 namespace {
 std::mutex texture_owners_mutex;
@@ -140,7 +210,7 @@ void RetireDescriptorImage(Texture& texture) {
     // the bounded cache after the API owner (or this submission) releases them.
     auto* image=new Texture(texture);
     image->owner_finalized=false;image->gpu_retirement_pending=false;
-    texture.image=VK_NULL_HANDLE;texture.memory=VK_NULL_HANDLE;texture.view=VK_NULL_HANDLE;
+    texture.image=VK_NULL_HANDLE;texture.memory=VK_NULL_HANDLE;texture.view=VK_NULL_HANDLE;texture.block=nullptr;
     texture.views.clear();texture.allocation_size=0;
     texture.layout=VK_IMAGE_LAYOUT_UNDEFINED;texture.uploaded=texture.gpu_written=false;
     RetireTexture(image);
@@ -281,7 +351,15 @@ void CreateImage(Texture& t) {
         // 64 MiB. OOT_ASTC_RGBA8=1: all as RGBA8.)
         // (the Graphics screen's Texture Memory: Low re-encodes from 256 KiB, Quality keeps RGBA8)
         const bool rgba8=std::getenv("OOT_ASTC_RGBA8")||std::getenv("OOT_CPU_ASTC")||gfx::Current().texture_memory==2;
-        const bool low=gfx::Current().texture_memory==1;
+        // (also on GPUs sharing system memory, such as the Steam Deck's, or with under 6 GB of their own, as
+        // Hookshot does since 4378a24: the threshold of Low unless the user chose Quality)
+        static const bool small_memory=[&]{
+            VkPhysicalDeviceProperties p;vkGetPhysicalDeviceProperties(vk.physical,&p);
+            u64 local=0;for(u32 h=0;h<vk.memory_properties.memoryHeapCount;++h)if(vk.memory_properties.memoryHeaps[h].flags&VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)local=std::max<u64>(local,vk.memory_properties.memoryHeaps[h].size);
+            const bool small=p.deviceType==VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU||local<(6ull<<30);
+            if(small)RT_LOG("textures: shared or small video memory: ASTC textures from 256 KiB kept as BC3");
+            return small;}();
+        const bool low=gfx::Current().texture_memory==1||small_memory;
         if(!rgba8&&t.target!=Target::T3D&&t.samples==1&&t.width<=2048&&t.height<=2048){
             u64 px=0;for(u32 l=0;l<t.levels;++l)px+=(u64)std::max(1u,t.width>>l)*std::max(1u,t.height>>l);
             const u64 min_bytes=low?(256ull<<10):t.info.block_w*t.info.block_h>=36?(2ull<<20):(64ull<<20);
@@ -323,12 +401,23 @@ void CreateImage(Texture& t) {
     if (t.info.block_w > 1 && !t.decoded_astc) ii.flags |= VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
     ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     t.usage = ii.usage;
+    static const bool trace = std::getenv("OOT_IMAGE_TRACE") != nullptr;
+    if (trace) { static std::mutex m; static std::map<std::tuple<u32,u32,u32,u32,u32,u32>, u64> made; static u64 n = 0; std::lock_guard l{m};
+        ++made[{t.width, t.height, t.format, t.levels, t.layers, (u32)!!(ii.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))}];
+        if (++n % 500 == 0) { for (auto& [k, c] : made) if (c > 4) RT_LOG("images made: %ux%u fmt %u levels %u layers %u attachment %u: %llu", std::get<0>(k), std::get<1>(k), std::get<2>(k), std::get<3>(k), std::get<4>(k), std::get<5>(k), (unsigned long long)c); made.clear(); RT_LOG("(500 images made)"); } }
     VK_CHECK(vkCreateImage(vk.device, &ii, nullptr, &t.image));
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(vk.device, t.image, &req);
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = req.size;
     ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    // (only images that cannot be render targets: NVIDIA compresses attachments in memory of their own; shared
+    // blocks made the frame's GPU time 20% longer)
+    if(!(ii.usage&(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))&&SubAllocate(req,ai.memoryTypeIndex,t)){
+        t.allocation_size=req.size;image_live_bytes+=req.size;if(t.decoded_astc)image_astc_bytes+=req.size;NoteLive(t,1);
+        VK_CHECK(vkBindImageMemory(vk.device,t.image,t.memory,t.memory_offset));
+        return;
+    }
     VkResult allocated=vkAllocateMemory(vk.device,&ai,nullptr,&t.memory);
     if(allocated!=VK_SUCCESS){
         // Out of device memory: release every cached image (destroyed after the GPU is done with
@@ -346,11 +435,12 @@ void CreateImage(Texture& t) {
     if(allocated!=VK_SUCCESS)RT_LOG("texture allocation failed: %ux%ux%u format %u, requested %llu MiB; live images %llu MiB, cached %llu MiB",t.width,t.height,t.depth,t.format,
         (unsigned long long)(req.size>>20),(unsigned long long)(image_live_bytes.load()>>20),(unsigned long long)(image_cached_bytes.load()>>20));
     VK_CHECK(allocated);
-    t.allocation_size=req.size;image_live_bytes+=req.size;if(t.decoded_astc)image_astc_bytes+=req.size;
+    t.allocation_size=req.size;image_live_bytes+=req.size;if(t.decoded_astc)image_astc_bytes+=req.size;NoteLive(t,1);
     VK_CHECK(vkBindImageMemory(vk.device, t.image, t.memory, 0));
 }
 
 } // namespace
+bool StealLiveImage(Texture& t); void NoteHolder(Texture& t); void ReportImageAges(); void ReuseOverlapping(Texture& t, bool take);
 void EnsureImage(Texture& t) {
     // A finalized texture still used by recorded work keeps its image until that batch. One no shared owner
     // holds any more (a stale reference to an object on its way out, destroyed with its image) is not
@@ -360,8 +450,16 @@ void EnsureImage(Texture& t) {
         static std::atomic<u32> told{0};
         if(told++<5)RT_LOG("texture %#llx used after its last owner released it",(unsigned long long)t.object);
     }
-    if(!t.image)AdoptCachedImage(t); // a descriptor replacement may have released it since initialization
-    if(!t.image)CreateImage(t);
+    t.used_frame=CurrentFrameNumber();
+    if(!t.image){
+        AdoptCachedImage(t); // a descriptor replacement may have released it since initialization
+        if(!t.image)StealLiveImage(t);
+        {static const bool take=std::getenv("OOT_IMAGE_REUSE_TAKE")!=nullptr; // (taking them made the GPU time longer: re-uploads)
+         if(!t.image&&take)ReuseOverlapping(t,true);}
+        if(!t.image)CreateImage(t);
+        NoteHolder(t);
+        ReuseOverlapping(t,false);
+    }
     if(t.owner_finalized&&self&&!t.gpu_retirement_pending){
         t.gpu_retirement_pending=true;
         AfterBatch([texture=std::move(self)] {
@@ -378,6 +476,7 @@ void EnsureImage(Texture& t) {
 // storage and description, so the next texture created identically continues with it (contents
 // preserved, no CPU upload of stale memory). CPU-uploaded textures are always uploaded afresh.
 namespace nvn {
+void ForgetImageHolder(Texture* t);
 namespace {
 using ImageKey = std::tuple<u64, u32, u32, u32, u32, u32, u32, u32, u32>;
 ImageKey KeyOf(const Texture& t) {
@@ -392,10 +491,13 @@ struct CachedImage {
 std::map<ImageKey,CachedImage> image_cache;
 
 void DestroyLater(Texture* t) {
+    ForgetImageHolder(t); // (on its way out: no other object takes its image now)
     AfterFlush([t] {
         auto& vk = Vk();
         if (t->view) vkDestroyImageView(vk.device, t->view, nullptr);
         for (auto& [key, view] : t->views) vkDestroyImageView(vk.device, view, nullptr);
+        if (t->block || t->memory) NoteLive(*t,-1);
+        if (t->block) {SubFree(*t);image_live_bytes-=t->allocation_size;if(t->decoded_astc)image_astc_bytes-=t->allocation_size;} // (before the image goes: it reads its size)
         if (t->image) vkDestroyImage(vk.device, t->image, nullptr);
         if (t->memory) {vkFreeMemory(vk.device, t->memory, nullptr);image_live_bytes-=t->allocation_size;if(t->decoded_astc)image_astc_bytes-=t->allocation_size;}
         delete t;
@@ -415,6 +517,7 @@ void AdoptCachedImage(Texture& t) {
     if (it == image_cache.end()) return;
     Texture& cached = *it->second.texture;
     t.image = cached.image; t.memory = cached.memory; t.view = cached.view; t.views = std::move(cached.views);
+    t.block = cached.block; t.memory_offset = cached.memory_offset; cached.block = nullptr;
     t.allocation_size=cached.allocation_size;image_cached_bytes-=cached.allocation_size;
     t.layout = cached.layout; t.usage = cached.usage; t.gpu_written = cached.gpu_written; t.uploaded = cached.uploaded;
     t.decoded_astc = cached.decoded_astc; t.bc3 = cached.bc3; t.decoded_rgb9e5 = cached.decoded_rgb9e5; t.info = cached.info;
@@ -425,6 +528,7 @@ void AdoptCachedImage(Texture& t) {
 }
 
 void RetireTexture(Texture* t) {
+    ForgetImageHolder(t); // (cached or destroyed: either way no longer a holder)
     if (!t->image || !t->gpu_written) { DestroyLater(t); return; }
     std::lock_guard lock{cache_mutex};
     const ImageKey key = KeyOf(*t);
@@ -442,6 +546,138 @@ void RetireTexture(Texture* t) {
     t->object = 0;
     while (image_cache.size() > ImageCacheEntries||image_cached_bytes>ImageCacheBudget) EvictOldest();
 }
+// ---- one image per memory and description, as on the console ----------------------------------------
+// OoT makes new texture objects over the same memory every frame (its render targets) while older objects
+// over it are still referenced (descriptors, unfinalized objects). Each had an image of its own: ~12 new
+// images a frame (driver allocations on the executor, ~15% of its time) and gigabytes of copies (155 of
+// one 960x540 target). On the console they are one memory: here the image goes to whichever object over
+// it is used, with its contents and layout. OOT_NO_IMAGE_SHARING=1: an image per object.
+namespace {
+std::mutex holders_mutex;
+std::map<ImageKey, Texture*> holders; // the object holding the image of that memory and description
+std::atomic<u64> images_shared{0}, images_reused{0}, images_released{0};
+}
+std::set<Texture*> with_images; // objects holding images (OOT_IMAGE_TRACE: their ages)
+// (the same by description, for ReuseOverlapping: only objects of t's description are candidates)
+using DescKey = std::tuple<u32, u32, u32, u32, u32, u32, u32, u32>;
+DescKey DescOf(const Texture& t) { return {t.format, t.width, t.height, t.depth, t.levels, t.layers, t.samples, (u32)t.target}; }
+std::map<DescKey, std::set<Texture*>> by_desc;
+void Unlist(Texture* t) { // (holders_mutex held)
+    if (!with_images.erase(t)) return;
+    auto it = by_desc.find(DescOf(*t));
+    if (it != by_desc.end()) { it->second.erase(t); if (it->second.empty()) by_desc.erase(it); }
+}
+void NoteHolder(Texture& t) {
+    if (!t.image) return;
+    std::lock_guard lock{holders_mutex};
+    holders[KeyOf(t)] = &t;
+    if (with_images.insert(&t).second) by_desc[DescOf(t)].insert(&t);
+}
+void ForgetImageHolder(Texture* t) {
+    std::lock_guard lock{holders_mutex};
+    Unlist(t);
+    auto it = holders.find(KeyOf(*t));
+    if (it != holders.end() && it->second == t) holders.erase(it);
+}
+// Images of objects over memory a newer object of the same description now uses, unused for a while
+// (OoT's transient render targets move a little every frame: 131 copies of one 960x540 target were kept,
+// 4.9 MB each). take: the first one becomes t's image (its contents are not t's: as a new image);
+// otherwise they are destroyed. OOT_NO_IMAGE_REUSE=1: kept.
+void ReuseOverlapping(Texture& t, bool take) {
+    static const bool off = std::getenv("OOT_NO_IMAGE_REUSE") != nullptr;
+    if (off || !t.storage || !t.storage_size) return;
+    const u64 now = CurrentFrameNumber();
+    std::vector<Texture*> dead;
+    {
+        std::lock_guard lock{holders_mutex};
+        auto candidates = by_desc.find(DescOf(t));
+        if (candidates == by_desc.end()) return;
+        for (Texture* h : candidates->second) {
+            // (taken after 10 frames unused, destroyed after 60: objects touched every few frames keep theirs)
+            if (h == &t || !h->image || now - h->used_frame < (take ? 10u : 60u) || !h->storage_size) continue;
+            if (h->storage >= t.storage + t.storage_size || t.storage >= h->storage + h->storage_size) continue;
+            if (h->format != t.format || h->width != t.width || h->height != t.height || h->depth != t.depth || h->levels != t.levels ||
+                h->layers != t.layers || h->samples != t.samples || h->target != t.target) continue;
+            if (take) {
+                if (h->depth_stencil_mode != t.depth_stencil_mode || std::memcmp(h->swizzle, t.swizzle, sizeof t.swizzle)) continue;
+                t.image = h->image; t.memory = h->memory; t.block = h->block; t.memory_offset = h->memory_offset; t.allocation_size = h->allocation_size;
+                t.view = h->view; t.views = std::move(h->views); t.layout = h->layout; t.usage = h->usage;
+                t.decoded_astc = h->decoded_astc; t.bc3 = h->bc3; t.decoded_rgb9e5 = h->decoded_rgb9e5; t.info = h->info;
+                t.uploaded = t.gpu_written = false; // (a new image as far as its contents go)
+                h->image = VK_NULL_HANDLE; h->memory = VK_NULL_HANDLE; h->block = nullptr; h->view = VK_NULL_HANDLE; h->views.clear(); h->allocation_size = 0;
+                h->layout = VK_IMAGE_LAYOUT_UNDEFINED; h->uploaded = h->gpu_written = false;
+                auto it = holders.find(KeyOf(*h)); if (it != holders.end() && it->second == h) holders.erase(it);
+                Unlist(h);
+                ++binding_generation; ++images_reused;
+                return;
+            }
+            dead.push_back(h);
+        }
+        for (Texture* h : dead) {
+            auto it = holders.find(KeyOf(*h)); if (it != holders.end() && it->second == h) holders.erase(it);
+            Unlist(h);
+        }
+    }
+    for (Texture* h : dead) { // (the image goes after the GPU is done with it; the object stays, without one)
+        auto* image = new Texture(*h);
+        h->image = VK_NULL_HANDLE; h->memory = VK_NULL_HANDLE; h->block = nullptr; h->view = VK_NULL_HANDLE; h->views.clear(); h->allocation_size = 0;
+        h->layout = VK_IMAGE_LAYOUT_UNDEFINED; h->uploaded = h->gpu_written = false;
+        image->object = 0;
+        DestroyLater(image);
+        ++images_released;
+    }
+    if (!dead.empty()) ++binding_generation;
+}
+void ReportImageAges() {
+    std::lock_guard lock{holders_mutex};
+    const u64 now = CurrentFrameNumber();
+    std::map<std::tuple<u32,u32,u32>, std::array<u64,4>> ages; // (<60, <600, older frames; bytes)
+    for (Texture* t : with_images) if (t->image) {
+        auto& a = ages[{t->width, t->height, t->format}];
+        const u64 age = now - t->used_frame;
+        ++a[age < 2 ? 0 : age < 10 ? 1 : 2]; a[3] += t->allocation_size;
+    }
+    std::vector<std::pair<u64, std::string>> top;
+    for (auto& [k, a] : ages) { char b[160]; std::snprintf(b, sizeof b, "%ux%u fmt %u: used this or the last frame %llu, 2-9 frames ago %llu, earlier %llu (%.0f MiB)", std::get<0>(k), std::get<1>(k), std::get<2>(k),
+        (unsigned long long)a[0], (unsigned long long)a[1], (unsigned long long)a[2], a[3] / 1048576.0); top.push_back({a[3], b}); }
+    std::sort(top.rbegin(), top.rend());
+    for (size_t i = 0; i < top.size() && i < 10; ++i) RT_LOG("  held %s", top[i].second.c_str());
+    std::vector<std::pair<u64, u64>> spans; // (960x540 format 41: where they are)
+    for (Texture* t : with_images) if (t->image && t->width == 960 && t->height == 540 && t->format == 41) spans.push_back({t->storage, t->storage_size});
+    std::sort(spans.begin(), spans.end());
+    std::string list; u64 overlapping = 0;
+    for (size_t i = 0; i < spans.size(); ++i) {
+        if (i && spans[i].first < spans[i - 1].first + spans[i - 1].second) ++overlapping;
+        if (i < 24) { char b[48]; std::snprintf(b, sizeof b, " %#llx+%#llx", (unsigned long long)spans[i].first, (unsigned long long)spans[i].second); list += b; }
+    }
+    RT_LOG("  960x540/41 storage (%zu, %llu overlapping the previous):%s", spans.size(), (unsigned long long)overlapping, list.c_str());
+}
+bool StealLiveImage(Texture& t) {
+    static const bool off = std::getenv("OOT_NO_IMAGE_SHARING") != nullptr;
+    if (off || !t.storage) return false;
+    std::lock_guard lock{holders_mutex};
+    auto it = holders.find(KeyOf(t));
+    if (it == holders.end()) return false;
+    Texture& h = *it->second;
+    if (&h == &t || !h.image || h.depth_stencil_mode != t.depth_stencil_mode || std::memcmp(h.swizzle, t.swizzle, sizeof t.swizzle)) return false;
+    t.image = h.image; t.memory = h.memory; t.block = h.block; t.memory_offset = h.memory_offset; t.allocation_size = h.allocation_size;
+    t.view = h.view; t.views = std::move(h.views);
+    t.layout = h.layout; t.usage = h.usage; t.gpu_written = h.gpu_written; t.uploaded = h.uploaded; t.upload_frame = h.upload_frame;
+    t.upload_sequence = h.upload_sequence; t.checked_sequence = h.checked_sequence; t.content_hash = h.content_hash; t.hash_frame = h.hash_frame;
+    t.decoded_astc = h.decoded_astc; t.bc3 = h.bc3; t.decoded_rgb9e5 = h.decoded_rgb9e5; t.info = h.info;
+    h.image = VK_NULL_HANDLE; h.memory = VK_NULL_HANDLE; h.block = nullptr; h.view = VK_NULL_HANDLE; h.views.clear(); h.allocation_size = 0;
+    h.layout = VK_IMAGE_LAYOUT_UNDEFINED; h.uploaded = h.gpu_written = false;
+    it->second = &t;
+    ++binding_generation; // (descriptors cached with the other object's views are made again)
+    ++images_shared;
+    return true;
+}
+Texture::~Texture() {
+    std::lock_guard lock{holders_mutex};
+    Unlist(this);
+    auto it = holders.find(KeyOf(*this));
+    if (it != holders.end() && it->second == this) holders.erase(it);
+}
 void TrimImageCache(u64 keep_bytes) {
     std::lock_guard lock{cache_mutex};
     while (!cache_order.empty() && image_cached_bytes > keep_bytes) EvictOldest();
@@ -450,9 +686,17 @@ void TrimImageCache(u64 keep_bytes) {
 namespace nvn {
 void ReportImageCache() {
     std::lock_guard lock{cache_mutex};
-    RT_LOG("image cache: %llu adopted, %llu evicted; %zu cached (%.0f MiB), %.0f MiB live (%.0f MiB decoded ASTC)",
-           (unsigned long long)image_cache_adopted.exchange(0), (unsigned long long)image_cache_evicted.exchange(0),
+    RT_LOG("image cache: %llu adopted, %llu shared, %llu reused, %llu released, %llu evicted; %zu cached (%.0f MiB), %.0f MiB live (%.0f MiB decoded ASTC)",
+           (unsigned long long)image_cache_adopted.exchange(0), (unsigned long long)images_shared.exchange(0), (unsigned long long)images_reused.exchange(0),
+           (unsigned long long)images_released.exchange(0), (unsigned long long)image_cache_evicted.exchange(0),
            image_cache.size(), image_cached_bytes / 1048576.0, image_live_bytes / 1048576.0, image_astc_bytes / 1048576.0);
+    if (std::getenv("OOT_IMAGE_TRACE")) {
+        std::lock_guard l{live_kinds_mutex}; std::vector<std::pair<s64,std::string>> top;
+        for (auto& [k,v] : live_kinds) if (v.first) { char b[160]; std::snprintf(b,sizeof b,"%ux%u fmt %u%s%s: %lld images, %.0f MiB",std::get<0>(k),std::get<1>(k),std::get<2>(k),std::get<3>(k)?" attachment":"",std::get<4>(k)?" astc":"",(long long)v.first,v.second/1048576.0); top.push_back({v.second,b}); }
+        std::sort(top.rbegin(),top.rend());
+        for (size_t i=0;i<top.size()&&i<14;++i) RT_LOG("  live %s",top[i].second.c_str());
+        ReportImageAges();
+    }
 }
 } // namespace nvn
 using nvn::AdoptCachedImage; using nvn::RetireTexture;

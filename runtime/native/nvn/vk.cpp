@@ -101,6 +101,13 @@ void CreateDevice(VulkanContext& vk) {
     VK_CHECK(vkEnumerateDeviceExtensionProperties(vk.physical,nullptr,&extension_count,nullptr));
     std::vector<VkExtensionProperties> available(extension_count);
     VK_CHECK(vkEnumerateDeviceExtensionProperties(vk.physical,nullptr,&extension_count,available.data()));
+#ifdef __linux__
+    {   // (memory pools backed by exported GPU memory mapped in place: memory.cpp, AMD)
+        bool fd = false, dma = false;
+        for (const auto& e : available) { fd |= !std::strcmp(e.extensionName, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME); dma |= !std::strcmp(e.extensionName, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME); }
+        if (fd && dma) { extensions.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME); extensions.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME); vk.dma_buf = true; }
+    }
+#endif
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomic_float{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT};
     for(const auto& extension:available)if(!std::strcmp(extension.extensionName,VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME)){
         VkPhysicalDeviceFeatures2 supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};supported.pNext=&atomic_float;
@@ -115,13 +122,23 @@ void CreateDevice(VulkanContext& vk) {
     VkPhysicalDeviceRobustness2FeaturesEXT robustness{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
     if(vk.buffer_float32_atomic_add)robustness.pNext=&atomic_float;
     robustness.nullDescriptor=VK_TRUE;
-    robustness.robustBufferAccess2=VK_TRUE; // reads past a bound range return zero (driver banks bind only their used bytes)
-    robustness.robustImageAccess2=VK_TRUE;
+    // Bounds-checked buffer access: reads past a bound range return zero. NVIDIA pays heavily for it (Hookshot measured
+    // 50%+ lower frame rates there: their issues 394, 418, 419), so it is on elsewhere only. OOT_ROBUST=0/1 forces it.
+    vk.robust = std::getenv("OOT_ROBUST") ? std::atoi(std::getenv("OOT_ROBUST")) != 0 : vk.properties.vendorID != 0x10DE;
+    RT_LOG("robust buffer access: %s", vk.robust ? "on" : "off");
+    robustness.robustBufferAccess2=vk.robust;
+    robustness.robustImageAccess2=vk.robust;
     VkPhysicalDeviceMeshShaderFeaturesEXT mesh_shaders{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
     mesh_shaders.pNext=&robustness;
     mesh_shaders.taskShader = VK_TRUE;
     mesh_shaders.meshShader = VK_TRUE;
-    mesh_shaders.meshShaderQueries = VK_TRUE; // (draw-log statistics of task/mesh invocations)
+    {   // (draw-log statistics of task/mesh invocations, where the driver has them: RADV does not)
+        VkPhysicalDeviceMeshShaderFeaturesEXT supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; query.pNext = &supported;
+        vkGetPhysicalDeviceFeatures2(vk.physical, &query);
+        mesh_shaders.meshShaderQueries = supported.meshShaderQueries;
+        vk.mesh_shader_queries = supported.meshShaderQueries;
+    }
     VkPhysicalDeviceIndexTypeUint8FeaturesKHR uint8_indices{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_KHR};
     uint8_indices.indexTypeUint8 = VK_TRUE;
     uint8_indices.pNext = &mesh_shaders;
@@ -179,7 +196,7 @@ void CreateDevice(VulkanContext& vk) {
     VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features.pNext = vk.conditional_rendering ? static_cast<void*>(&conditional) : static_cast<void*>(&v11);
     vkGetPhysicalDeviceFeatures(vk.physical, &features.features); // enable everything the core offers
-    features.features.robustBufferAccess = VK_TRUE;
+    features.features.robustBufferAccess = vk.robust;
 
     VkDeviceCreateInfo info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     info.pNext = &features;
@@ -245,8 +262,24 @@ std::string PipelineCachePath() {
 }
 } // namespace
 
+// Mesa drivers (RADV on the Steam Deck) keep every pipeline in their own disk cache, per pipeline and
+// loaded on demand: a cache of the application's own would only be a second copy, all of it in memory
+// (it grows past 1 GB) and written again and again. OOT_APP_PIPELINE_CACHE=1 keeps it there too.
+bool DriverCachesPipelines() {
+    static const bool mesa = [] {
+        VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2}; props.pNext = &driver;
+        vkGetPhysicalDeviceProperties2(Vk().physical, &props);
+        const bool m = driver.driverID == VK_DRIVER_ID_MESA_RADV || driver.driverID == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA ||
+                       driver.driverID == VK_DRIVER_ID_MESA_TURNIP || driver.driverID == VK_DRIVER_ID_MESA_NVK;
+        if (m && !std::getenv("OOT_APP_PIPELINE_CACHE")) RT_LOG("pipeline cache: the driver's own (%s)", driver.driverName);
+        return m && !std::getenv("OOT_APP_PIPELINE_CACHE");
+    }();
+    return mesa;
+}
 VkPipelineCache PipelineCache() {
     if (pipeline_cache) return pipeline_cache;
+    if (DriverCachesPipelines()) return VK_NULL_HANDLE;
     std::vector<char> data;
     if (FILE* f = std::fopen(PipelineCachePath().c_str(), "rb")) {
         std::fseek(f, 0, SEEK_END);
@@ -269,14 +302,15 @@ VkPipelineCache PipelineCache() {
 }
 
 namespace { void SavePipelineCacheNow(); }
-// Writes the cache on a background thread, at most every 10 s: it is hundreds of MB, and writing
+// Writes the cache on a background thread, at most once a minute: it is hundreds of MB, and writing
 // it on the command thread stalled the frame for up to 0.7 s.
 void SavePipelineCache() {
     if (!pipeline_cache) return;
     static std::atomic<bool> saving{false};
     static auto last = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
-    if (now - last < std::chrono::seconds(10) || saving.exchange(true)) return;
+    static const bool off = std::getenv("OOT_NO_CACHE_SAVE") != nullptr; // (diagnostic: only at exit)
+    if (off || now - last < std::chrono::seconds(60) || saving.exchange(true)) return;
     last = now;
     std::thread([] { SavePipelineCacheNow(); saving = false; }).detach();
 }
@@ -284,6 +318,9 @@ void SavePipelineCache() {
 void SavePipelineCacheBlocking() { if (pipeline_cache) SavePipelineCacheNow(); }
 namespace {
 void SavePipelineCacheNow() {
+    const auto t0 = std::chrono::steady_clock::now();
+    struct Report { std::chrono::steady_clock::time_point t0; size_t before; ~Report() { if (pipeline_cache_saved != before)
+        RT_LOG("pipeline cache: %zu MiB saved in %.0f ms", pipeline_cache_saved >> 20, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()); } } report{t0, pipeline_cache_saved};
     size_t size = 0;
     if (vkGetPipelineCacheData(Vk().device, pipeline_cache, &size, nullptr) != VK_SUCCESS || size <= pipeline_cache_saved) return;
     std::vector<char> data(size);

@@ -21,6 +21,8 @@ FormatInfo GetFormat(u32 nvn_format);
 
 struct Texture : std::enable_shared_from_this<Texture> {
     Texture() = default;
+    Texture(const Texture&) = default;
+    ~Texture(); // (texture.cpp: forgets it as its image's holder)
     u64 object = 0; // guest NVNtexture
     u32 format = 0;
     Target target = Target::T2D;
@@ -32,6 +34,7 @@ struct Texture : std::enable_shared_from_this<Texture> {
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     u64 allocation_size=0;
+    void* block = nullptr; u64 memory_offset = 0; // (memory: part of a shared block, texture.cpp ImageBlocks)
     bool owner_finalized=false,gpu_retirement_pending=false;
     VkImageView view = VK_NULL_HANDLE; // full view with the texture's own format and swizzle
     std::vector<std::pair<TextureView, VkImageView>> views;
@@ -40,7 +43,9 @@ struct Texture : std::enable_shared_from_this<Texture> {
     bool gpu_written = false; // rendered to: contents live on the host GPU
     bool uploaded = false;
     u64 upload_frame = 0; // (OOT_REUPLOAD_TEXTURES diagnostic)
+    u64 used_frame = 0; // (the frame EnsureImage last ran for it)
     u32 upload_sequence = 0, checked_sequence = 0; // CPU-write tracking (ArmTextureMemory)
+    u64 content_hash = 0, hash_frame = 0;          // (where pages cannot be protected: the contents' hash at upload)
     bool decoded_astc = false;
     bool bc3 = false; // decoded ASTC kept as BC3 (re-encoded on the GPU: a quarter of RGBA8's memory)
     bool decoded_rgb9e5 = false; // RGB9E5 (no host storage-image support) kept as RGBA16F

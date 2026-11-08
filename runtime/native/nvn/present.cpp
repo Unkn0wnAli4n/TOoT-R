@@ -1,3 +1,7 @@
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 #include <cmath>
 #include "upscale.h"
 #include "overlay.h"
@@ -24,6 +28,7 @@ extern "C" volatile unsigned long long oot_dynres_context;
 #include "texture.h"
 #include "batch.h"
 
+std::atomic<int> profile_present_tid{0}; // (profiler.cpp: OOT_PROFILE_WALL=present)
 namespace nvn {
 namespace {
 
@@ -225,7 +230,8 @@ void PresentPacing() {
     // 60 frames per second at most when frame skip is on (or OOT_FPS_LIMIT): the game advances
     // one fixed step per frame, so faster frames would run it fast.
     {
-        static const bool limit = FrameSkipEnabled() || RealtimeOn() || std::getenv("OOT_FPS_LIMIT") != nullptr; // (the step is at least 1/60 s)
+        // (OOT_UNCAPPED=1, benchmarks: no limit, to measure how far above 60 frames per second the game could run)
+        static const bool limit = std::getenv("OOT_UNCAPPED") == nullptr && (FrameSkipEnabled() || RealtimeOn() || std::getenv("OOT_FPS_LIMIT") != nullptr);
         static auto next = std::chrono::steady_clock::now();
         if (limit) {
             const auto now = std::chrono::steady_clock::now();
@@ -234,6 +240,20 @@ void PresentPacing() {
         }
     }
     RealtimeStep();
+    {   // Frame intervals (smoothness): median, 99th percentile, worst, and how many missed a 60 Hz refresh.
+        static auto last = std::chrono::steady_clock::now();
+        static std::vector<float> intervals; intervals.reserve(600);
+        const auto now = std::chrono::steady_clock::now();
+        const float ms = std::chrono::duration<float, std::milli>(now - last).count(); last = now;
+        if (ms < 1000) intervals.push_back(ms);
+        if (intervals.size() >= 600) {
+            std::vector<float> v = intervals; std::sort(v.begin(), v.end());
+            const size_t over20 = v.end() - std::upper_bound(v.begin(), v.end(), 20.0f), over33 = v.end() - std::upper_bound(v.begin(), v.end(), 33.4f);
+            RT_LOG("frame intervals (600): median %.2f ms, p99 %.2f ms, worst %.1f ms; %zu over 20 ms, %zu over 33 ms",
+                   v[v.size() / 2], v[v.size() * 99 / 100], v.back(), over20, over33);
+            intervals.clear();
+        }
+    }
     {   // Render scale: the engine's fixed-resolution path at the chosen scale (after its dynamic path ran
         // a few frames, which fills fields the 3D reads); 0 keeps the game's own dynamic resolution.
         const int scale = gfx::Current().render_scale;
@@ -268,6 +288,13 @@ void PresentPacing() {
 void PresentWindowTexture(u64 window, s32 index) {
     rt::CoreRelease release; // waits on the swapchain
     if (nvn::TimelineOn()) RT_LOG("T %.2f present", nvn::TimelineMs());
+    { 
+#ifdef __linux__
+      static thread_local const int tid = (int)syscall(SYS_gettid);
+#else
+      const int tid = 0;
+#endif
+      ::profile_present_tid.store(tid, std::memory_order_relaxed); }
     nvn::Submit(); // the frame executes before the blit (queue order)
     nvn::last_present_ns = nvn::GuestTimestampNs();
     if (CurrentFrameSkipped()) { NextFrame(); return; } // (frame skip: nothing rendered, nothing shown)
@@ -343,7 +370,9 @@ void PresentWindowTexture(u64 window, s32 index) {
         vkCmdClearColorImage(sc.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &to_dst.subresourceRange);
     }
     // (also on request: a file named "snap" in the directory takes the next image and is removed)
-    const bool dumping = dump.dir && ((sc.frames + 1) % 300 == 0 || std::remove((std::string(dump.dir) + "/snap").c_str()) == 0);
+    // (every 300th image only with OOT_PRESENT_DUMP_EVERY=1: writing one takes ~0.5 s, a hitch)
+    static const bool every = std::getenv("OOT_PRESENT_DUMP_EVERY") != nullptr;
+    const bool dumping = dump.dir && ((every && (sc.frames + 1) % 300 == 0) || std::remove((std::string(dump.dir) + "/snap").c_str()) == 0);
     VkImageLayout last = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     if (dumping) {
         EnsureDumpBuffer((VkDeviceSize)sc.extent.width * sc.extent.height * 4);
@@ -417,8 +446,9 @@ void PresentWindowTexture(u64 window, s32 index) {
         const u64 flushes = FlushCount();
         static u64 last_gpu = GpuBusyNanoseconds(), last_wait = FenceWaitNanoseconds();
         const u64 gpu = GpuBusyNanoseconds(), wait = FenceWaitNanoseconds();
-        RT_LOG("presented %llu frames (%.1f fps, %.1f GPU submissions, %.2f ms GPU busy, %.2f ms waiting per frame; worst %.0f ms, %u over 25 ms, %u over 50 ms)", (unsigned long long)sc.frames,
-               300.0 / seconds, (flushes - last_flushes) / 300.0, (gpu - last_gpu) / 300e6, (wait - last_wait) / 300e6, frame_worst_ms, frames_over_25, frames_over_50);
+        extern std::atomic<u64> executor_busy_ns;
+        RT_LOG("presented %llu frames (%.1f fps, %.1f GPU submissions, %.2f ms GPU busy, %.2f ms waiting, %.2f ms recording per frame; worst %.0f ms, %u over 25 ms, %u over 50 ms)", (unsigned long long)sc.frames,
+               300.0 / seconds, (flushes - last_flushes) / 300.0, (gpu - last_gpu) / 300e6, (wait - last_wait) / 300e6, executor_busy_ns.exchange(0) / 300e6, frame_worst_ms, frames_over_25, frames_over_50);
         frame_worst_ms = 0; frames_over_25 = frames_over_50 = 0;
         last_gpu = gpu; last_wait = wait;
         last_report = now;

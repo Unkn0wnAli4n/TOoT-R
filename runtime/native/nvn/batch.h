@@ -22,8 +22,17 @@ void ReportGpuProfile();
 // ends the instance. Within an instance rasterization order keeps attachment accesses ordered.
 // Whether the open batch has a render pass instance open with this key (PassDraw would reuse it).
 bool PassOpenWithKey(const std::vector<u64>& key);
+// What a draw accesses (textures by host object, guest memory ranges): a render pass whose first draw
+// conflicts with nothing recorded since the last full barrier begins without one (no pipeline drain).
+struct PassAccess {
+    std::vector<const void*> read_textures, written_textures; // (attachments are written)
+    std::vector<std::pair<u64, u64>> reads, writes;
+    bool global_read = false, global_write = false;           // (shader accesses through pointers: anywhere)
+};
 void PassDraw(const std::vector<u64>& key, const std::function<void(VkCommandBuffer)>& begin,
-              const std::function<void(VkCommandBuffer)>& draw, u64 profile_key = 0);
+              const std::function<void(VkCommandBuffer)>& draw, u64 profile_key = 0, const PassAccess* access = nullptr);
+// Work recorded without a full barrier whose accesses are not described: the next pass orders after it.
+void NoteUnorderedWork();
 void EndPass();
 // Records work that carries its own narrow barriers (the item it depends on and what depends on it
 // are ordered by `record` itself): no full barrier before it, and reopening the same render pass
@@ -82,6 +91,9 @@ void NotePendingWrite(u64 address, u64 size, bool write_back = true); // write_b
 // A GPU write whose data CPU readers already see (e.g. uniform updates, kept in an overlay): only
 // copied back to guest memory, never waited for.
 void NoteWriteBack(u64 address, u64 size);
+// Guest time blocked on the GPU (per-frame report): 0 nvnSyncWait, 1 readbacks (invalidates), 2 nvnQueueFinish.
+extern std::atomic<u64> cpu_wait_ns[3];
+void DropDeviceAhead(u64 address, u64 size); // (a pool goes)
 bool HasPendingWrite(u64 address, u64 size);
 bool PendingWriteRange(u64 address, u64 size, u64* start, u64* end); // the pending range hit (diagnostics)
 // An invalidate: GPU work writing [address, address + size), and its write-back, completes first.

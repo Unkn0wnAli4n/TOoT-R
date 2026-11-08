@@ -23,6 +23,9 @@ struct VulkanContext {
     VkQueue copy_queue = VK_NULL_HANDLE; // (same family: write-back copies beside the main queue; else = queue)
     std::mutex copy_mutex;               // (copy_queue's submissions, when it is its own queue)
     u32 queue_count = 1;
+    bool mesh_shader_queries = false;
+    bool dma_buf = false;
+    bool robust = true; // bounds-checked buffer access (vk.cpp) // (VK_KHR_external_memory_fd + VK_EXT_external_memory_dma_buf enabled) // (VkPhysicalDeviceMeshShaderFeaturesEXT::meshShaderQueries enabled)
     VkCommandPool command_pool = VK_NULL_HANDLE;
     u64 host_import_alignment = 0x1000;
     bool buffer_float32_atomic_add=false;

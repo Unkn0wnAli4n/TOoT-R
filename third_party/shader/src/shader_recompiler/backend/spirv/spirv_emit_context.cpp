@@ -8,6 +8,7 @@
 #include <array>
 #include <bit>
 #include <climits>
+#include <cstdlib>
 
 #include <boost/container/static_vector.hpp>
 
@@ -606,7 +607,12 @@ void EmitContext::DefineLocalMemory(const IR::Program& program) {
     const Id element_type{TypeStruct(U32[1])};
     const Id type{TypeArray(element_type, Const(num_elements))};
     const Id pointer{TypePointer(spv::StorageClass::Private, type)};
-    local_memory = AddGlobalVariable(pointer, spv::StorageClass::Private);
+    // Local memory read before the shader writes it holds 0 on the console; a Private array without an initializer is
+    // undefined, and NVIDIA's driver hands such a read another lane's values (OoT's clustered-light loop then added other
+    // pixels' light: objects lit neon, floors in 4x8 tiles). From Hookshot 08b413e (NX2navi ee6fbaf). OOT_LOCAL_ZERO=0: not.
+    static const bool zero_local = [] { const char* v = std::getenv("OOT_LOCAL_ZERO"); return v == nullptr || v[0] != '0'; }();
+    local_memory = zero_local ? AddGlobalVariable(pointer, spv::StorageClass::Private, ConstantNull(type))
+                              : AddGlobalVariable(pointer, spv::StorageClass::Private);
     if (profile.supported_spirv >= 0x00010400) {
         interfaces.push_back(local_memory);
     }

@@ -59,8 +59,11 @@ static void RaiseDriverShaderCaches() {
     set("MESA_SHADER_CACHE_MAX_SIZE", "10G");
 }
 
+namespace rt { void StartProfiler(); }
+using rt::StartProfiler;
 int main(int argc, char** argv) {
     RaiseDriverShaderCaches();
+    StartProfiler(); // (OOT_PROFILE=1)
     std::string data_dir;
     if (argc > 1) data_dir = argv[1];
     else data_dir = DataDir();
