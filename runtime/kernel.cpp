@@ -359,6 +359,16 @@ s32 CountAddressWaiters(u64 addr) {
 }
 
 // ---- memory ------------------------------------------------------------------------------------
+// Guest memory is private anonymous memory everywhere (OOT_ANONYMOUS_MEMORY): AMD's Vulkan drivers import only
+// anonymous pages (VK_EXT_external_memory_host, the kernel's userptr), so a shared memfd heap could not reach the
+// GPU on the Steam Deck. Stacks mapped from the heap (SvcMapMemory) are copies then: the source pages are
+// inaccessible while mapped, so a copy is exact (copied back on unmap). Discarded pages read as zero again.
+#define OOT_ANONYMOUS_MEMORY 1
+#ifdef _WIN32
+constexpr int DiscardAdvice = MADV_REMOVE;  // (platform.cpp: decommit)
+#else
+constexpr int DiscardAdvice = MADV_DONTNEED; // (private anonymous: zero-filled on the next access)
+#endif
 u64 heap_size = 0;
 bool heap_reserved = false;
 int heap_fd = -1;
@@ -401,7 +411,7 @@ u32 SvcMapMemory(Cpu* c, bool map) {
                 return ResultInvalidCurrentMemory;
         // Both mappings use the same pages. Protect the original heap address until unmap,
         // matching the SDK's ownership transfer of heap storage to an alias stack.
-#ifdef _WIN32
+#if OOT_ANONYMOUS_MEMORY
         // No shared mappings: the source pages are inaccessible while mapped, so a copy is an
         // exact stand-in (copied back on unmap).
         (void)source_fd; (void)source_offset;
@@ -420,11 +430,11 @@ u32 SvcMapMemory(Cpu* c, bool map) {
         if (it == stack_mappings.end() || it->second.source != src || it->second.size != size)
             return ResultInvalidCurrentMemory;
         // Replace only the mapping we own, retaining the reserved address range.
-#ifdef _WIN32
+#if OOT_ANONYMOUS_MEMORY
         if (mprotect(reinterpret_cast<void*>(src), size, PROT_READ | PROT_WRITE) != 0)
             Fatal("cannot restore stack source pages");
         std::memcpy(reinterpret_cast<void*>(src), reinterpret_cast<void*>(dst), size);
-        if (madvise(reinterpret_cast<void*>(dst), size, MADV_REMOVE) != 0) return ResultOutOfResource;
+        if (madvise(reinterpret_cast<void*>(dst), size, DiscardAdvice) != 0) return ResultOutOfResource;
 #else
         void* p = mmap(reinterpret_cast<void*>(dst), size, PROT_NONE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
@@ -462,8 +472,10 @@ u32 SvcMapPhysicalMemory(Cpu* c, bool map) {
         if (Overlaps(addr, size, m.source, m.size)) return ResultInvalidCurrentMemory;
     if (mprotect(reinterpret_cast<void*>(addr), size, map ? PROT_READ | PROT_WRITE : PROT_NONE) != 0)
         return ResultOutOfResource;
-    if (!map && madvise(reinterpret_cast<void*>(addr), size, MADV_REMOVE) != 0)
+    if (!map && madvise(reinterpret_cast<void*>(addr), size, DiscardAdvice) != 0)
         Fatal("cannot discard unmapped physical pages");
+    { static u64 mapped = 0; mapped = map ? mapped + size : mapped - std::min(mapped, size);
+      static u64 shown = 0; if (shown++ < 20) RT_LOG("memory: physical %s %#llx+%#llx (%llu MiB mapped)", map ? "map" : "unmap", (unsigned long long)addr, (unsigned long long)size, (unsigned long long)(mapped >> 20)); }
     u64 begin = addr, end = addr + size;
     for (auto it = physical_mappings.begin(); it != physical_mappings.end();) {
         const u64 old_begin = it->first, old_end = old_begin + it->second;
@@ -891,7 +903,7 @@ u32 SvcSetHeapSize(Cpu* c) {
         if (m.source < HeapBase + HeapReserve && m.source + m.size > HeapBase + size)
             return ResultInvalidCurrentMemory;
     if (!heap_reserved) {
-#ifdef _WIN32
+#if OOT_ANONYMOUS_MEMORY
         void* p = mmap(reinterpret_cast<void*>(HeapBase), HeapReserve, PROT_NONE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0);
 #else
@@ -901,17 +913,23 @@ u32 SvcSetHeapSize(Cpu* c) {
                        MAP_SHARED | MAP_FIXED_NOREPLACE | MAP_NORESERVE, heap_fd, 0);
 #endif
         if (p != reinterpret_cast<void*>(HeapBase)) Fatal("cannot reserve heap");
+#ifdef __linux__
+        // (no transparent huge pages: the renderer imports guest pages into the GPU (userptr on amdgpu), and a huge
+        // page split or merged invalidates the imports, pinned again at the next submission; from Hookshot, issue 312)
+        if (!std::getenv("OOT_THP")) madvise(reinterpret_cast<void*>(HeapBase), HeapReserve, MADV_NOHUGEPAGE);
+#endif
         heap_reserved = true;
     }
     if (size > heap_size) {
         if (mprotect(reinterpret_cast<void*>(HeapBase + heap_size), size - heap_size, PROT_READ | PROT_WRITE) != 0)
             return ResultOutOfResource;
     } else if (size < heap_size) {
-        if (madvise(reinterpret_cast<void*>(HeapBase + size), heap_size - size, MADV_REMOVE) != 0 ||
+        if (madvise(reinterpret_cast<void*>(HeapBase + size), heap_size - size, DiscardAdvice) != 0 ||
             mprotect(reinterpret_cast<void*>(HeapBase + size), heap_size - size, PROT_NONE) != 0)
             return ResultOutOfResource;
     }
     heap_size = size;
+    RT_LOG("memory: heap %llu MiB", (unsigned long long)(size >> 20));
     c->x[1] = HeapBase;
     return ResultSuccess;
 }
@@ -977,7 +995,7 @@ void SignalKernelEvent(u32 handle) { SetEvent(handle, true); }
 void ClearKernelEvent(u32 handle) { SetEvent(handle, false); }
 
 void InitializeKernel() {
-#ifdef _WIN32
+#if OOT_ANONYMOUS_MEMORY
     void* p = mmap(reinterpret_cast<void*>(AliasBase), AliasSize, PROT_NONE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0);
 #else
@@ -987,6 +1005,9 @@ void InitializeKernel() {
                    MAP_SHARED | MAP_FIXED_NOREPLACE | MAP_NORESERVE, physical_fd, 0);
 #endif
     if (p != reinterpret_cast<void*>(AliasBase)) Fatal("cannot reserve the alias region");
+#ifdef __linux__
+    if (!std::getenv("OOT_THP")) madvise(reinterpret_cast<void*>(AliasBase), AliasSize, MADV_NOHUGEPAGE); // (as the heap's)
+#endif
     p = mmap(reinterpret_cast<void*>(StackBase), StackSize, PROT_NONE,
              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0);
     if (p != reinterpret_cast<void*>(StackBase)) Fatal("cannot reserve the stack region");
@@ -1036,6 +1057,10 @@ void rt_svc(Cpu* c, u32 imm) {
     case 0x0A: ExitCurrentThread(); break;
     case 0x0B: { // SleepThread
         const s64 ns = (s64)c->x[0];
+        static const bool trace = std::getenv("OOT_SLEEP_TRACE") != nullptr;
+        if (trace) { static std::mutex m; static std::map<std::pair<u64, s64>, u64> seen; static u64 n = 0; std::lock_guard l{m};
+            ++seen[{c->x[30], ns < 1000000 ? ns : ns / 100000 * 100000}];
+            if (++n % 3000 == 0) { for (auto& [k, v] : seen) if (v > 20) RT_LOG("sleep %.4f ms from %s: %llu", k.second / 1e6, DescribeAddress(k.first).c_str(), (unsigned long long)v); seen.clear(); } }
         if (ns <= 0) std::this_thread::yield();
         else std::this_thread::sleep_for(std::chrono::nanoseconds(ns));
         return;

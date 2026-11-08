@@ -94,4 +94,6 @@ void ReportSlowFrame(double frame_ms); // render.cpp
 void UniformUpdatesBefore(u64 cpu, u64 size); // render.cpp (uniform overlays)
 void ReportUniformOverlays();
 bool FrameLogged(); // render.cpp: the current frame is being logged (OOT_DRAW_LOG*)
+void NoteCpuEvent(u32* value);
+bool IsCpuEvent(u32* value);
 } // namespace nvn

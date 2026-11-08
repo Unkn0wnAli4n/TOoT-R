@@ -682,7 +682,7 @@ u8 AttributeType(VkFormat format) {
 // Each translation is stored with the constants it depended on, keyed by everything the variant
 // match above compares; a later run whose constants match uses it instead of translating.
 // Bump ShaderCacheVersion when the translator's output changes. OOT_NO_SHADER_CACHE=1 disables it.
-constexpr u32 ShaderCacheVersion=5; // 2: subgroup operations in task/mesh programs; 3: NaN guard, fog scale (in the key); 4: guard clamp 65000; 5: NaN-safe min/max/saturate
+constexpr u32 ShaderCacheVersion=6; // 2: subgroup operations in task/mesh programs; 3: NaN guard, fog scale (in the key); 4: guard clamp 65000; 5: NaN-safe min/max/saturate; 6: local memory starts at zero
 bool ShaderCacheEnabled(){static const bool on=std::getenv("OOT_NO_SHADER_CACHE")==nullptr;return on;}
 std::string ShaderCacheDirectory(){
     static const std::string dir=[]{std::string d=rt::DataDir()+"/shader_cache";
@@ -691,7 +691,7 @@ std::string ShaderCacheDirectory(){
 }
 u64 ShaderCacheKey(const ShaderCode& code,const nvshader::Request& r){
     u64 h=0xcbf29ce484222325ull;const auto mix=[&](const void* p,size_t n){const u8* b=static_cast<const u8*>(p);for(size_t i=0;i<n;++i)h=(h^b[i])*0x100000001b3ull;};
-    mix(&ShaderCacheVersion,4);{const char* fog=std::getenv("OOT_FOG_SCALE");const char* nan=std::getenv("OOT_NAN_GUARD");const std::string k=std::string(fog?fog:"")+"/"+(nan?nan:"");mix(k.data(),k.size());}mix(code.code.data(),code.code.size());mix(code.control.data(),code.control.size());
+    mix(&ShaderCacheVersion,4);{const char* fog=std::getenv("OOT_FOG_SCALE");const char* nan=std::getenv("OOT_NAN_GUARD");const char* lz=std::getenv("OOT_LOCAL_ZERO");const std::string k=std::string(fog?fog:"")+"/"+(nan?nan:"")+"/"+(lz?lz:"");mix(k.data(),k.size());}mix(code.code.data(),code.code.size());mix(code.control.data(),code.control.size());
     mix(&r.stage,4);mix(&r.binding_base,4);mix(r.input_types.data(),r.input_types.size());mix(r.color_types.data(),r.color_types.size());
     mix(&r.have_previous_stores,1);mix(r.previous_stores.data(),sizeof(u64)*r.previous_stores.size());mix(&r.topology,4);mix(&r.convert_depth,1);
     mix(&r.point_size,4);mix(r.mesh_registers.data(),4*r.mesh_registers.size());mix(&r.storage_alignment,8);mix(&r.buffer_float32_atomic_add,1);
@@ -1013,6 +1013,16 @@ u32 ResourceHandle(const nvshader::Resource& r,ShaderVariant& shader,u32 element
                 return ReadWord((address&~(alignment-1))+offset);
             })+element;
     }
+    // A handle word where a storage buffer of the same program keeps its address is no handle (from Hookshot
+    // 3858629 / Fritchii d603d98bb): OoT's water loads each light's handle per pixel from the light buffer, and the
+    // translation falls back to that buffer's address, whose low bits named a different texture each frame (the
+    // water flickered). No texture there. OOT_HANDLE_POINTER=1: the old handle.
+    static const bool handle_pointer=std::getenv("OOT_HANDLE_POINTER")!=nullptr;
+    if(!handle_pointer&&!r.secondary){
+        const u32 at=r.offset+(element<<r.size_shift);
+        for(const auto& sb:shader.compiled.resources)
+            if(sb.kind==nvshader::ResourceKind::StorageBuffer&&sb.indirect_offset==~0u&&sb.storage_index==~0u&&sb.bank==r.bank&&at>=sb.offset&&at<sb.offset+8)return 0;
+    }
     u32 value=Cbuf(&stage,r.bank,r.offset+(element<<r.size_shift))<<r.shift;
     if(r.secondary)value|=Cbuf(&stage,r.secondary_bank,r.secondary_offset+(element<<r.size_shift))<<r.secondary_shift;
     return value;
@@ -1249,13 +1259,26 @@ bool WriteDescriptors(Pipeline& pipeline){
                     queue_write(r,std::move(buffers),{});
                     continue;
                 }
-                if(!b.size)b.size=std::min<u64>(range.available,64u<<20);
+                // Bound to the end of its memory: written ones up to 64 MiB, read-only ones as far as a storage binding
+                // reaches (1 GiB at most). OoT's froxel fog finds its light probes up to ~130 MB past the pointer; past
+                // the binding they read 0 and the fog went overbright (from Hookshot 3858629 / Lichii #351).
+                // OOT_STORAGE_READ_MB=<MiB> caps the read-only ones.
+                static const u64 read_cap=[&]{const u64 reach=std::min<u64>(vk.properties.limits.maxStorageBufferRange,1ull<<30)&~0xffffull;
+                    return std::max<u64>(64ull<<20,std::getenv("OOT_STORAGE_READ_MB")?std::min<u64>(reach,(u64)std::atoll(std::getenv("OOT_STORAGE_READ_MB"))<<20):reach);}();
+                if(!b.size)b.size=std::min<u64>(range.available,r.kind==nvshader::ResourceKind::StorageBuffer&&!r.written?read_cap:(64u<<20));
                 // Extent the shader accesses: an NVN storage descriptor in the driver bank holds its
                 // size at +8 (shaders keep to it; the binding itself stays wider).
                 u64 extent=std::min(b.size,range.available);
                 if(r.kind==nvshader::ResourceKind::StorageBuffer&&r.indirect_offset==~0u&&r.bank==0){
                     static const bool whole=std::getenv("OOT_WHOLE_STORAGE_WRITES")!=nullptr;
                     const u64 nvn_size=Cbuf(&stage,r.bank,r.offset+8);if(nvn_size&&!whole)extent=std::min(extent,nvn_size);}
+                {static const u64 info=std::getenv("OOT_SHADER_INFO")?std::strtoull(std::getenv("OOT_SHADER_INFO"),nullptr,16):0;
+                 if(info==1&&!range.pool->device_buffer){static std::set<std::tuple<u64,u32,u32>> seen;if(seen.insert({shader->source->address,r.bank,r.offset}).second&&seen.size()<400)RT_LOG("host-memory binding: shader %#llx stage %u %s bank %u+%#x: %#llx+%#llx pool %#llx+%#llx flags %#x",
+                    (unsigned long long)shader->source->address,shader->source->stage,r.kind==nvshader::ResourceKind::StorageBuffer?(r.written?"storage (written)":"storage"):"uniform",r.bank,r.offset,(unsigned long long)b.address,(unsigned long long)extent,
+                    (unsigned long long)range.pool->address,(unsigned long long)range.pool->size,range.pool->flags);}
+                 if(info&&shader->source->address==info){static int shown=0;if(shown++<40)RT_LOG("shader %#llx %s bank %u+%#x: %#llx+%#llx pool %#llx flags %#x %s",(unsigned long long)info,
+                    r.kind==nvshader::ResourceKind::StorageBuffer?(r.written?"storage (written)":"storage"):"uniform",r.bank,r.offset,(unsigned long long)b.address,(unsigned long long)extent,
+                    (unsigned long long)range.pool->address,range.pool->flags,range.pool->device_buffer?"device copy":"host memory");}}
                 if(r.kind==nvshader::ResourceKind::StorageBuffer&&r.written){static const bool write_back=std::getenv("OOT_NO_STORAGE_WRITEBACK")==nullptr;NotePendingWrite(b.address,extent,write_back);descriptor_writes=true;}
                 (r.kind==nvshader::ResourceKind::StorageBuffer&&r.written?descriptor_buffer_writes:descriptor_buffer_reads).push_back({b.address,b.address+extent});
                 const u64 alignment=r.kind==nvshader::ResourceKind::StorageBuffer?vk.properties.limits.minStorageBufferOffsetAlignment:vk.properties.limits.minUniformBufferOffsetAlignment;
@@ -1452,7 +1475,7 @@ void Draw(const Command& command) {
     VkQueryPool stats_pool=VK_NULL_HANDLE;
     if(LogThisFrame()){LogDraw(command);static VkQueryPool pool=VK_NULL_HANDLE;
         if(!pool){VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};qi.queryType=VK_QUERY_TYPE_PIPELINE_STATISTICS;qi.queryCount=1;
-            qi.pipelineStatistics=VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_PRIMITIVES_BIT|VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT|VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT|VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT|VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT|VK_QUERY_PIPELINE_STATISTIC_TASK_SHADER_INVOCATIONS_BIT_EXT|VK_QUERY_PIPELINE_STATISTIC_MESH_SHADER_INVOCATIONS_BIT_EXT;
+            qi.pipelineStatistics=VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_PRIMITIVES_BIT|VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT|VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT|VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT|VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT|(Vk().mesh_shader_queries?VK_QUERY_PIPELINE_STATISTIC_TASK_SHADER_INVOCATIONS_BIT_EXT|VK_QUERY_PIPELINE_STATISTIC_MESH_SHADER_INVOCATIONS_BIT_EXT:0);
             VK_CHECK(vkCreateQueryPool(Vk().device,&qi,nullptr,&pool));}
         stats_pool=pool;}
     const bool mesh=(Op)command.op==Op::DrawMeshTasks;
@@ -1584,12 +1607,29 @@ void Draw(const Command& command) {
         for(auto* color:colors)if(color)color->gpu_written=true;
         if(depth)depth->gpu_written=true;
         const bool count_samples=gpu_counters.ready&&samples.enabled;
+        // What this draw touches (render passes whose draws conflict with nothing since the last full
+        // barrier begin without one). Sizes not known here (vertex, index) count as 1 MiB.
+        static PassAccess access;
+        static const bool tracking=std::getenv("OOT_PASS_HAZARDS")!=nullptr;
+        if(tracking){
+        access.read_textures.assign(descriptor_reads.begin(),descriptor_reads.end());
+        access.written_textures.assign(descriptor_image_writes.begin(),descriptor_image_writes.end());
+        for(auto* c:colors)if(c)access.written_textures.push_back(c);
+        if(depth)access.written_textures.push_back(depth);
+        access.reads=descriptor_buffer_reads;access.writes=descriptor_buffer_writes;
+        access.global_read=access.global_write=false;
+        for(const auto* shader:pipeline.shaders){access.global_read|=shader->compiled.global_loads;access.global_write|=shader->compiled.global_stores;}
+        for(u32 st=0;st<8;++st)if(st!=5&&state.stages[st].shader)for(const auto& u:state.stages[st].uniforms)if(u.address)access.reads.push_back({u.address,u.address+std::max<u64>(u.size,256)});
+        for(const auto& v:state.vertices)if(v.address)access.reads.push_back({v.address,v.address+(v.size?v.size:(1u<<20))});
+        if((command.op==(u32)Op::DrawElements||command.op==(u32)Op::DrawElementsInstanced||command.op==(u32)Op::DrawElementsBaseVertex)&&command.x[3])
+            access.reads.push_back({command.x[3],command.x[3]+(1u<<20)});
+        }
         PassDraw(key,[&](VkCommandBuffer cmd){
             begin(cmd);
             if(count_samples){ // the pass instance's first occlusion segment
                 const u32 q=samples.next++;vkCmdBeginQuery(cmd,samples.pool,q,VK_QUERY_CONTROL_PRECISE_BIT);gpu_counters.segment_query=q;
                 SetPassEndHook([q](VkCommandBuffer c){vkCmdEndQuery(c,samples.pool,q);gpu_counters.segment_query=~0u;});}
-        },record,profile_key);
+        },record,profile_key,tracking&&!mesh_indirect_slot?&access:nullptr);
         if(!fast){ // what the next draw may reuse
             fd.valid=pipeline.push&&descriptor_fast_eligible&&!descriptor_writes&&predicate==~0u&&!mesh;
             if(fd.valid){fd.pipeline=&pipeline;fd.colors=colors;fd.depth=depth;fd.extent=extent;fd.attachments=attachments;fd.da=da;fd.key=key;

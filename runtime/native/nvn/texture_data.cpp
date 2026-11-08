@@ -362,7 +362,23 @@ void EnsureUploaded(Texture& t) {
     if (reupload && t.uploaded && !t.gpu_written && t.upload_frame != CurrentFrameNumber()) t.uploaded = false;
     // CPU writes to the texture's memory since its upload (menus fill label and icon textures
     // after first use): upload again.
-    if (t.uploaded && !t.gpu_written && t.storage) {
+    // (without page protection, small textures (menus' labels and icons) are hashed again every 16 frames)
+    constexpr u64 HashedMax = 512u << 10;
+    const auto hash_of = [](const Texture& tex, u64* out) {
+        const auto range = LookupAddress(tex.storage);
+        if (!range.pool || range.available < tex.storage_size) return false;
+        const u64* w = reinterpret_cast<const u64*>(range.cpu_address);
+        u64 h = 0x9e3779b97f4a7c15ull ^ tex.storage_size;
+        for (u64 i = 0, n = tex.storage_size / 8; i < n; ++i) h = (h ^ w[i]) * 0x100000001b3ull + (h >> 29);
+        *out = h;
+        return true;
+    };
+    const bool by_content = !PageProtectionUsable();
+    if (by_content && t.uploaded && !t.gpu_written && t.storage && t.storage_size <= HashedMax && CurrentFrameNumber() >= t.hash_frame + 16) {
+        t.hash_frame = CurrentFrameNumber();
+        u64 h; if (hash_of(t, &h) && h != t.content_hash) { t.uploaded = false; ++cpu_reuploads; }
+    }
+    if (!by_content && t.uploaded && !t.gpu_written && t.storage) {
         const u32 now = TextureWriteSequence();
         if (now != t.checked_sequence) {
             t.checked_sequence = now;
@@ -373,6 +389,7 @@ void EnsureUploaded(Texture& t) {
     t.upload_frame = CurrentFrameNumber();
     // Protect first, then read: writes from here on are seen by the next check.
     if (t.storage && t.samples == 1) t.upload_sequence = t.checked_sequence = ArmTextureMemory(t.storage, t.storage_size);
+    if (by_content && t.storage && t.storage_size <= HashedMax) { t.hash_frame = CurrentFrameNumber(); if (!hash_of(t, &t.content_hash)) t.content_hash = 0; }
     static const bool trace_r8 = std::getenv("OOT_R8_TRACE") != nullptr;
     if (trace_r8 && t.format == 1 && t.storage) {
         std::vector<u8> bytes(std::min<u64>(t.storage_size, 1u << 20)); ReadStorage(t.storage, bytes.data(), bytes.size());

@@ -29,6 +29,7 @@ struct Pool;
 struct HostImport {
     ~HostImport();
     u64 base = 0, size = 0;
+    bool backed = false; // (GPU memory mapped over the guest range instead of an import of it: memory.cpp, AMD)
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkBuffer buffer = VK_NULL_HANDLE;
 };
@@ -96,6 +97,13 @@ void PrepareHostWrite(u64 address, u64 size);
 // returns the current write sequence; TextureMemoryWritten tells whether the CPU wrote any of it
 // (at 64 KiB granularity) after that sequence. TextureWriteSequence changes with every such write.
 u32 ArmTextureMemory(u64 address, u64 size);
+// Whether imported guest pages may be write-protected to find CPU writes. Not with AMD's drivers: amdgpu checks
+// every imported (userptr) page at each submission, and one read-only page gets the submission rejected and the
+// device lost (measured on the Steam Deck). Textures are then checked by content (texture_data.cpp).
+bool PageProtectionUsable();
+// GPU results kept in a pool's device copy (batch.cpp): inaccessible to the CPU until copied back.
+void ProtectDeviceAhead(u64 start, u64 end);
+void SettleDeviceAhead(u64 start, u64 end);
 bool TextureMemoryWritten(u64 address, u64 size, u32 since);
 u32 TextureWriteSequence();
 void ReportPoolStats();
