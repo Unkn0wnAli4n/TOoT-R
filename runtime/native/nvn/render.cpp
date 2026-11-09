@@ -1673,6 +1673,54 @@ namespace { u64 GuestDeviceAddress(u64 address); }
 std::map<VkShaderModule,std::unique_ptr<Pipeline>> compute_pipelines;
 // indirect: guest address of {x, y, z} workgroup counts written by GPU work in the open batch;
 // they are read on the GPU (vkCmdDispatchIndirect, and copied into the driver bank's +0x4..+0xc).
+// ---- the game's neural upscaler, where its matrix multiplies are slow --------------------------------------
+// OoT upscales movies and gameplay with networks of compute passes built on the console's matrix unit (HMMA). The
+// translator expands each multiply in software: fine on NVIDIA, but on AMD (the Steam Deck) a pass took up to
+// 113 ms and its pipeline 3.5 minutes to build (a black screen at 3 fps). There, as Hookshot does (b306c4d), the
+// network's passes are left out and the pass writing the output image becomes a linear upscale of its input: the
+// largest colour texture the pass samples, into the largest image it writes (not also sampled).
+// OOT_NETWORKS=1: always run them; =0: always the stand-in (also on NVIDIA, to compare).
+bool IsNetwork(const ShaderCode& code){
+    static std::unordered_map<const ShaderCode*,bool> known;
+    auto it=known.find(&code);if(it!=known.end())return it->second;
+    u32 hits=0;for(size_t at=0;at+16<=code.code.size();at+=16){u32 w;std::memcpy(&w,code.code.data()+at,4);hits+=(w&0xfff)==0x23c;}
+    const bool network=hits>=4;
+    if(network){static int shown=0;if(shown++<32)RT_LOG("compute program %#llx is an upscaling network (%u matrix multiplies)",(unsigned long long)code.address,hits);}
+    return known[&code]=network;
+}
+bool SlowNetworks(){
+    static const bool slow=[]{const char* e=std::getenv("OOT_NETWORKS");if(e)return std::atoi(e)==0;
+        const u32 vendor=Vk().properties.vendorID;const bool s=vendor==0x1002||vendor==0x8086;
+        if(s)RT_LOG("upscaling networks: a linear upscale instead (this GPU's matrix multiplies are emulated slowly)");return s;}();
+    return slow;
+}
+void NetworkStandIn(ShaderVariant& v){
+    std::vector<Texture*> images,textures;
+    for(const auto& r:v.compiled.resources){
+        if(r.kind!=nvshader::ResourceKind::Image&&r.kind!=nvshader::ResourceKind::Texture)continue;
+        for(u32 e=0;e<r.count;++e){const u32 handle=ResourceHandle(r,v,e);if(!handle)continue;
+            Texture* t=Binding(handle).host.get();if(!t)continue;(r.kind==nvshader::ResourceKind::Image?images:textures).push_back(t);}
+    }
+    const auto area=[](const Texture* t){return (u64)t->width*t->height;};
+    const auto has=[](const std::vector<Texture*>& list,const Texture* t){for(auto* x:list)if(x==t||(x->storage&&x->storage==t->storage))return true;return false;};
+    Texture* out=nullptr;for(auto* t:images)if(t->depth<=1&&!has(textures,t)&&(!out||area(t)>area(out)))out=t;
+    if(!out)return; // (an earlier pass: feature maps in buffers)
+    Texture* in=nullptr;for(auto* t:textures)if(t->depth<=1&&t->target==out->target&&!has(images,t)&&!t->info.depth&&(!in||area(t)>area(in)))in=t;
+    if(!in||area(in)>=area(out))return;
+    EnsureUploaded(*in);EnsureImage(*out);
+    auto& vk=Vk();VkFormatProperties fi,fo;vkGetPhysicalDeviceFormatProperties(vk.physical,in->info.vk,&fi);vkGetPhysicalDeviceFormatProperties(vk.physical,out->info.vk,&fo);
+    if(!(fi.optimalTilingFeatures&VK_FORMAT_FEATURE_BLIT_SRC_BIT)||!(fi.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)||!(fo.optimalTilingFeatures&VK_FORMAT_FEATURE_BLIT_DST_BIT)){
+        static int told=0;if(told++<8)RT_LOG("upscaling network stand-in: formats %d -> %d cannot be blitted",(int)in->info.vk,(int)out->info.vk);return;}
+    {static int shown=0;if(shown++<8)RT_LOG("upscaling network stand-in: %ux%u fmt %u -> %ux%u fmt %u",in->width,in->height,in->format,out->width,out->height,out->format);}
+    Texture* src=in;Texture* dst=out;
+    Immediate([src,dst](VkCommandBuffer cmd){
+        Transition(cmd,*src,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);Transition(cmd,*dst,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkImageBlit b{};b.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};b.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};
+        b.srcOffsets[1]={(s32)src->width,(s32)src->height,1};b.dstOffsets[1]={(s32)dst->width,(s32)dst->height,1};
+        vkCmdBlitImage(cmd,src->image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,dst->image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&b,VK_FILTER_LINEAR);
+    });
+    out->gpu_written=true;
+}
 void Dispatch(u32 gx,u32 gy,u32 gz,u64 indirect=0){
     // (Compute is never skipped: exposure/luminance measurement and simulations run every frame on
     // the last rendered images; skipping them left stale exposure: strongly exaggerated bloom.)
@@ -1687,6 +1735,7 @@ void Dispatch(u32 gx,u32 gy,u32 gz,u64 indirect=0){
                 (unsigned long long)shader,total,ms[0],ms[1],ms[2],ms[3],ms[4]);}}} phases;phases.shader=stage.shader->address;
     auto& v=CompileShader(*stage.shader,0,nullptr);auto& vk=Vk();phases.mark(0);
     if(!v.module)return; // not translatable
+    if(IsNetwork(*stage.shader)&&SlowNetworks()){NetworkStandIn(v);return;}
     if(v.compiled.global_loads||v.compiled.global_stores)GlobalAddressTable(); // (pools may have changed)
     phases.mark(1);
     auto& slot=compute_pipelines[v.module];
@@ -1701,12 +1750,31 @@ void Dispatch(u32 gx,u32 gy,u32 gz,u64 indirect=0){
         VK_CHECK(vkCreatePipelineLayout(vk.device,&li,nullptr,&slot->layout));
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};ci.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         ci.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;ci.stage.module=v.module;ci.stage.pName="main";ci.layout=slot->layout;
+        // AMD (RADV's optimizer): OoT's largest compute programs (300k+ SPIR-V words) took up to 3.5 minutes to build on the
+        // Steam Deck, the game frozen meanwhile. Programs past OOT_NOOPT_WORDS (40000; 0: never) are built without the
+        // optimizer first (from Hookshot f414a76), and optimized on a worker, which takes over when done.
+        static const u64 noopt_words=std::getenv("OOT_NOOPT_WORDS")?std::strtoull(std::getenv("OOT_NOOPT_WORDS"),nullptr,10):40000;
+        const bool quick=vk.properties.vendorID==0x1002&&noopt_words&&v.compiled.spirv.size()>noopt_words;
+        if(quick)ci.flags|=VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
         const auto t0=std::chrono::steady_clock::now();
         VkPipeline created=VK_NULL_HANDLE;VK_CHECK(vkCreateComputePipelines(vk.device,PipelineCache(),1,&ci,nullptr,&created));slot->pipeline.store(created);
+        if(quick){
+            Pipeline* target=slot.get();const VkShaderModule module=v.module;const VkPipelineLayout layout=slot->layout;const u64 address=stage.shader->address;
+            PipelineWorkers().Run([target,module,layout,address]{
+                auto& vk=Vk();const auto t0=std::chrono::steady_clock::now();
+                VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};ci.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+                ci.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;ci.stage.module=module;ci.stage.pName="main";ci.layout=layout;
+                VkPipeline optimized=VK_NULL_HANDLE;
+                if(vkCreateComputePipelines(vk.device,PipelineCache(),1,&ci,nullptr,&optimized)!=VK_SUCCESS)return;
+                const VkPipeline old=target->pipeline.exchange(optimized);
+                RT_LOG("compute pipeline for shader %#llx optimized on a worker in %.0f ms",(unsigned long long)address,std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count());
+                AfterFlush([old]{vkDestroyPipeline(Vk().device,old,nullptr);}); // (after work recorded with it)
+            });
+        }
         {const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
          if(ms>20){u64 h=0xcbf29ce484222325ull;for(u32 w:v.compiled.spirv)h=(h^w)*0x100000001b3ull;
-             RT_LOG("compute pipeline for shader %#llx built in %.0f ms (SPIR-V %zu words, hash %016llx%s)",(unsigned long long)stage.shader->address,ms,v.compiled.spirv.size(),(unsigned long long)h,
-                    v.compiled.global_loads||v.compiled.global_stores?", global memory":"");}}
+             RT_LOG("compute pipeline for shader %#llx built in %.0f ms (SPIR-V %zu words, hash %016llx%s%s)",(unsigned long long)stage.shader->address,ms,v.compiled.spirv.size(),(unsigned long long)h,
+                    v.compiled.global_loads||v.compiled.global_stores?", global memory":"",quick?", without the optimizer":"");}}
     }
     auto& pipeline=*slot;phases.mark(2);
     if(!WriteDescriptors(pipeline))return;
