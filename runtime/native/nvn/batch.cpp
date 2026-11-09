@@ -745,30 +745,45 @@ void NoteWriteBack(u64 address, u64 size) {
 // ---- GPU storage writes copied back when read ---------------------------------------------------
 // Storage results reach guest memory only when something reads them: the game invalidates the range (its
 // readback), or the runtime looks at it (HasPendingWrite guards those reads). Until then they stay in the
-// pool's device copy (OoT writes ~78 MiB a frame on the GPU and reads back ~8 of it). A binding read back
-// once is copied back eagerly from then on. OOT_EAGER_WRITEBACK=1: every batch copies all back (as before).
+// pool's device copy (OoT writes ~78 MiB a frame on the GPU and reads a few words of it). Pages the CPU read
+// once are copied back eagerly from then on; the rest stays inaccessible to the CPU (a touch copies that page
+// back first). OOT_EAGER_WRITEBACK=1: every batch copies all back (as before).
 namespace {
-std::map<u64, u64> device_ahead; // binding start -> end: GPU-written, not yet in guest memory
-std::set<u64> read_back;         // binding starts the CPU reads
-u64 deferred_bytes = 0, recalled_bytes = 0;
+std::map<u64, u64> device_ahead;           // binding start -> end: GPU-written, not yet (all) in guest memory
+std::set<u64> cpu_pages;                   // pages of GPU results the CPU reads (copied back every time; by address:
+                                           // the game binds the same memory at other offsets frame to frame)
+u64 deferred_bytes = 0, recalled_bytes = 0, eager_bytes = 0;
 bool DeferWriteBack() { static const bool on = std::getenv("OOT_EAGER_WRITEBACK") == nullptr; return on; }
-// (batch lock held) Ranges overlapping [address, address + size) are copied back by the open batch.
+constexpr u64 Page = 4096;
+// (batch lock held) [address, address + size) of GPU results still on the GPU comes back with the open batch; those
+// pages are copied back eagerly from then on (OoT reads a few words at the start of buffers of megabytes).
 bool RecallDeviceAhead(u64 address, u64 size) {
-    if (device_ahead.empty()) return false;
+    if (device_ahead.empty() || !size) return false;
     bool any = false;
-    for (auto it = device_ahead.begin(); it != device_ahead.end() && it->first < address + size;) {
-        if (it->second <= address) { ++it; continue; }
-        if (!batch.cmd) BeginWork();
-        AddRange(batch.pending_writes, it->first, it->second);
-        AddRange(batch.pending_writeback, it->first, it->second);
-        read_back.insert(it->first);
-        recalled_bytes += it->second - it->first;
-        SettleDeviceAhead(it->first, it->second);
+    // (whole pages, and every binding on them: a page becomes accessible as a whole)
+    const u64 first = address & ~(Page - 1), last = (address + size + Page - 1) & ~(Page - 1);
+    auto it = device_ahead.lower_bound(last);
+    while (it != device_ahead.begin()) {
+        --it;
+        const u64 start = it->first, end = it->second;
+        if (end <= first) { if (start + (64ull << 20) < first) break; continue; } // (bindings are at most 64 MiB)
+        const u64 lo = std::max(start, first), hi = std::min(end, last);
+        if (lo >= hi) continue;
+        // (pages already known go back with the batches writing them: waiting for those is enough)
+        for (u64 page = lo & ~(Page - 1); page < hi; page += Page) {
+            if (cpu_pages.count(page)) continue;
+            const u64 a = std::max(page, lo), b = std::min(page + Page, hi);
+            if (!batch.cmd) BeginWork();
+            AddRange(batch.pending_writes, a, b);
+            AddRange(batch.pending_writeback, a, b);
+            cpu_pages.insert(page);
+            recalled_bytes += b - a;
+            SettleDeviceAhead(a, b);
+            any = true;
+        }
         static int shown = 0;
-        if (shown++ < 24) RT_LOG("GPU results %#llx+%#llx are read on the CPU: copied back from now on",
-                                 (unsigned long long)it->first, (unsigned long long)(it->second - it->first));
-        it = device_ahead.erase(it);
-        any = true;
+        if (any && shown++ < 24) RT_LOG("GPU results %#llx-%#llx (of %#llx+%#llx) are read on the CPU: those pages copied back from now on",
+                                        (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)start, (unsigned long long)(end - start));
     }
     return any;
 }
@@ -783,9 +798,10 @@ void DropDeviceAhead(u64 address, u64 size) { // (a pool goes: its results are n
 void ReportDeviceAhead() {
     std::lock_guard lock{BatchMutex()};
     if (!DeferWriteBack()) return;
-    RT_LOG("GPU results kept on the GPU: %.2f MiB per frame (%.2f MiB copied back when read; %zu bindings read back)",
-           deferred_bytes / 300.0 / 1048576.0, recalled_bytes / 300.0 / 1048576.0, read_back.size());
-    deferred_bytes = recalled_bytes = 0;
+    const size_t pages = cpu_pages.size();
+    RT_LOG("GPU results kept on the GPU: %.2f MiB per frame; copied back: %.2f MiB of pages the CPU reads, %.2f MiB on first reads (%zu pages known)",
+           (deferred_bytes - eager_bytes) / 300.0 / 1048576.0, eager_bytes / 300.0 / 1048576.0, recalled_bytes / 300.0 / 1048576.0, pages);
+    deferred_bytes = recalled_bytes = eager_bytes = 0;
 }
 void NotePendingWrite(u64 address, u64 size, bool write_back) {
     if (!size) return;
@@ -796,10 +812,14 @@ void NotePendingWrite(u64 address, u64 size, bool write_back) {
     }
     std::lock_guard lock{BatchMutex()};
     AddRange(batch.pending_writes, address, address + size);
-    if (write_back && DeferWriteBack() && !read_back.count(address)) {
+    if (write_back && DeferWriteBack()) {
         u64& end = device_ahead[address];
-        if (end < address + size) { end = address + size; ProtectDeviceAhead(address, end); }
+        if (end < address + size) { end = address + size; ProtectDeviceAhead(address, end, &cpu_pages); }
         deferred_bytes += size;
+        for (auto page = cpu_pages.lower_bound(address & ~(Page - 1)); page != cpu_pages.end() && *page < address + size; ++page) {
+            const u64 lo = std::max(*page, address), hi = std::min(*page + Page, address + size); // (pages the CPU reads: back with this batch)
+            if (lo < hi) { AddRange(batch.pending_writeback, lo, hi); eager_bytes += hi - lo; }
+        }
     } else if (write_back) AddRange(batch.pending_writeback, address, address + size);
 }
 

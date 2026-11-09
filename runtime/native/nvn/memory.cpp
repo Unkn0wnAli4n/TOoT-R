@@ -10,11 +10,13 @@
 #include <pthread.h>
 #include <ucontext.h>
 #include <execinfo.h>
+#include <dlfcn.h>
 #include <unistd.h>
 #endif
 #include <vector>
 #include <mutex>
 #include <map>
+#include <set>
 
 #include "../../native.h"
 #include "memory.h"
@@ -382,10 +384,12 @@ bool HandleFault(u64 address, u64 host_pc) {
     const u64 page = address & ~(PageSize - 1);
     if (u64 start, end; AheadAt(address, &start, &end)) {
         static std::atomic<u32> shown{0};
-        if (shown++ < 40) RT_LOG("CPU reads GPU results at %#llx (pages %#llx-%#llx, host pc %#llx): copying them back",
-                                 (unsigned long long)address, (unsigned long long)start, (unsigned long long)end, (unsigned long long)host_pc);
-        nvn::WaitForWrites(start, end - start); // (copies the bindings there back; their pages are settled on the way)
-        nvn::SettleDeviceAhead(start, end);     // (in case another thread recalled it meanwhile)
+        if (shown++ < 200) { char name[32] = "?"; pthread_getname_np(pthread_self(), name, sizeof name);
+            Dl_info info{}; dladdr(reinterpret_cast<void*>(host_pc), &info);
+            RT_LOG("CPU reads GPU results at %#llx (pages %#llx-%#llx, host pc +%#llx, thread %s): copying them back",
+                   (unsigned long long)address, (unsigned long long)start, (unsigned long long)end, (unsigned long long)(host_pc - (u64)info.dli_fbase), name); }
+        nvn::WaitForWrites(page, PageSize);     // (copies that page back; it is settled on the way)
+        nvn::SettleDeviceAhead(page, page + PageSize); // (in case another thread recalled it meanwhile)
         return true;
     }
     if (u64* back = BackSerial(page); back && __atomic_load_n(back, __ATOMIC_ACQUIRE)) {
@@ -629,29 +633,47 @@ bool CreateDeviceCopy(Pool& p) {
 VkBuffer GpuBuffer(const Pool& p) { return p.device_buffer ? p.device_buffer : p.buffer; }
 
 } // namespace
-void ProtectDeviceAhead(u64 start, u64 end) {
+// Pages of [start, end) except `keep` (page addresses the CPU reads: copied back eagerly, left accessible).
+void ProtectDeviceAhead(u64 start, u64 end, const std::set<u64>* keep) {
     static const bool off = std::getenv("OOT_AHEAD_NO_PROTECT") != nullptr;
     if (off || !MirrorEnabled()) return;
     track::InstallHandler();
     const u64 first = start & ~(track::PageSize - 1), last = (end + track::PageSize - 1) & ~(track::PageSize - 1);
+    std::vector<std::pair<u64, u64>> runs;
     {
         std::lock_guard lock{track::ahead_mutex};
-        auto it = track::ahead_pages.upper_bound(first);
-        if (it != track::ahead_pages.begin() && std::prev(it)->second > first) return; // (already)
-        if (it != track::ahead_pages.end() && it->first < last) return;               // (overlaps another: left unprotected)
-        track::ahead_pages[first] = last;
+        // (page by page: those not kept and not already in a protected run; runs of them are added)
+        const auto covered = [&](u64 page) {
+            auto it = track::ahead_pages.upper_bound(page);
+            return it != track::ahead_pages.begin() && std::prev(it)->second > page;
+        };
+        u64 run = 0;
+        const auto close = [&](u64 to) { if (run && to > run) { track::ahead_pages[run] = to; runs.push_back({run, to}); } run = 0; };
+        for (u64 page = first; page < last; page += track::PageSize) {
+            if ((keep && keep->count(page)) || covered(page)) close(page);
+            else if (!run) run = page;
+        }
+        close(last);
     }
+    if (runs.empty()) return;
     track::Guard guard;
-    mprotect(reinterpret_cast<void*>(first), last - first, PROT_NONE);
+    for (auto [a, b] : runs) mprotect(reinterpret_cast<void*>(a), b - a, PROT_NONE);
 }
+// The pages of [start, end) become accessible again (the rest of a protected run stays protected).
 void SettleDeviceAhead(u64 start, u64 end) {
     const u64 first = start & ~(track::PageSize - 1), last = (end + track::PageSize - 1) & ~(track::PageSize - 1);
     std::vector<std::pair<u64, u64>> settle;
     {
         std::lock_guard lock{track::ahead_mutex};
-        for (auto it = track::ahead_pages.begin(); it != track::ahead_pages.end();) {
-            if (it->first < last && first < it->second) { settle.push_back(*it); it = track::ahead_pages.erase(it); }
-            else ++it;
+        auto it = track::ahead_pages.upper_bound(first);
+        if (it != track::ahead_pages.begin()) --it;
+        while (it != track::ahead_pages.end() && it->first < last) {
+            const u64 a = it->first, b = it->second;
+            if (b <= first) { ++it; continue; }
+            it = track::ahead_pages.erase(it);
+            if (a < first) track::ahead_pages[a] = first;
+            if (b > last) track::ahead_pages[last] = b;
+            settle.push_back({std::max(a, first), std::min(b, last)});
         }
     }
     if (settle.empty()) return;
