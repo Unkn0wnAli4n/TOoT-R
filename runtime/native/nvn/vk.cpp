@@ -30,9 +30,31 @@ void CreateInstance(VulkanContext& vk) {
     info.ppEnabledExtensionNames = extensions.data();
     std::vector<const char*> layers;
     if (std::getenv("OOT_VK_VALIDATION")) layers.push_back("VK_LAYER_KHRONOS_validation");
+    const bool report = std::getenv("OOT_ADDRESS_REPORT") != nullptr;
+    if (report) { extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME); info.enabledExtensionCount = (u32)extensions.size(); info.ppEnabledExtensionNames = extensions.data(); }
     info.enabledLayerCount = (u32)layers.size();
     info.ppEnabledLayerNames = layers.data();
     VK_CHECK(vkCreateInstance(&info, nullptr, &vk.instance));
+    if (report) { // OOT_ADDRESS_REPORT=1 (diagnosis of GPU page faults): every GPU address binding, to <data>/address_report.txt
+        static FILE* out = std::fopen((rt::DataDir() + "/address_report.txt").c_str(), "w");
+        VkDebugUtilsMessengerCreateInfoEXT mi{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+        mi.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+        mi.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT;
+        mi.pfnUserCallback = [](VkDebugUtilsMessageSeverityFlagBitsEXT, VkDebugUtilsMessageTypeFlagsEXT, const VkDebugUtilsMessengerCallbackDataEXT* d, void*) -> VkBool32 {
+            for (auto* n = static_cast<const VkBaseInStructure*>(d->pNext); n; n = n->pNext)
+                if (n->sType == VK_STRUCTURE_TYPE_DEVICE_ADDRESS_BINDING_CALLBACK_DATA_EXT && out) {
+                    const auto* b = reinterpret_cast<const VkDeviceAddressBindingCallbackDataEXT*>(n);
+                    std::fprintf(out, "%s %#llx+%#llx object %d %#llx%s\n", b->bindingType == VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT ? "bind" : "unbind",
+                                 (unsigned long long)b->baseAddress, (unsigned long long)b->size, d->objectCount ? (int)d->pObjects[0].objectType : -1,
+                                 d->objectCount ? (unsigned long long)d->pObjects[0].objectHandle : 0ull, (b->flags & VK_DEVICE_ADDRESS_BINDING_INTERNAL_OBJECT_BIT_EXT) ? " internal" : "");
+                    std::fflush(out);
+                }
+            return VK_FALSE;
+        };
+        auto create = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(vkGetInstanceProcAddr(vk.instance, "vkCreateDebugUtilsMessengerEXT"));
+        VkDebugUtilsMessengerEXT messenger;
+        if (create) create(vk.instance, &mi, nullptr, &messenger);
+    }
 }
 
 void PickDevice(VulkanContext& vk) {
@@ -205,6 +227,16 @@ void CreateDevice(VulkanContext& vk) {
     vkGetPhysicalDeviceFeatures(vk.physical, &features.features); // enable everything the core offers
     features.features.robustBufferAccess = vk.robust;
 
+    VkPhysicalDeviceAddressBindingReportFeaturesEXT address_report{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT};
+    if (std::getenv("OOT_ADDRESS_REPORT")) {
+        u32 n = 0; vkEnumerateDeviceExtensionProperties(vk.physical, nullptr, &n, nullptr);
+        std::vector<VkExtensionProperties> all(n); vkEnumerateDeviceExtensionProperties(vk.physical, nullptr, &n, all.data());
+        for (const auto& e : all) if (!std::strcmp(e.extensionName, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME)) {
+            extensions.push_back(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
+            address_report.reportAddressBinding = VK_TRUE; address_report.pNext = features.pNext; features.pNext = &address_report;
+            RT_LOG("GPU address bindings are reported (address_report.txt)");
+        }
+    }
     VkDeviceCreateInfo info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     info.pNext = &features;
     info.queueCreateInfoCount = 1;

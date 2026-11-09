@@ -191,10 +191,14 @@ void ImportPool(Pool& p) {
     }
     // A new import of exactly the range. (Imports must not overlap: the driver refuses pages already
     // imported. Larger shared chunks were tried: a later pool across a chunk's end could not be imported.)
-    if (BackPools() && p.import_size >= (1u << 20)) {
+    // (OOT_BACK_MIN_KB: the smallest pool put in GPU memory. Small pools imported were ~3800 userptr objects on the Deck,
+    // and amdgpu checks each one at every submission: 18 ms a submission)
+    static const u64 back_min = std::getenv("OOT_BACK_MIN_KB") ? std::strtoull(std::getenv("OOT_BACK_MIN_KB"), nullptr, 10) << 10 : (1u << 20);
+    if (BackPools() && p.import_size >= back_min) {
         bool overlap = false;
         for (auto& [b, w] : imports) if (auto i = w.lock(); i && i->base < end && p.import_base < i->base + i->size) overlap = true;
         if (!overlap) if (auto backed = CreateBacked(p.import_base, p.import_size)) {
+            if (std::getenv("OOT_ADDRESS_REPORT")) RT_LOG("pool %#llx+%#llx: GPU memory buffer %#llx", (unsigned long long)p.import_base, (unsigned long long)p.import_size, (unsigned long long)(u64)backed->buffer);
             ++imports_live;
             imports[backed->base] = backed;
             p.host_import = backed; p.buffer = backed->buffer; p.buffer_offset = 0;
@@ -218,6 +222,7 @@ void ImportPool(Pool& p) {
     if (!imp) Fatal("cannot import guest memory %#llx+%#llx into Vulkan (%llu imports live)", (unsigned long long)p.import_base,
                     (unsigned long long)p.import_size, (unsigned long long)imports_live.load());
     ++imports_live;
+    if (std::getenv("OOT_ADDRESS_REPORT")) RT_LOG("pool %#llx+%#llx: imported as buffer %#llx", (unsigned long long)p.import_base, (unsigned long long)p.import_size, (unsigned long long)(u64)imp->buffer);
     for (auto e = imports.begin(); e != imports.end();) e = e->second.expired() ? imports.erase(e) : std::next(e); // (forget released ones)
     imports[imp->base] = imp;
     p.host_import = imp; p.buffer = imp->buffer; p.buffer_offset = p.import_base - imp->base;
@@ -789,6 +794,8 @@ u64 GlobalAddressTable(bool update) {
             if (FILE* f = std::fopen(replay_path.c_str(), "wb")) { std::fwrite(&now, sizeof now, 1, f); std::fclose(f); }
         }
         RT_LOG("guest address table: %s GPU address", replayed ? "the same" : vk.address_replay ? "a new (kept)" : "this run's");
+        { VkBufferDeviceAddressInfo ai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO}; ai.buffer = buffer;
+          RT_LOG("guest address table at GPU address %#llx", (unsigned long long)vkGetBufferDeviceAddress(vk.device, &ai)); }
         VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bi.size = 8 + Capacity * 24; // (the mapping below)
         VK_CHECK(vkMapMemory(vk.device, memory, 0, bi.size, 0, reinterpret_cast<void**>(&mapped)));
         VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
@@ -1181,9 +1188,13 @@ u32 TextureWriteSequence() { return track::write_sequence.load(std::memory_order
 std::atomic<u64> cpu_reuploads{0}; // (texture_data.cpp counts)
 void ReportPoolStats() {
     {   // (each import is a userptr object on amdgpu, whose pages the kernel checks at every submission)
-        std::lock_guard lock{imports_mutex}; u64 bytes = 0, n = 0;
-        for (auto& [b0, w] : imports) if (auto i = w.lock()) { bytes += i->size; ++n; }
-        RT_LOG("imports: %llu live, %.0f MiB", (unsigned long long)n, bytes / 1048576.0);
+        std::lock_guard lock{imports_mutex}; u64 bytes = 0, n = 0, backed_bytes = 0, backed = 0;
+        std::map<u64, u64> sizes; // (imports by size class, MiB)
+        for (auto& [b0, w] : imports) if (auto i = w.lock()) {
+            if (i->backed) { backed_bytes += i->size; ++backed; continue; }
+            bytes += i->size; ++n; sizes[i->size >= (1u << 20) ? 1 : 0] += i->size; }
+        RT_LOG("imports: %llu live, %.0f MiB (%.0f MiB of them 1 MiB or larger); %llu pools in GPU memory, %.0f MiB", (unsigned long long)n, bytes / 1048576.0,
+               sizes[1] / 1048576.0, (unsigned long long)backed, backed_bytes / 1048576.0);
     }
     if (const u64 n = track::pending_faults.exchange(0)) RT_LOG("write-back: %llu CPU accesses waited for copies (%.2f ms per frame)",
         (unsigned long long)n, track::pending_wait_ns.exchange(0) / 1e6 / 300.0);
