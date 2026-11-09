@@ -488,9 +488,20 @@ ImageKey KeyOf(const Texture& t) {
 }
 std::mutex cache_mutex;
 std::list<ImageKey> cache_order;
+// Small images the GPU drew (4 MiB or less) have an LRU and budget of their own: OoT draws some once (terrain tiles'
+// normal maps when a chunk comes in), finalizes them, and later makes a texture over that memory again and samples it
+// without drawing it. The render targets cycling through the main cache evicted them, and they came back from guest
+// memory as garbage: streaks over the ground in square patches after a while of play (Hookshot #593/763a693).
+// OOT_SMALL_IMAGE_CACHE_MB=0: one cache, as before.
+std::list<ImageKey> small_order;
+u64 small_cached_bytes = 0;
+const u64 SmallImageMax = 4ull << 20;
+const u64 SmallCacheBudget = std::getenv("OOT_SMALL_IMAGE_CACHE_MB") ? std::strtoull(std::getenv("OOT_SMALL_IMAGE_CACHE_MB"), nullptr, 10) << 20 : 512ull << 20;
+constexpr size_t SmallCacheEntries = 8192;
 struct CachedImage {
     std::unique_ptr<Texture> texture;
     std::list<ImageKey>::iterator position;
+    bool small = false;
 };
 std::map<ImageKey,CachedImage> image_cache;
 
@@ -510,10 +521,12 @@ void DestroyLater(Texture* t) {
 } // namespace
 
 // (cache_mutex held)
-void EvictOldest() {
-    auto old = image_cache.find(cache_order.front());
-    if (old != image_cache.end()) { image_cached_bytes-=old->second.texture->allocation_size;DestroyLater(old->second.texture.release()); image_cache.erase(old); ++image_cache_evicted; }
-    cache_order.pop_front();
+void EvictOldest(bool small = false) {
+    auto& order = small ? small_order : cache_order;
+    auto old = image_cache.find(order.front());
+    if (old != image_cache.end()) { image_cached_bytes-=old->second.texture->allocation_size;if(small)small_cached_bytes-=old->second.texture->allocation_size;
+        DestroyLater(old->second.texture.release()); image_cache.erase(old); ++image_cache_evicted; }
+    order.pop_front();
 }
 std::atomic<u64> image_cache_overlap{0};
 void AdoptCachedImage(Texture& t) {
@@ -538,11 +551,11 @@ void AdoptCachedImage(Texture& t) {
     Texture& cached = *it->second.texture;
     t.image = cached.image; t.memory = cached.memory; t.view = cached.view; t.views = std::move(cached.views);
     t.block = cached.block; t.memory_offset = cached.memory_offset; cached.block = nullptr;
-    t.allocation_size=cached.allocation_size;image_cached_bytes-=cached.allocation_size;
+    t.allocation_size=cached.allocation_size;image_cached_bytes-=cached.allocation_size;if(it->second.small)small_cached_bytes-=cached.allocation_size;
     t.layout = cached.layout; t.usage = cached.usage; t.gpu_written = contents && cached.gpu_written; t.uploaded = contents && cached.uploaded;
     t.decoded_astc = cached.decoded_astc; t.bc3 = cached.bc3; t.decoded_rgb9e5 = cached.decoded_rgb9e5; t.info = cached.info;
     cached.image = VK_NULL_HANDLE; cached.memory = VK_NULL_HANDLE; cached.view = VK_NULL_HANDLE; cached.views.clear();
-    cache_order.erase(it->second.position);
+    (it->second.small ? small_order : cache_order).erase(it->second.position);
     image_cache.erase(it);
     ++image_cache_adopted;
 }
@@ -553,18 +566,20 @@ void RetireTexture(Texture* t) {
     std::lock_guard lock{cache_mutex};
     const ImageKey key = KeyOf(*t);
     auto it=image_cache.find(key);
-    if(it!=image_cache.end()) {
-        image_cached_bytes-=it->second.texture->allocation_size;
+    if(it!=image_cache.end()) { // (the older one goes; this one takes its place in its list)
+        image_cached_bytes-=it->second.texture->allocation_size;if(it->second.small)small_cached_bytes-=it->second.texture->allocation_size;
         DestroyLater(it->second.texture.release());
-        cache_order.splice(cache_order.end(),cache_order,it->second.position);
-        it->second.texture.reset(t);
-    } else {
-        cache_order.push_back(key);
-        image_cache.emplace(key,CachedImage{std::unique_ptr<Texture>(t),std::prev(cache_order.end())});
+        (it->second.small ? small_order : cache_order).erase(it->second.position);
+        image_cache.erase(it);
     }
-    image_cached_bytes+=t->allocation_size;
+    const bool small=SmallCacheBudget&&t->allocation_size<=SmallImageMax;
+    auto& order=small?small_order:cache_order;
+    order.push_back(key);
+    image_cache.emplace(key,CachedImage{std::unique_ptr<Texture>(t),std::prev(order.end()),small});
+    image_cached_bytes+=t->allocation_size;if(small)small_cached_bytes+=t->allocation_size;
     t->object = 0;
-    while (image_cache.size() > ImageCacheEntries||image_cached_bytes>ImageCacheBudget) EvictOldest();
+    while (!cache_order.empty()&&(cache_order.size() > ImageCacheEntries||image_cached_bytes-small_cached_bytes>ImageCacheBudget)) EvictOldest(false);
+    while (!small_order.empty()&&(small_order.size() > SmallCacheEntries||small_cached_bytes>SmallCacheBudget)) EvictOldest(true);
 }
 // ---- one image per memory and description, as on the console ----------------------------------------
 // OoT makes new texture objects over the same memory every frame (its render targets) while older objects
@@ -701,7 +716,8 @@ Texture::~Texture() {
 }
 void TrimImageCache(u64 keep_bytes) {
     std::lock_guard lock{cache_mutex};
-    while (!cache_order.empty() && image_cached_bytes > keep_bytes) EvictOldest();
+    while (!cache_order.empty() && image_cached_bytes > keep_bytes) EvictOldest(false);
+    while (!small_order.empty() && image_cached_bytes > keep_bytes) EvictOldest(true);
 }
 } // namespace nvn
 namespace nvn {
