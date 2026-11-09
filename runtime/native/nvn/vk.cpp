@@ -123,6 +123,24 @@ void CreateDevice(VulkanContext& vk) {
     VK_CHECK(vkEnumerateDeviceExtensionProperties(vk.physical,nullptr,&extension_count,nullptr));
     std::vector<VkExtensionProperties> available(extension_count);
     VK_CHECK(vkEnumerateDeviceExtensionProperties(vk.physical,nullptr,&extension_count,available.data()));
+    VkPhysicalDeviceMapMemoryPlacedFeaturesEXT placed{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
+    {   // (memory pools in GPU memory mapped at their guest addresses, without exporting it: memory.cpp)
+        bool m2 = false, mp = false;
+        for (const auto& e : available) { m2 |= !std::strcmp(e.extensionName, VK_KHR_MAP_MEMORY_2_EXTENSION_NAME); mp |= !std::strcmp(e.extensionName, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME); }
+        if (m2 && mp && !std::getenv("OOT_NO_PLACED_MAPS")) {
+            VkPhysicalDeviceMapMemoryPlacedFeaturesEXT have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; query.pNext = &have;
+            vkGetPhysicalDeviceFeatures2(vk.physical, &query);
+            VkPhysicalDeviceMapMemoryPlacedPropertiesEXT props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT};
+            VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2}; p2.pNext = &props;
+            vkGetPhysicalDeviceProperties2(vk.physical, &p2);
+            if (have.memoryMapPlaced && have.memoryUnmapReserve && props.minPlacedMemoryMapAlignment <= 4096) {
+                extensions.push_back(VK_KHR_MAP_MEMORY_2_EXTENSION_NAME); extensions.push_back(VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME);
+                placed.memoryMapPlaced = VK_TRUE; placed.memoryUnmapReserve = VK_TRUE;
+                vk.placed_maps = true;
+            }
+        }
+    }
 #ifdef __linux__
     {   // (memory pools backed by exported GPU memory mapped in place: memory.cpp, AMD)
         bool fd = false, dma = false;
@@ -148,6 +166,16 @@ void CreateDevice(VulkanContext& vk) {
     // 50%+ lower frame rates there: their issues 394, 418, 419), so it is on elsewhere only. OOT_ROBUST=0/1 forces it.
     vk.robust = std::getenv("OOT_ROBUST") ? std::atoi(std::getenv("OOT_ROBUST")) != 0 : vk.properties.vendorID != 0x10DE;
     RT_LOG("robust buffer access: %s", vk.robust ? "on" : "off");
+    // Shader local memory starts at zero on NVIDIA only (its driver hands an unwritten read another lane's values); on
+    // AMD the zeroing of OoT's large local arrays went through scratch memory and faulted the GPU (Steam Deck: page
+    // faults and resets when new scenery came into view). OOT_LOCAL_ZERO=0/1 forces it.
+#ifdef _WIN32
+    if (!std::getenv("OOT_LOCAL_ZERO") && vk.properties.vendorID != 0x10DE) _putenv_s("OOT_LOCAL_ZERO", "0");
+    if (!std::getenv("OOT_LOCAL_CRS") && vk.properties.vendorID != 0x10DE) _putenv_s("OOT_LOCAL_CRS", "0");
+#else
+    if (!std::getenv("OOT_LOCAL_ZERO") && vk.properties.vendorID != 0x10DE) setenv("OOT_LOCAL_ZERO", "0", 0);
+    if (!std::getenv("OOT_LOCAL_CRS") && vk.properties.vendorID != 0x10DE) setenv("OOT_LOCAL_CRS", "0", 0); // (shader_compiler.cpp)
+#endif
     robustness.robustBufferAccess2=vk.robust;
     robustness.robustImageAccess2=vk.robust;
     VkPhysicalDeviceMeshShaderFeaturesEXT mesh_shaders{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
@@ -169,6 +197,7 @@ void CreateDevice(VulkanContext& vk) {
     v13.dynamicRendering = VK_TRUE;
     v13.synchronization2 = VK_TRUE;
     v13.maintenance4 = VK_TRUE;
+    v13.pipelineCreationCacheControl = VK_TRUE; // (render.cpp: a pipeline from the driver's cache only, or not now)
     VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     v12.pNext = &v13;
     v12.bufferDeviceAddress = VK_TRUE;
@@ -237,6 +266,7 @@ void CreateDevice(VulkanContext& vk) {
             RT_LOG("GPU address bindings are reported (address_report.txt)");
         }
     }
+    if (vk.placed_maps) { placed.pNext = features.pNext; features.pNext = &placed; }
     VkDeviceCreateInfo info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     info.pNext = &features;
     info.queueCreateInfoCount = 1;
@@ -401,3 +431,12 @@ void ReportDeviceLost() {
     for (const auto& v : vendor) RT_LOG("  vendor: %s code %#llx data %#llx", v.description, (unsigned long long)v.vendorFaultCode, (unsigned long long)v.vendorFaultData);
 }
 }
+namespace nvn {
+VkResult TracedCreateBuffer(const VkBufferCreateInfo* info, VkBuffer* buffer, const char* file, int line) {
+    const VkResult r = vkCreateBuffer(Vk().device, info, nullptr, buffer);
+    static const bool on = std::getenv("OOT_ADDRESS_REPORT") != nullptr;
+    if (on && r == VK_SUCCESS && info->size >= (1u << 20)) { const char* f = std::strrchr(file, '/');
+        RT_LOG("buffer %#llx: %.1f MiB, made at %s:%d", (unsigned long long)(u64)*buffer, info->size / 1048576.0, f ? f + 1 : file, line); }
+    return r;
+}
+} // namespace nvn

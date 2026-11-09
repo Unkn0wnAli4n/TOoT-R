@@ -1,0 +1,17 @@
+// GPU timestamps in nanoseconds where a tick is not one (the Steam Deck's is 10 ns): the report's tick count, copied
+// from the query to `source`, times the period (16.16 fixed point) into the guest's report at `destination`.
+// Regenerate with
+//   glslangValidator -V --target-env vulkan1.2 --vn timestamp_scale_spv timestamp_scale.comp -o timestamp_scale_spv.h
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference : require
+layout(local_size_x = 1) in;
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer Ticks { uint64_t value; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint lo; uint hi; };
+layout(push_constant) uniform Parameters { uint64_t source; uint64_t destination; uint64_t period_16_16; } p;
+void main() {
+    const uint64_t ticks = Ticks(p.source).value;
+    const uint64_t ns = (ticks >> 16) * p.period_16_16 + (((ticks & 0xfffful) * p.period_16_16) >> 16);
+    Words d = Words(p.destination);
+    d.lo = uint(ns); d.hi = uint(ns >> 32);
+}
