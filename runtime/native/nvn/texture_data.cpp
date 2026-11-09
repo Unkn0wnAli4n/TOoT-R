@@ -401,7 +401,19 @@ void EnsureUploaded(Texture& t) {
     upload_ns_frame += (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
     ++uploads_frame;
 }
+void UploadTexelsNow(Texture& t);
+// (large uploads are reported with their time: a 288 MB texture uploaded on first use stalled the executor)
 void UploadTexels(Texture& t) {
+    const auto t0 = std::chrono::steady_clock::now();
+    UploadTexelsNow(t);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (ms > 30 || t.storage_size > (32ull << 20)) {
+        static std::atomic<u32> shown{0};
+        if (shown++ < 40) RT_LOG("texture upload: %ux%u fmt %u levels %u layers %u, %.0f MiB at %#llx, %.0f ms%s", t.width, t.height, t.format, t.levels, t.layers,
+                                 t.storage_size / 1048576.0, (unsigned long long)t.storage, ms, t.gpu_written ? " (GPU-written)" : "");
+    }
+}
+void UploadTexelsNow(Texture& t) {
     if (t.samples != 1) return; // multisampled images receive GPU writes only
     // Texel memory GPU work of unfinished batches writes (the game produces some textures with
     // buffer writes): read it only once those results are back in guest memory.

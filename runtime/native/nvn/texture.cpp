@@ -456,9 +456,13 @@ void EnsureImage(Texture& t) {
         if(!t.image)StealLiveImage(t);
         {static const bool take=std::getenv("OOT_IMAGE_REUSE_TAKE")!=nullptr; // (taking them made the GPU time longer: re-uploads)
          if(!t.image&&take)ReuseOverlapping(t,true);}
-        if(!t.image)CreateImage(t);
+        const bool created=!t.image;
+        if(created){const auto t0=std::chrono::steady_clock::now();CreateImage(t);
+            const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
+            if(ms>20){static std::atomic<u32> shown{0};if(shown++<40)RT_LOG("image %ux%u fmt %u levels %u layers %u (%.0f MiB) at %#llx made in %.0f ms",t.width,t.height,t.format,t.levels,t.layers,
+                t.allocation_size/1048576.0,(unsigned long long)t.storage,ms);}}
         NoteHolder(t);
-        ReuseOverlapping(t,false);
+        if(created)ReuseOverlapping(t,false); // (only a new image brings a new occupant of that memory)
     }
     if(t.owner_finalized&&self&&!t.gpu_retirement_pending){
         t.gpu_retirement_pending=true;
@@ -511,15 +515,31 @@ void EvictOldest() {
     if (old != image_cache.end()) { image_cached_bytes-=old->second.texture->allocation_size;DestroyLater(old->second.texture.release()); image_cache.erase(old); ++image_cache_evicted; }
     cache_order.pop_front();
 }
+std::atomic<u64> image_cache_overlap{0};
 void AdoptCachedImage(Texture& t) {
     std::lock_guard lock{cache_mutex};
     auto it = image_cache.find(KeyOf(t));
-    if (it == image_cache.end()) return;
+    bool contents = true;
+    if (it == image_cache.end()) {
+        // A finalized image of the same description over memory t now uses: that memory was reused (OoT's transient
+        // render targets move a little every frame), so the image is free; its contents are not t's.
+        // OOT_OVERLAP_ADOPT=1 (no gain measured).
+        static const bool off = std::getenv("OOT_OVERLAP_ADOPT") == nullptr; // (no gain measured: opt-in)
+        if (off || !t.storage_size) return;
+        for (auto c = image_cache.begin(); c != image_cache.end(); ++c) {
+            const Texture& o = *c->second.texture;
+            if (o.format != t.format || o.width != t.width || o.height != t.height || o.depth != t.depth || o.levels != t.levels ||
+                o.layers != t.layers || o.samples != t.samples || o.target != t.target || !o.storage_size) continue;
+            if (o.storage >= t.storage + t.storage_size || t.storage >= o.storage + o.storage_size) continue;
+            it = c; contents = false; ++image_cache_overlap; break;
+        }
+        if (it == image_cache.end()) return;
+    }
     Texture& cached = *it->second.texture;
     t.image = cached.image; t.memory = cached.memory; t.view = cached.view; t.views = std::move(cached.views);
     t.block = cached.block; t.memory_offset = cached.memory_offset; cached.block = nullptr;
     t.allocation_size=cached.allocation_size;image_cached_bytes-=cached.allocation_size;
-    t.layout = cached.layout; t.usage = cached.usage; t.gpu_written = cached.gpu_written; t.uploaded = cached.uploaded;
+    t.layout = cached.layout; t.usage = cached.usage; t.gpu_written = contents && cached.gpu_written; t.uploaded = contents && cached.uploaded;
     t.decoded_astc = cached.decoded_astc; t.bc3 = cached.bc3; t.decoded_rgb9e5 = cached.decoded_rgb9e5; t.info = cached.info;
     cached.image = VK_NULL_HANDLE; cached.memory = VK_NULL_HANDLE; cached.view = VK_NULL_HANDLE; cached.views.clear();
     cache_order.erase(it->second.position);
@@ -594,7 +614,8 @@ void ReuseOverlapping(Texture& t, bool take) {
         if (candidates == by_desc.end()) return;
         for (Texture* h : candidates->second) {
             // (taken after 10 frames unused, destroyed after 60: objects touched every few frames keep theirs)
-            if (h == &t || !h->image || now - h->used_frame < (take ? 10u : 60u) || !h->storage_size) continue;
+            static const u64 take_after = std::getenv("OOT_IMAGE_TAKE_FRAMES") ? std::strtoull(std::getenv("OOT_IMAGE_TAKE_FRAMES"), nullptr, 10) : 60;
+            if (h == &t || !h->image || now - h->used_frame < (take ? take_after : 60u) || !h->storage_size) continue;
             if (h->storage >= t.storage + t.storage_size || t.storage >= h->storage + h->storage_size) continue;
             if (h->format != t.format || h->width != t.width || h->height != t.height || h->depth != t.depth || h->levels != t.levels ||
                 h->layers != t.layers || h->samples != t.samples || h->target != t.target) continue;
@@ -686,8 +707,8 @@ void TrimImageCache(u64 keep_bytes) {
 namespace nvn {
 void ReportImageCache() {
     std::lock_guard lock{cache_mutex};
-    RT_LOG("image cache: %llu adopted, %llu shared, %llu reused, %llu released, %llu evicted; %zu cached (%.0f MiB), %.0f MiB live (%.0f MiB decoded ASTC)",
-           (unsigned long long)image_cache_adopted.exchange(0), (unsigned long long)images_shared.exchange(0), (unsigned long long)images_reused.exchange(0),
+    RT_LOG("image cache: %llu adopted (%llu over reused memory), %llu shared, %llu reused, %llu released, %llu evicted; %zu cached (%.0f MiB), %.0f MiB live (%.0f MiB decoded ASTC)",
+           (unsigned long long)image_cache_adopted.exchange(0), (unsigned long long)image_cache_overlap.exchange(0), (unsigned long long)images_shared.exchange(0), (unsigned long long)images_reused.exchange(0),
            (unsigned long long)images_released.exchange(0), (unsigned long long)image_cache_evicted.exchange(0),
            image_cache.size(), image_cached_bytes / 1048576.0, image_live_bytes / 1048576.0, image_astc_bytes / 1048576.0);
     if (std::getenv("OOT_IMAGE_TRACE")) {

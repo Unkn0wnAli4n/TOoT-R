@@ -736,8 +736,15 @@ const std::vector<nvshader::Result>& ShaderCacheLookup(u64 key){
     }
     return list;
 }
+// Programs reading global memory embed the address of this run's guest address table: they are translated with
+// a placeholder there, cached as such, and get the real address just before their module is made
+// (they were translated again every run: 100-900 ms of hitches).
+constexpr u64 AddressTablePlaceholder=0x5eedf00dcafe0008ull;
+void PatchAddressTable(std::vector<u32>& spirv){
+    const u32 lo=(u32)AddressTablePlaceholder,hi=(u32)(AddressTablePlaceholder>>32);const u64 real=GlobalAddressTable(false);
+    for(size_t i=0;i+1<spirv.size();++i)if(spirv[i]==lo&&spirv[i+1]==hi){spirv[i]=(u32)real;spirv[i+1]=(u32)(real>>32);}
+}
 void ShaderCacheStore(u64 key,const nvshader::Result& r){
-    if(r.global_loads||r.global_stores)return; // (they embed this run's guest address table address)
     ShaderCacheWriter w;SerializeResult(w,r);
     char path[64];std::snprintf(path,sizeof path,"/%016llx.bin",(unsigned long long)key);
     if(FILE* f=std::fopen((ShaderCacheDirectory()+path).c_str(),"ab")){std::fwrite(w.bytes.data(),1,w.bytes.size(),f);std::fclose(f);}
@@ -751,7 +758,7 @@ ShaderVariant& CompileShader(const ShaderCode& code, u32 binding_base, const Sha
     request.constant_pointer_available=ConstantPointerAvailable;
     request.texture_type=TextureType; request.texture_format=TextureFormat;
     request.classify_constant=ClassifyConstant; request.describe_texture=DescribeTexture;
-    request.global_address_table=GlobalAddressTable(false); request.storage_alignment=Vk().properties.limits.minStorageBufferOffsetAlignment;
+    request.global_address_table=AddressTablePlaceholder; request.storage_alignment=Vk().properties.limits.minStorageBufferOffsetAlignment;
     request.buffer_float32_atomic_add=Vk().buffer_float32_atomic_add;
     // Input types describe vertex fetch, so they apply to the vertex stage only; later stages take
     // float inputs from the previous stage (gated by its store mask).
@@ -817,6 +824,7 @@ ShaderVariant& CompileShader(const ShaderCode& code, u32 binding_base, const Sha
         if(f){std::vector<u32> words;u32 w;while(std::fread(&w,4,1,f)==1)words.push_back(w);std::fclose(f);
             RT_LOG("shader %#llx stage %u: using override %s (%zu words)",(unsigned long long)code.address,code.stage,path,words.size());variant->compiled.spirv=std::move(words);}
     }
+    if(variant->compiled.global_loads||variant->compiled.global_stores)PatchAddressTable(variant->compiled.spirv);
     VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO}; info.codeSize=variant->compiled.spirv.size()*4;info.pCode=variant->compiled.spirv.data();
     VK_CHECK(vkCreateShaderModule(Vk().device,&info,nullptr,&variant->module));
     if(std::getenv("OOT_SHADER_DUMP")) {char path[512];std::snprintf(path,sizeof path,"%s/%llx-v%zu.spv",std::getenv("OOT_SHADER_DUMP"),(unsigned long long)code.address,shaders.size());FILE* file=std::fopen(path,"wb");if(file){std::fwrite(info.pCode,1,info.codeSize,file);std::fclose(file);}}
@@ -1672,9 +1680,15 @@ void Dispatch(u32 gx,u32 gy,u32 gz,u64 indirect=0){
     if(state.root[1][0][2]<8192&&state.root[1][0][3]<8192&&state.root[1][0][2]>16)frame_render_width=std::max(frame_render_width,state.root[1][0][2]+1); // (compute root: render size - 1)
     auto& stage=state.stages[5];if(!stage.shader)Fatal("compute dispatch without a compute shader");
     if(SkippedByFile(stage.shader->address))return;
-    auto& v=CompileShader(*stage.shader,0,nullptr);auto& vk=Vk();
+    struct Phases{std::chrono::steady_clock::time_point t0=std::chrono::steady_clock::now(),last=t0;double ms[6]{};u64 shader=0;
+        void mark(int i){const auto now=std::chrono::steady_clock::now();ms[i]+=std::chrono::duration<double,std::milli>(now-last).count();last=now;}
+        ~Phases(){const double total=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
+            if(total>100){static std::atomic<u32> shown{0};if(shown++<30)RT_LOG("slow dispatch of shader %#llx: %.0f ms (shader %.0f, address table %.0f, pipeline %.0f, descriptors %.0f, recording %.0f)",
+                (unsigned long long)shader,total,ms[0],ms[1],ms[2],ms[3],ms[4]);}}} phases;phases.shader=stage.shader->address;
+    auto& v=CompileShader(*stage.shader,0,nullptr);auto& vk=Vk();phases.mark(0);
     if(!v.module)return; // not translatable
     if(v.compiled.global_loads||v.compiled.global_stores)GlobalAddressTable(); // (pools may have changed)
+    phases.mark(1);
     auto& slot=compute_pipelines[v.module];
     if(!slot){
         slot=std::make_unique<Pipeline>();slot->shaders={&v};
@@ -1687,10 +1701,16 @@ void Dispatch(u32 gx,u32 gy,u32 gz,u64 indirect=0){
         VK_CHECK(vkCreatePipelineLayout(vk.device,&li,nullptr,&slot->layout));
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};ci.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         ci.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;ci.stage.module=v.module;ci.stage.pName="main";ci.layout=slot->layout;
+        const auto t0=std::chrono::steady_clock::now();
         VkPipeline created=VK_NULL_HANDLE;VK_CHECK(vkCreateComputePipelines(vk.device,PipelineCache(),1,&ci,nullptr,&created));slot->pipeline.store(created);
+        {const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
+         if(ms>20){u64 h=0xcbf29ce484222325ull;for(u32 w:v.compiled.spirv)h=(h^w)*0x100000001b3ull;
+             RT_LOG("compute pipeline for shader %#llx built in %.0f ms (SPIR-V %zu words, hash %016llx%s)",(unsigned long long)stage.shader->address,ms,v.compiled.spirv.size(),(unsigned long long)h,
+                    v.compiled.global_loads||v.compiled.global_stores?", global memory":"");}}
     }
-    auto& pipeline=*slot;
+    auto& pipeline=*slot;phases.mark(2);
     if(!WriteDescriptors(pipeline))return;
+    phases.mark(3);
     // Storage images the shader writes now hold GPU-produced contents.
     std::vector<Texture*> written;
     for(const auto& r:v.compiled.resources)if(r.kind==nvshader::ResourceKind::Image)
