@@ -2,6 +2,7 @@
 // address. Each pool imports its pages into Vulkan and exposes them as one buffer, so data the game
 // writes is read by the GPU in place.
 #pragma once
+#include <set>
 
 #include <map>
 #include <memory>
@@ -102,7 +103,7 @@ u32 ArmTextureMemory(u64 address, u64 size);
 // device lost (measured on the Steam Deck). Textures are then checked by content (texture_data.cpp).
 bool PageProtectionUsable();
 // GPU results kept in a pool's device copy (batch.cpp): inaccessible to the CPU until copied back.
-void ProtectDeviceAhead(u64 start, u64 end);
+void ProtectDeviceAhead(u64 start, u64 end, const std::set<u64>* keep = nullptr);
 void SettleDeviceAhead(u64 start, u64 end);
 bool TextureMemoryWritten(u64 address, u64 size, u32 since);
 u32 TextureWriteSequence();
