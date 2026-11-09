@@ -19,6 +19,7 @@
 #include <set>
 
 #include "../../native.h"
+#include "trace_compat.h"
 #include "memory.h"
 #include "batch.h"
 

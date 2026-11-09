@@ -1,12 +1,8 @@
-#ifndef _WIN32
-#include <dlfcn.h>
 #include <thread>
 #include <condition_variable>
-#include <pthread.h>
 #include <mutex>
-#include <execinfo.h>
 #include <string>
-#endif
+#include "trace_compat.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
