@@ -682,7 +682,7 @@ u8 AttributeType(VkFormat format) {
 // Each translation is stored with the constants it depended on, keyed by everything the variant
 // match above compares; a later run whose constants match uses it instead of translating.
 // Bump ShaderCacheVersion when the translator's output changes. OOT_NO_SHADER_CACHE=1 disables it.
-constexpr u32 ShaderCacheVersion=6; // 2: subgroup operations in task/mesh programs; 3: NaN guard, fog scale (in the key); 4: guard clamp 65000; 5: NaN-safe min/max/saturate; 6: local memory starts at zero
+constexpr u32 ShaderCacheVersion=7; // 2: subgroup operations in task/mesh programs; 3: NaN guard, fog scale (in the key); 4: guard clamp 65000; 5: NaN-safe min/max/saturate; 6: local memory starts at zero; 7: mesh stage buffer starts at zero
 bool ShaderCacheEnabled(){static const bool on=std::getenv("OOT_NO_SHADER_CACHE")==nullptr;return on;}
 std::string ShaderCacheDirectory(){
     static const std::string dir=[]{std::string d=rt::DataDir()+"/shader_cache";
@@ -691,7 +691,7 @@ std::string ShaderCacheDirectory(){
 }
 u64 ShaderCacheKey(const ShaderCode& code,const nvshader::Request& r){
     u64 h=0xcbf29ce484222325ull;const auto mix=[&](const void* p,size_t n){const u8* b=static_cast<const u8*>(p);for(size_t i=0;i<n;++i)h=(h^b[i])*0x100000001b3ull;};
-    mix(&ShaderCacheVersion,4);{const char* fog=std::getenv("OOT_FOG_SCALE");const char* nan=std::getenv("OOT_NAN_GUARD");const char* lz=std::getenv("OOT_LOCAL_ZERO");const std::string k=std::string(fog?fog:"")+"/"+(nan?nan:"")+"/"+(lz?lz:"");mix(k.data(),k.size());}mix(code.code.data(),code.code.size());mix(code.control.data(),code.control.size());
+    mix(&ShaderCacheVersion,4);{const char* fog=std::getenv("OOT_FOG_SCALE");const char* nan=std::getenv("OOT_NAN_GUARD");const char* lz=std::getenv("OOT_LOCAL_ZERO");const char* mz=std::getenv("OOT_MESH_NO_ZERO");const std::string k=std::string(fog?fog:"")+"/"+(nan?nan:"")+"/"+(lz?lz:"")+"/"+(mz?mz:"");mix(k.data(),k.size());}mix(code.code.data(),code.code.size());mix(code.control.data(),code.control.size());
     mix(&r.stage,4);mix(&r.binding_base,4);mix(r.input_types.data(),r.input_types.size());mix(r.color_types.data(),r.color_types.size());
     mix(&r.have_previous_stores,1);mix(r.previous_stores.data(),sizeof(u64)*r.previous_stores.size());mix(&r.topology,4);mix(&r.convert_depth,1);
     mix(&r.point_size,4);mix(r.mesh_registers.data(),4*r.mesh_registers.size());mix(&r.storage_alignment,8);mix(&r.buffer_float32_atomic_add,1);
