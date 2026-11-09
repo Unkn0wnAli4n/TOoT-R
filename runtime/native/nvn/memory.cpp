@@ -1339,12 +1339,17 @@ NATIVE("nvnMemoryPoolInitialize") {
         pools_by_address[p->address] = std::move(p);
         table_dirty = true; ++pool_generation;
     }
+    if (retired && (retired->buffer || retired->host_import || retired->device_buffer)) Flush(); // (as in nvnMemoryPoolFinalize)
     Ret(c, 1);
 }
 NATIVE("nvnMemoryPoolFinalize") {
     Pool* p = HostPool(c->x[0]);
     if (std::getenv("OOT_POOL_TRACE")) RT_LOG("memory pool finalize %#llx", p ? (unsigned long long)p->address : 0ull);
     if (!p) return;
+    // Commands recorded so far may still use the pool's buffer (descriptors, vertex data, report writes): submit
+    // them before the buffer and its memory are released, or the GPU reads and writes freed addresses (amdgpu page
+    // faults and GPU resets on the Steam Deck while scenery streams in).
+    if (p->buffer || p->host_import || p->device_buffer) Flush();
     DropDeviceAhead(p->address, p->size);
     std::shared_ptr<Pool> retired;
     {
