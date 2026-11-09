@@ -150,6 +150,13 @@ void CreateDevice(VulkanContext& vk) {
     VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     v12.pNext = &v13;
     v12.bufferDeviceAddress = VK_TRUE;
+    {   // (the guest address table at the same GPU address every run: memory.cpp)
+        VkPhysicalDeviceVulkan12Features have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; query.pNext = &have;
+        vkGetPhysicalDeviceFeatures2(vk.physical, &query);
+        vk.address_replay = have.bufferDeviceAddressCaptureReplay && !std::getenv("OOT_NO_ADDRESS_REPLAY");
+        v12.bufferDeviceAddressCaptureReplay = vk.address_replay;
+    }
     v12.hostQueryReset = VK_TRUE; // occlusion query ring reset after each batch (render.cpp)
     v12.timelineSemaphore = VK_TRUE;
     v12.descriptorIndexing = VK_TRUE;
@@ -265,17 +272,22 @@ std::string PipelineCachePath() {
 // Mesa drivers (RADV on the Steam Deck) keep every pipeline in their own disk cache, per pipeline and
 // loaded on demand: a cache of the application's own would only be a second copy, all of it in memory
 // (it grows past 1 GB) and written again and again. OOT_APP_PIPELINE_CACHE=1 keeps it there too.
+// The drivers keep compiled pipelines on disk themselves (Mesa's cache, NVIDIA's shader disk cache: both enlarged in
+// main.cpp). An application cache of its own grew to 2 GB on NVIDIA, was held in memory whole, and saving it held the
+// driver's cache for seconds (the executor's pipeline creations waited: 0.6-1.4 s hitches). OOT_APP_PIPELINE_CACHE=1: ours.
 bool DriverCachesPipelines() {
-    static const bool mesa = [] {
-        VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
-        VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2}; props.pNext = &driver;
+    static const bool driver = [] {
+        VkPhysicalDeviceDriverProperties properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2}; props.pNext = &properties;
         vkGetPhysicalDeviceProperties2(Vk().physical, &props);
-        const bool m = driver.driverID == VK_DRIVER_ID_MESA_RADV || driver.driverID == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA ||
-                       driver.driverID == VK_DRIVER_ID_MESA_TURNIP || driver.driverID == VK_DRIVER_ID_MESA_NVK;
-        if (m && !std::getenv("OOT_APP_PIPELINE_CACHE")) RT_LOG("pipeline cache: the driver's own (%s)", driver.driverName);
-        return m && !std::getenv("OOT_APP_PIPELINE_CACHE");
+        const bool d = !std::getenv("OOT_APP_PIPELINE_CACHE");
+        if (d) {
+            RT_LOG("pipeline cache: the driver's own (%s)", properties.driverName);
+            if (std::remove(PipelineCachePath().c_str()) == 0) RT_LOG("pipeline cache: the old cache file was removed");
+        }
+        return d;
     }();
-    return mesa;
+    return driver;
 }
 VkPipelineCache PipelineCache() {
     if (pipeline_cache) return pipeline_cache;

@@ -25,6 +25,7 @@ struct VulkanContext {
     u32 queue_count = 1;
     bool mesh_shader_queries = false;
     bool dma_buf = false;
+    bool address_replay = false; // bufferDeviceAddressCaptureReplay (memory.cpp: GlobalAddressTable)
     bool robust = true; // bounds-checked buffer access (vk.cpp) // (VK_KHR_external_memory_fd + VK_EXT_external_memory_dma_buf enabled) // (VkPhysicalDeviceMeshShaderFeaturesEXT::meshShaderQueries enabled)
     VkCommandPool command_pool = VK_NULL_HANDLE;
     u64 host_import_alignment = 0x1000;

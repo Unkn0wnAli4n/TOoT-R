@@ -578,8 +578,12 @@ bool CopyEligible(const Pool& p) {
     // (shader-code pools hold data too: OoT keeps a light-culling counter there that ~130k threads add to each frame;
     // read across the bus that was 2.7 ms of GPU time. OOT_NO_MIRROR_SHADER_POOLS=1: left in place)
     static const bool shader_pools = std::getenv("OOT_NO_MIRROR_SHADER_POOLS") == nullptr;
-    return MirrorEnabled() && !p.copy_failed && (uncached || (p.flags & PoolGpuCached)) && p.buffer &&
-           !(p.flags & ((uncached ? 0 : PoolCpuUncached) | (shader_pools ? 0 : PoolShaderCode) | PoolGpuNoAccess | PoolVirtual));
+    // (physical pools behind virtual ones, though marked GPU-no-access, are what the GPU reads and writes through
+    // those mappings: OoT's per-tile light lists, 1 MB written by ~130k threads, were 2 ms a frame across the bus.
+    // OOT_NO_MIRROR_PHYSICAL=1: left in place)
+    static const bool physical = std::getenv("OOT_NO_MIRROR_PHYSICAL") == nullptr;
+    return MirrorEnabled() && !p.copy_failed && (uncached || (p.flags & PoolGpuCached) || (physical && (p.flags & PoolPhysical))) && p.buffer &&
+           !(p.flags & ((uncached ? 0 : PoolCpuUncached) | (shader_pools ? 0 : PoolShaderCode) | (physical ? 0 : PoolGpuNoAccess) | PoolVirtual));
 }
 // Gives a pool its device-memory copy (on its first use as a GPU buffer: pools holding only
 // texture data never get one). Earlier work of the open batch may have used the imported pages;
@@ -716,21 +720,54 @@ u64 GlobalAddressTable(bool update) {
     static u64 device = 0;
     auto& vk = Vk();
     if (!buffer) {
-        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bi.size = 8 + Capacity * 24;
-        bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-        VK_CHECK(vkCreateBuffer(vk.device, &bi, nullptr, &buffer));
-        VkMemoryRequirements req;
-        vkGetBufferMemoryRequirements(vk.device, buffer, &req);
-        VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
-        flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        ai.pNext = &flags;
-        ai.allocationSize = req.size;
-        ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        VkDeviceMemory memory;
-        VK_CHECK(vkAllocateMemory(vk.device, &ai, nullptr, &memory));
-        VK_CHECK(vkBindBufferMemory(vk.device, buffer, memory, 0));
+        // Programs reading global memory embed this table's GPU address: at another address every run, their
+        // pipelines missed the driver's cache every run (270-660 ms each, mid-game). The address of the first run
+        // is kept (capture/replay) and asked for again; if the driver cannot give it, a new one is kept.
+        const std::string replay_path = rt::DataDir() + "/address_table.bin";
+        struct Replay { u64 buffer = 0, memory = 0; } replay{};
+        if (vk.address_replay) if (FILE* f = std::fopen(replay_path.c_str(), "rb")) { if (std::fread(&replay, sizeof replay, 1, f) != 1) replay = {}; std::fclose(f); }
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        const auto make = [&](const Replay& want) -> bool {
+            VkBufferOpaqueCaptureAddressCreateInfo bo{VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO};
+            bo.opaqueCaptureAddress = want.buffer;
+            VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            bi.pNext = vk.address_replay ? &bo : nullptr;
+            bi.flags = vk.address_replay ? VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT : 0;
+            bi.size = 8 + Capacity * 24;
+            bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+            if (VkResult r = vkCreateBuffer(vk.device, &bi, nullptr, &buffer); r != VK_SUCCESS) {
+                RT_LOG("guest address table: buffer at %#llx refused (%d)", (unsigned long long)want.buffer, (int)r); buffer = VK_NULL_HANDLE; return false; }
+            VkMemoryRequirements req;
+            vkGetBufferMemoryRequirements(vk.device, buffer, &req);
+            VkMemoryOpaqueCaptureAddressAllocateInfo mo{VK_STRUCTURE_TYPE_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO};
+            mo.opaqueCaptureAddress = want.memory;
+            VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+            flags.pNext = vk.address_replay ? &mo : nullptr;
+            flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT | (vk.address_replay ? VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT : 0);
+            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            ai.pNext = &flags;
+            ai.allocationSize = req.size;
+            ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            VkResult r = vkAllocateMemory(vk.device, &ai, nullptr, &memory);
+            if (r == VK_SUCCESS) r = vkBindBufferMemory(vk.device, buffer, memory, 0);
+            if (r != VK_SUCCESS) {
+                RT_LOG("guest address table: memory at %#llx refused (%d)", (unsigned long long)want.memory, (int)r);
+                if (memory) vkFreeMemory(vk.device, memory, nullptr);
+                vkDestroyBuffer(vk.device, buffer, nullptr); buffer = VK_NULL_HANDLE; memory = VK_NULL_HANDLE;
+                return false;
+            }
+            return true;
+        };
+        const bool replayed = (replay.buffer || replay.memory) && make(replay); // (NVIDIA: the memory carries it, the buffer reports 0)
+        if (!replayed && !make({})) Fatal("cannot make the guest address table");
+        if (vk.address_replay && !replayed) { // (kept for the next run)
+            VkBufferDeviceAddressInfo bi{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO}; bi.buffer = buffer;
+            VkDeviceMemoryOpaqueCaptureAddressInfo mi{VK_STRUCTURE_TYPE_DEVICE_MEMORY_OPAQUE_CAPTURE_ADDRESS_INFO}; mi.memory = memory;
+            Replay now{vkGetBufferOpaqueCaptureAddress(vk.device, &bi), vkGetDeviceMemoryOpaqueCaptureAddress(vk.device, &mi)};
+            if (FILE* f = std::fopen(replay_path.c_str(), "wb")) { std::fwrite(&now, sizeof now, 1, f); std::fclose(f); }
+        }
+        RT_LOG("guest address table: %s GPU address", replayed ? "the same" : vk.address_replay ? "a new (kept)" : "this run's");
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bi.size = 8 + Capacity * 24; // (the mapping below)
         VK_CHECK(vkMapMemory(vk.device, memory, 0, bi.size, 0, reinterpret_cast<void**>(&mapped)));
         VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
         info.buffer = buffer;
