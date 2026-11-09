@@ -9,6 +9,7 @@
 // output region is the task payload, the mesh output regions live in workgroup memory, and the
 // epilogue (reached by every invocation, see structured_control_flow.cpp) hands them to Vulkan.
 
+#include <cstdlib>
 #include <algorithm>
 #include <span>
 
@@ -209,6 +210,25 @@ void EmitIsbeWriteMapU32(EmitContext& ctx, const IR::Value& address, Id value) {
 void EmitMeshPrologue(EmitContext& ctx) {
     if (ctx.stage != Stage::Mesh) {
         return;
+    }
+    // The stage buffer's map and attribute regions start at zero: workgroup memory holds whatever the last
+    // workgroup on that unit left, and a vertex or index byte the program leaves unwritten was that (long thin
+    // triangles across foliage shadow maps; from Hookshot ae4fb30). Zeroed, such a primitive has no area.
+    // Straight-line stores, each clamped into its array (no branch: see below). OOT_MESH_NO_ZERO=1: as before.
+    static const bool no_zero{std::getenv("OOT_MESH_NO_ZERO") != nullptr};
+    if (!no_zero && ctx.mesh_threads) {
+        const Id invocation{LocalInvocation(ctx)};
+        const auto zero_all = [&](Id array, u32 count) {
+            if (!Sirit::ValidId(array) || count == 0) {
+                return;
+            }
+            for (u32 first = 0; first < count; first += ctx.mesh_threads) {
+                const Id at{Clamped(ctx, ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first)), count)};
+                ctx.OpStore(SharedWord(ctx, array, at), ctx.u32_zero_value);
+            }
+        };
+        zero_all(ctx.mesh_map, ctx.mesh_map_bytes);
+        zero_all(ctx.mesh_attributes, ctx.mesh_attribute_words);
     }
     // Every invocation stores the zero: no branch here, the entry block's label is a phi
     // predecessor for later blocks.
