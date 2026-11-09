@@ -22,6 +22,7 @@
 #include "../../native.h"
 #include "occlusion_spv.h"
 #include "indirect_clamp_spv.h"
+#include "timestamp_scale_spv.h"
 #include "commands.h"
 #include "memory.h"
 #include "program.h"
@@ -431,7 +432,7 @@ VkDescriptorBufferInfo DriverBankDescriptor(StageState& stage, u32 bank) {
         VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bi.size = ring.size;
         bi.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        VK_CHECK(vkCreateBuffer(vk.device, &bi, nullptr, &ring.buffer));
+        VK_CHECK(TracedCreateBuffer(&bi,&ring.buffer,__FILE__,__LINE__));
         VkMemoryRequirements req;
         vkGetBufferMemoryRequirements(vk.device, ring.buffer, &req);
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -691,7 +692,7 @@ std::string ShaderCacheDirectory(){
 }
 u64 ShaderCacheKey(const ShaderCode& code,const nvshader::Request& r){
     u64 h=0xcbf29ce484222325ull;const auto mix=[&](const void* p,size_t n){const u8* b=static_cast<const u8*>(p);for(size_t i=0;i<n;++i)h=(h^b[i])*0x100000001b3ull;};
-    mix(&ShaderCacheVersion,4);{const char* fog=std::getenv("OOT_FOG_SCALE");const char* nan=std::getenv("OOT_NAN_GUARD");const char* lz=std::getenv("OOT_LOCAL_ZERO");const std::string k=std::string(fog?fog:"")+"/"+(nan?nan:"")+"/"+(lz?lz:"");mix(k.data(),k.size());}mix(code.code.data(),code.code.size());mix(code.control.data(),code.control.size());
+    mix(&ShaderCacheVersion,4);{const char* fog=std::getenv("OOT_FOG_SCALE");const char* nan=std::getenv("OOT_NAN_GUARD");const char* lz=std::getenv("OOT_LOCAL_ZERO");const char* crs=std::getenv("OOT_LOCAL_CRS");const std::string k=std::string(fog?fog:"")+"/"+(nan?nan:"")+"/"+(lz?lz:"")+"/"+(crs?crs:"");mix(k.data(),k.size());}mix(code.code.data(),code.code.size());mix(code.control.data(),code.control.size());
     mix(&r.stage,4);mix(&r.binding_base,4);mix(r.input_types.data(),r.input_types.size());mix(r.color_types.data(),r.color_types.size());
     mix(&r.have_previous_stores,1);mix(r.previous_stores.data(),sizeof(u64)*r.previous_stores.size());mix(&r.topology,4);mix(&r.convert_depth,1);
     mix(&r.point_size,4);mix(r.mesh_registers.data(),4*r.mesh_registers.size());mix(&r.storage_alignment,8);mix(&r.buffer_float32_atomic_add,1);
@@ -1045,7 +1046,7 @@ void DumpTexture(Texture& t, const std::string& path) {
     VkImage image;VK_CHECK(vkCreateImage(vk.device,&ii,nullptr,&image));VkMemoryRequirements req;vkGetImageMemoryRequirements(vk.device,image,&req);
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ai.allocationSize=req.size;ai.memoryTypeIndex=FindMemoryType(req.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     VkDeviceMemory memory;VK_CHECK(vkAllocateMemory(vk.device,&ai,nullptr,&memory));VK_CHECK(vkBindImageMemory(vk.device,image,memory,0));
-    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};bi.size=W*H*4;bi.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT;VkBuffer buffer;VK_CHECK(vkCreateBuffer(vk.device,&bi,nullptr,&buffer));
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};bi.size=W*H*4;bi.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT;VkBuffer buffer;VK_CHECK(TracedCreateBuffer(&bi,&buffer,__FILE__,__LINE__));
     vkGetBufferMemoryRequirements(vk.device,buffer,&req);ai.allocationSize=req.size;ai.memoryTypeIndex=FindMemoryType(req.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     VkDeviceMemory host;VK_CHECK(vkAllocateMemory(vk.device,&ai,nullptr,&host));VK_CHECK(vkBindBufferMemory(vk.device,buffer,host,0));
     Immediate([&](VkCommandBuffer cmd){
@@ -1070,7 +1071,7 @@ void DumpRaw(Texture& t,u32 n,const char* dir){
     if(!target||t.object!=target||!t.image||t.info.depth||t.info.stencil||t.info.block_w!=1)return;
     const u32 w=std::min(rw,t.width>rx?t.width-rx:0),h=std::min(rh,t.height>ry?t.height-ry:0);if(!w||!h)return;
     auto& vk=Vk();const u64 size=(u64)w*h*t.info.bytes;
-    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};bi.size=size;bi.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT;VkBuffer buffer;VK_CHECK(vkCreateBuffer(vk.device,&bi,nullptr,&buffer));
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};bi.size=size;bi.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT;VkBuffer buffer;VK_CHECK(TracedCreateBuffer(&bi,&buffer,__FILE__,__LINE__));
     VkMemoryRequirements req;vkGetBufferMemoryRequirements(vk.device,buffer,&req);VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ai.allocationSize=req.size;
     ai.memoryTypeIndex=FindMemoryType(req.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);VkDeviceMemory host;VK_CHECK(vkAllocateMemory(vk.device,&ai,nullptr,&host));VK_CHECK(vkBindBufferMemory(vk.device,buffer,host,0));
     Immediate([&](VkCommandBuffer cmd){Transition(cmd,t,VK_IMAGE_LAYOUT_GENERAL);
@@ -1120,7 +1121,7 @@ VkDescriptorBufferInfo ZeroBuffer(){
     static VkBuffer buffer=VK_NULL_HANDLE;
     if(!buffer){auto& vk=Vk();
         VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};bi.size=0x10000;bi.usage=VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
-        VK_CHECK(vkCreateBuffer(vk.device,&bi,nullptr,&buffer));VkMemoryRequirements req;vkGetBufferMemoryRequirements(vk.device,buffer,&req);
+        VK_CHECK(TracedCreateBuffer(&bi,&buffer,__FILE__,__LINE__));VkMemoryRequirements req;vkGetBufferMemoryRequirements(vk.device,buffer,&req);
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ai.allocationSize=req.size;ai.memoryTypeIndex=FindMemoryType(req.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         VkDeviceMemory memory;VK_CHECK(vkAllocateMemory(vk.device,&ai,nullptr,&memory));VK_CHECK(vkBindBufferMemory(vk.device,buffer,memory,0));
         void* p;VK_CHECK(vkMapMemory(vk.device,memory,0,0x10000,0,&p));std::memset(p,0,0x10000);}
@@ -1387,7 +1388,7 @@ void InitializeIndirectClamp(){
     auto& vk=Vk();auto& c=indirect_clamp;if(c.pipeline)return;
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};bi.size=IndirectClamp::Slots*16;
     bi.usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-    VK_CHECK(vkCreateBuffer(vk.device,&bi,nullptr,&c.buffer));
+    VK_CHECK(TracedCreateBuffer(&bi,&c.buffer,__FILE__,__LINE__));
     VkMemoryRequirements req;vkGetBufferMemoryRequirements(vk.device,c.buffer,&req);
     VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};flags.flags=VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ai.pNext=&flags;ai.allocationSize=req.size;ai.memoryTypeIndex=FindMemoryType(req.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -1754,10 +1755,17 @@ void Dispatch(u32 gx,u32 gy,u32 gz,u64 indirect=0){
         // Steam Deck, the game frozen meanwhile. Programs past OOT_NOOPT_WORDS (40000; 0: never) are built without the
         // optimizer first (from Hookshot f414a76), and optimized on a worker, which takes over when done.
         static const u64 noopt_words=std::getenv("OOT_NOOPT_WORDS")?std::strtoull(std::getenv("OOT_NOOPT_WORDS"),nullptr,10):40000;
-        const bool quick=vk.properties.vendorID==0x1002&&noopt_words&&v.compiled.spirv.size()>noopt_words;
-        if(quick)ci.flags|=VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+        bool quick=vk.properties.vendorID==0x1002&&noopt_words&&v.compiled.spirv.size()>noopt_words;
         const auto t0=std::chrono::steady_clock::now();
-        VkPipeline created=VK_NULL_HANDLE;VK_CHECK(vkCreateComputePipelines(vk.device,PipelineCache(),1,&ci,nullptr,&created));slot->pipeline.store(created);
+        VkPipeline created=VK_NULL_HANDLE;
+        if(quick){ // (the optimized one from the driver's cache when it is there: unoptimized ones are only for first builds)
+            VkComputePipelineCreateInfo cached=ci;cached.flags|=VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+            if(vkCreateComputePipelines(vk.device,PipelineCache(),1,&cached,nullptr,&created)==VK_SUCCESS&&created)quick=false;
+            else created=VK_NULL_HANDLE;
+        }
+        if(quick)ci.flags|=VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+        if(!created)VK_CHECK(vkCreateComputePipelines(vk.device,PipelineCache(),1,&ci,nullptr,&created));
+        slot->pipeline.store(created);
         if(quick){
             Pipeline* target=slot.get();const VkShaderModule module=v.module;const VkPipelineLayout layout=slot->layout;const u64 address=stage.shader->address;
             PipelineWorkers().Run([target,module,layout,address]{
@@ -2101,7 +2109,7 @@ void InitializeGpuCounters(){
     if(gpu_counters.ready||!vk.conditional_rendering||disabled)return;
     const auto make=[&](VkDeviceSize size,VkBufferUsageFlags usage,bool host=false){
         VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};bi.size=size;bi.usage=usage|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        VkBuffer buffer;VK_CHECK(vkCreateBuffer(vk.device,&bi,nullptr,&buffer));VkMemoryRequirements req;vkGetBufferMemoryRequirements(vk.device,buffer,&req);
+        VkBuffer buffer;VK_CHECK(TracedCreateBuffer(&bi,&buffer,__FILE__,__LINE__));VkMemoryRequirements req;vkGetBufferMemoryRequirements(vk.device,buffer,&req);
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ai.allocationSize=req.size;ai.memoryTypeIndex=FindMemoryType(req.memoryTypeBits,host?VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT:VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         VkDeviceMemory memory;VK_CHECK(vkAllocateMemory(vk.device,&ai,nullptr,&memory));VK_CHECK(vkBindBufferMemory(vk.device,buffer,memory,0));
         if(host)VK_CHECK(vkMapMemory(vk.device,memory,0,size,0,reinterpret_cast<void**>(&gpu_counters.predicate_values)));return buffer;};
@@ -2264,7 +2272,9 @@ bool GpuReportTimes(){
     auto& vk=Vk();auto& r=report_times;
     if(r.initialized)return r.enabled;
     r.initialized=true;
-    if(std::getenv("OOT_HOST_REPORT_TIMES")||!vk.calibrated_timestamps||vk.properties.limits.timestampPeriod!=1.0f)return false;
+    if(std::getenv("OOT_HOST_REPORT_TIMES")||!vk.calibrated_timestamps)return false;
+    // (a tick of another length, as the Steam Deck's 10 ns: converted on the GPU, timestamp_scale.comp. Host-written times
+    // left the game's dynamic resolution at its highest there)
     r.calibrate=reinterpret_cast<PFN_vkGetCalibratedTimestampsKHR>(vkGetDeviceProcAddr(vk.device,vk.calibrated_timestamps));
     if(!r.calibrate)return false;
     VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};qi.queryType=VK_QUERY_TYPE_TIMESTAMP;qi.queryCount=ReportTimes::Capacity;
@@ -2290,9 +2300,57 @@ bool RecordReportTimestamp(u64 address,const u32* value){
     return true;
 }
 // (Before submission, outside render passes.)
+struct TimestampScale{VkPipeline pipeline=VK_NULL_HANDLE;VkPipelineLayout layout=VK_NULL_HANDLE;VkBuffer buffer=VK_NULL_HANDLE;VkDeviceMemory memory=VK_NULL_HANDLE;
+    VkDeviceAddress address=0;u64 period=0;static constexpr u32 Slots=ReportTimes::Capacity;} timestamp_scale;
+bool TimestampScaling(){ // (ticks of another length than 1 ns: the conversion's pipeline and tick buffer, made once)
+    auto& vk=Vk();auto& t=timestamp_scale;
+    static const bool needed=vk.properties.limits.timestampPeriod!=1.0f;
+    if(!needed||t.pipeline)return needed;
+    t.period=(u64)std::llround(vk.properties.limits.timestampPeriod*65536.0);
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};bi.size=TimestampScale::Slots*8ull;
+    bi.usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT|VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    VK_CHECK(TracedCreateBuffer(&bi,&t.buffer,__FILE__,__LINE__));
+    VkMemoryRequirements req;vkGetBufferMemoryRequirements(vk.device,t.buffer,&req);
+    VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};flags.flags=VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ai.pNext=&flags;ai.allocationSize=req.size;ai.memoryTypeIndex=FindMemoryType(req.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VK_CHECK(vkAllocateMemory(vk.device,&ai,nullptr,&t.memory));VK_CHECK(vkBindBufferMemory(vk.device,t.buffer,t.memory,0));
+    VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};info.buffer=t.buffer;t.address=vkGetBufferDeviceAddress(vk.device,&info);
+    VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT,0,24};
+    VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};li.pushConstantRangeCount=1;li.pPushConstantRanges=&push;
+    VK_CHECK(vkCreatePipelineLayout(vk.device,&li,nullptr,&t.layout));
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};mi.codeSize=sizeof timestamp_scale_spv;mi.pCode=timestamp_scale_spv;
+    VkShaderModule module;VK_CHECK(vkCreateShaderModule(vk.device,&mi,nullptr,&module));
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};ci.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    ci.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;ci.stage.module=module;ci.stage.pName="main";ci.layout=t.layout;
+    VK_CHECK(vkCreateComputePipelines(vk.device,VK_NULL_HANDLE,1,&ci,nullptr,&t.pipeline));
+    RT_LOG("GPU timestamps: %.2f ns ticks, converted on the GPU",vk.properties.limits.timestampPeriod);
+    return true;
+}
 void WriteReportTimestamps(){
     auto& r=report_times;
     if(r.writes.empty())return;
+    if(TimestampScaling()){
+        auto& t=timestamp_scale;auto& vk=Vk();
+        ImmediateLight([&](VkCommandBuffer cmd){
+            for(const auto& w:r.writes)vkCmdCopyQueryPoolResults(cmd,r.pool,w.query,1,t.buffer,w.query*8ull,8,VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WAIT_BIT);
+            VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&barrier,0,nullptr,0,nullptr);
+            vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,t.pipeline);
+            for(const auto& w:r.writes){
+                const auto range=GpuLookupAddress(w.address);if(!range.pool||range.available<16)continue;
+                VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};info.buffer=range.buffer;
+                const u64 push[3]{t.address+w.query*8ull,vkGetBufferDeviceAddress(vk.device,&info)+range.offset+8,t.period};
+                vkCmdPushConstants(cmd,t.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof push,push);
+                vkCmdDispatch(cmd,1,1,1);
+            }
+            barrier.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT|VK_ACCESS_MEMORY_READ_BIT;
+            vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT|VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&barrier,0,nullptr,0,nullptr);
+            for(const auto& w:r.writes)if(w.has_value){const auto range=GpuLookupAddress(w.address);if(!range.pool||range.available<16)continue;
+                vkCmdFillBuffer(cmd,range.buffer,range.offset,4,w.value);vkCmdFillBuffer(cmd,range.buffer,range.offset+4,4,0);}
+        });
+        r.writes.clear();
+        return;
+    }
     ImmediateLight([&](VkCommandBuffer cmd){
         for(const auto& w:r.writes){
             const auto range=GpuLookupAddress(w.address);if(!range.pool||range.available<16)continue;
@@ -2312,7 +2370,7 @@ u64 GuestTimestampNs(){
         VkCalibratedTimestampInfoKHR infos[2]{{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR,nullptr,VK_TIME_DOMAIN_DEVICE_KHR},
                                                {VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR,nullptr,VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR}};
         u64 stamps[2]{},deviation=0;
-        if(r.calibrate(vk.device,2,infos,stamps,&deviation)==VK_SUCCESS){r.offset=(s64)stamps[1]-(s64)stamps[0];r.calibrated_at=now;}
+        if(r.calibrate(vk.device,2,infos,stamps,&deviation)==VK_SUCCESS){r.offset=(s64)stamps[1]-(s64)(stamps[0]*(double)vk.properties.limits.timestampPeriod);r.calibrated_at=now;}
     }
     return (u64)((s64)now-r.offset);
 }

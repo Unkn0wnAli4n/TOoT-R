@@ -76,25 +76,52 @@ void WriteStorage(u64 address, const void* input, u64 size) {
         size -= count; src += count; address += count;
     }
 }
+// Staging buffers are kept for reuse (by size, up to 256 MiB in all) rather than freed after each upload: a 32 MiB
+// one made and freed per upload left its GPU addresses to the driver's scratch memory, and on the Steam Deck writes there
+// faulted (page faults, GPU resets) when new scenery came into view; it also costs an allocation each time.
+// OOT_STAGING_POOL_MB=<n> (0: freed as before).
+struct StagingBlock { VkBuffer buffer = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE; void* mapped = nullptr; u64 size = 0; };
+std::mutex staging_pool_mutex;
+std::multimap<u64, StagingBlock> staging_pool; // size -> block
+u64 staging_pooled = 0;
 struct Staging {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     void* mapped = nullptr;
-    explicit Staging(u64 size) {
+    u64 size = 0;
+    explicit Staging(u64 want) {
         auto& vk = Vk();
-        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bi.size = size;
+        // (sizes rounded up to powers of two past 1 MiB, so blocks fit later requests)
+        size = want <= (1u << 20) ? want : u64(1) << (64 - __builtin_clzll(want - 1));
+        if (size > (1u << 20)) {
+            std::lock_guard lock{staging_pool_mutex};
+            auto it = staging_pool.find(size);
+            if (it != staging_pool.end()) {
+                buffer = it->second.buffer; memory = it->second.memory; mapped = it->second.mapped;
+                staging_pooled -= size; staging_pool.erase(it);
+                return;
+            }
+        }
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bi.size = size;
         bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-        VK_CHECK(vkCreateBuffer(vk.device, &bi, nullptr, &buffer));
+        VK_CHECK(TracedCreateBuffer(&bi, &buffer, __FILE__, __LINE__));
         VkMemoryRequirements req; vkGetBufferMemoryRequirements(vk.device, buffer, &req);
-        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize = req.size;
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        ai.allocationSize = req.size;
         ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         VK_CHECK(vkAllocateMemory(vk.device, &ai, nullptr, &memory));
         VK_CHECK(vkBindBufferMemory(vk.device, buffer, memory, 0));
         VK_CHECK(vkMapMemory(vk.device, memory, 0, size, 0, &mapped));
     }
     ~Staging() {
-        // Batched copies may still read it: release once the recorded work completes.
-        AfterFlush([buffer = buffer, memory = memory] {
+        // Batched copies may still read it: kept or released once the recorded work completes.
+        AfterFlush([buffer = buffer, memory = memory, mapped = mapped, size = size] {
+            static const u64 cap = (std::getenv("OOT_STAGING_POOL_MB") ? std::strtoull(std::getenv("OOT_STAGING_POOL_MB"), nullptr, 10) : 256) << 20;
+            if (size > (1u << 20)) {
+                std::lock_guard lock{staging_pool_mutex};
+                if (staging_pooled + size <= cap) { staging_pool.insert({size, StagingBlock{buffer, memory, mapped, size}}); staging_pooled += size; return; }
+            }
             auto& vk = Vk(); vkUnmapMemory(vk.device, memory);
             vkDestroyBuffer(vk.device, buffer, nullptr); vkFreeMemory(vk.device, memory, nullptr);
         });
@@ -199,7 +226,7 @@ void EnsureBcEncoder() {
     VK_CHECK(vkCreateImageView(vk.device, &vi, nullptr, &e.scratch_view));
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bi.size = (u64)(BcScratchDim / 4) * (BcScratchDim / 4) * 16;
     bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    VK_CHECK(vkCreateBuffer(vk.device, &bi, nullptr, &e.out));
+    VK_CHECK(TracedCreateBuffer(&bi,&e.out,__FILE__,__LINE__));
     vkGetBufferMemoryRequirements(vk.device, e.out, &req); ai.allocationSize = req.size;
     ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     VK_CHECK(vkAllocateMemory(vk.device, &ai, nullptr, &e.out_memory)); VK_CHECK(vkBindBufferMemory(vk.device, e.out, e.out_memory, 0));

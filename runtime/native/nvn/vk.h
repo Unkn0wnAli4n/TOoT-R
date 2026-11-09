@@ -9,6 +9,8 @@
 #include "../../rt.h"
 
 namespace nvn {
+// vkCreateBuffer, logging the handle and size with OOT_ADDRESS_REPORT (which buffer a GPU fault address held).
+VkResult TracedCreateBuffer(const VkBufferCreateInfo* info, VkBuffer* buffer, const char* file, int line);
 
 struct VulkanContext {
     SDL_Window* window = nullptr;
@@ -25,6 +27,7 @@ struct VulkanContext {
     u32 queue_count = 1;
     bool mesh_shader_queries = false;
     bool dma_buf = false;
+    bool placed_maps = false; // VK_EXT_map_memory_placed (memory.cpp: pools in GPU memory at their guest addresses)
     bool address_replay = false; // bufferDeviceAddressCaptureReplay (memory.cpp: GlobalAddressTable)
     bool robust = true; // bounds-checked buffer access (vk.cpp) // (VK_KHR_external_memory_fd + VK_EXT_external_memory_dma_buf enabled) // (VkPhysicalDeviceMeshShaderFeaturesEXT::meshShaderQueries enabled)
     VkCommandPool command_pool = VK_NULL_HANDLE;

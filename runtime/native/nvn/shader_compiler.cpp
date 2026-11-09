@@ -112,7 +112,13 @@ public:
     }
     uint32_t ReadViewportTransformState() override { return 1; }
     uint32_t TextureBoundBuffer() const override { return texture_bound; }
-    uint32_t LocalMemorySize() const override { return sph.LocalMemorySize() + sph.common3.shader_local_memory_crs_size; }
+    // The program's local memory plus its call-return stack area. Translated programs have structured control flow and
+    // never touch that area; on AMD every byte of local memory is scratch memory per thread (OoT's programs asked for
+    // up to 18 KB, a 320 MB scratch buffer on the Steam Deck). OOT_LOCAL_CRS=0/1 forces it out/in; default: out except on NVIDIA.
+    uint32_t LocalMemorySize() const override {
+        static const bool crs = [] { const char* e = std::getenv("OOT_LOCAL_CRS"); return !e || std::atoi(e) != 0; }(); // (vk.cpp sets 0 on AMD)
+        return (uint32_t)sph.LocalMemorySize() + (crs ? (uint32_t)sph.common3.shader_local_memory_crs_size : 0u);
+    }
     // NVN2 compute control: +0x4c register count, +0x58.. workgroup size, +0x64 shared memory bytes.
     uint32_t SharedMemorySize() const override { return Control(0x64); }
     std::array<uint32_t, 3> WorkgroupSize() const override {

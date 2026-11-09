@@ -1,3 +1,7 @@
+#ifdef __linux__
+#include <cstdio>
+#include <sys/mman.h>
+#endif
 #include "graphics_settings.h"
 // Native replacements for SDK services backed by system processes on the console. The game runs
 // as a docked, focused, offline application with one preselected user.
@@ -33,7 +37,21 @@ NATIVE("nntimeStartup") {}
 NATIVE("_ZN2nn2oe15SetCpuBoostModeENS0_12CpuBoostModeE") {}
 // Docked (console, boost) by default; OOT_HANDHELD=1 reports handheld (normal performance).
 static bool Handheld() { static const bool on = std::getenv("OOT_HANDHELD") != nullptr || gfx::Current().handheld; return on; } // (read at start: the game sizes its targets once)
-NATIVE("_ZN2nn2oe16GetOperationModeEv") { Ret(c, Handheld() ? 0 : 1); }
+// OOT_RENDER_SIZE=<w>x<h> (experiment): the renderer's size pair in main's data (main+0x3f08250: 1920x1080 for both
+// modes as shipped), written before the game reads it.
+static void RenderSizeOverride() {
+    static bool done = false; if (done) return; done = true;
+    const char* e = std::getenv("OOT_RENDER_SIZE"); unsigned w = 0, h = 0;
+    if (!e || std::sscanf(e, "%ux%u", &w, &h) != 2) return;
+    u32* table = reinterpret_cast<u32*>(0x800000000ull + 0x3f08250);
+    if (table[0] != 1920 || table[1] != 1080) { RT_LOG("render size: the table is not where expected (%u x %u)", table[0], table[1]); return; }
+#ifdef __linux__
+    mprotect(reinterpret_cast<void*>(0x800000000ull + 0x3f08000), 0x1000, PROT_READ | PROT_WRITE);
+#endif
+    table[0] = table[2] = w; table[1] = table[3] = h;
+    RT_LOG("render size: %u x %u", w, h);
+}
+NATIVE("_ZN2nn2oe16GetOperationModeEv") { RenderSizeOverride(); Ret(c, Handheld() ? 0 : 1); }
 NATIVE("_ZN2nn2oe18GetPerformanceModeEv") { Ret(c, Handheld() ? 0 : 1); }
 NATIVE("_ZN2nn2oe17FinishStartupLogoEv") {}
 NATIVE("_ZN2nn2oe17GetDisplayVersionEPNS0_14DisplayVersionE") {

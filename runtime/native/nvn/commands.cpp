@@ -141,7 +141,8 @@ void SwitchTo(u64 queue) {
 // (OoT releases a whole frame at once, ~9 ms to record in busy scenes; submitted at the end, the GPU
 // waited for all of it). OOT_SUBMIT_EVERY_US=<us> (0: only at the end, as before).
 void SubmitWhileRecording() {
-    static const u64 every = std::getenv("OOT_SUBMIT_EVERY_US") ? std::strtoull(std::getenv("OOT_SUBMIT_EVERY_US"), nullptr, 10) * 1000 : 1'000'000;
+    // (NVIDIA only by default: on the Steam Deck a submission costs ~1 ms of the executor's time)
+    static const u64 every = std::getenv("OOT_SUBMIT_EVERY_US") ? std::strtoull(std::getenv("OOT_SUBMIT_EVERY_US"), nullptr, 10) * 1000 : Vk().properties.vendorID == 0x10DE ? 1'000'000 : 4'000'000;
     if (!every) return;
     static auto last = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
@@ -388,7 +389,7 @@ Step ExecuteFrom(const CommandList& list, size_t& index, size_t end, std::vector
     u32 previous_op = ~0u; u64 previous_x[4]{};
     end = std::min(end, list.commands.size());
     // Long command streams go to the GPU in pieces, so it works while the rest is translated.
-    static const u32 submit_every = std::getenv("OOT_SUBMIT_EVERY") ? std::atoi(std::getenv("OOT_SUBMIT_EVERY")) : 1500;
+    static const u32 submit_every = std::getenv("OOT_SUBMIT_EVERY") ? std::atoi(std::getenv("OOT_SUBMIT_EVERY")) : Vk().properties.vendorID == 0x10DE ? 1500 : 0;
     static u32 since_submit = 0;
     static const bool op_stats = std::getenv("OOT_OP_STATS") != nullptr;
     for (; index < end; ++index) {

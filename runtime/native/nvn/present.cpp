@@ -67,7 +67,7 @@ void EnsureDumpBuffer(VkDeviceSize size) {
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;
     bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    VK_CHECK(vkCreateBuffer(vk.device, &bi, nullptr, &dump.buffer));
+    VK_CHECK(TracedCreateBuffer(&bi,&dump.buffer,__FILE__,__LINE__));
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(vk.device, dump.buffer, &req);
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -260,6 +260,10 @@ void PresentPacing() {
         const float v = scale / 100.0f; unsigned bits; std::memcpy(&bits, &v, 4);
         if (scale) oot_fixed_scale_bits = bits;
         oot_fixed_resolution = scale > 0 && oot_dynres_runs >= 30;
+        // OOT_RENDER_HEIGHT=<pixels> (experiment): the engine's current render height (three copies, +0x78 +0xdc +0x140 of
+        // the dynamic-resolution context: 810 handheld, 1080 docked as shipped), written each frame.
+        static const float height = std::getenv("OOT_RENDER_HEIGHT") ? (float)std::atof(std::getenv("OOT_RENDER_HEIGHT")) : 0.0f;
+        if (height > 0 && oot_dynres_context) for (u32 at : {0x78u, 0xdcu, 0x140u}) std::memcpy(reinterpret_cast<void*>(oot_dynres_context + at), &height, 4);
         if (std::getenv("OOT_DYNRES_DUMP") && oot_dynres_context) { static u64 m = 0; if (m++ % 600 == 300) {
             const u32* w = reinterpret_cast<const u32*>(oot_dynres_context); std::string t;
             for (u32 i = 0; i < 0x200 / 4; ++i) { char b[24]; std::snprintf(b, sizeof b, " %03x:%08x", i * 4, w[i]); t += b; }

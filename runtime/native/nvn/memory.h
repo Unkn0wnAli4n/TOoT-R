@@ -31,6 +31,7 @@ struct HostImport {
     ~HostImport();
     u64 base = 0, size = 0;
     bool backed = false; // (GPU memory mapped over the guest range instead of an import of it: memory.cpp, AMD)
+    bool placed = false; // (that memory mapped by the driver at the guest address: VK_EXT_map_memory_placed)
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkBuffer buffer = VK_NULL_HANDLE;
 };

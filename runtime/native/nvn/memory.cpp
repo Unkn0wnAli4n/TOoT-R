@@ -110,8 +110,8 @@ namespace track { bool UnprotectForImport(u64 base, u64 size); }
 bool BackPools() {
 #ifdef __linux__
     static const bool on = [] {
-        const bool v = Vk().dma_buf && !PageProtectionUsable() && !std::getenv("OOT_IMPORT_POOLS");
-        if (v) RT_LOG("memory pools: 1 MiB and larger ones in GPU memory mapped in place (no imports to check per submission)");
+        const bool v = (Vk().placed_maps || Vk().dma_buf) && !PageProtectionUsable() && !std::getenv("OOT_IMPORT_POOLS");
+        if (v) RT_LOG("memory pools: in GPU memory mapped at their addresses (%s)", Vk().placed_maps ? "placed maps: every pool, nothing checked per submission" : "exported memory, 1 MiB and larger pools");
         return v;
     }();
     return on;
@@ -119,7 +119,58 @@ bool BackPools() {
     return false;
 #endif
 }
+std::shared_ptr<HostImport> CreatePlaced(u64 base, u64 size);
+// VK_EXT_map_memory_placed: ordinary (not exported) GPU memory, mapped by the driver at the pool's guest address.
+// Such memory stays valid in the GPU's address space; exported memory is listed in every submission (12 ms a
+// submission with OoT's ~4000 pools on the Deck), userptr imports are checked page by page (18-40 ms).
+std::shared_ptr<HostImport> CreatePlaced(u64 base, u64 size) {
+    auto& vk = Vk();
+    static auto map2 = reinterpret_cast<PFN_vkMapMemory2KHR>(vkGetDeviceProcAddr(vk.device, "vkMapMemory2KHR"));
+    auto imp = std::make_shared<HostImport>();
+    imp->base = base; imp->size = size; imp->backed = true; imp->placed = true;
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = size;
+    bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+               VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    if (vkCreateBuffer(vk.device, &bi, nullptr, &imp->buffer) != VK_SUCCESS) { imp->backed = false; return nullptr; }
+    VkMemoryRequirements req; vkGetBufferMemoryRequirements(vk.device, imp->buffer, &req);
+    u32 type = ~0u; // (CPU-cached and coherent, not device-local where such a type exists)
+    for (u32 pass = 0; pass < 2 && type == ~0u; ++pass)
+        for (u32 t = 0; t < vk.memory_properties.memoryTypeCount; ++t) {
+            const auto f = vk.memory_properties.memoryTypes[t].propertyFlags;
+            const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | (pass == 0 ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0);
+            if ((req.memoryTypeBits >> t & 1) && (f & want) == want && !(f & 0xc0)) { type = t; break; }
+        }
+    VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.pNext = &flags; ai.allocationSize = std::max<u64>(req.size, size); ai.memoryTypeIndex = type;
+    void* staging = nullptr;
+    if (type == ~0u || vkAllocateMemory(vk.device, &ai, nullptr, &imp->memory) != VK_SUCCESS ||
+        vkBindBufferMemory(vk.device, imp->buffer, imp->memory, 0) != VK_SUCCESS ||
+        vkMapMemory(vk.device, imp->memory, 0, VK_WHOLE_SIZE, 0, &staging) != VK_SUCCESS) {
+        RT_LOG("pool %#llx+%#llx: GPU memory unavailable, imported instead", (unsigned long long)base, (unsigned long long)size);
+        imp->backed = imp->placed = false; // (the destructor frees what was made)
+        return nullptr;
+    }
+    // The contents so far (the memory keeps them), then the memory in place of the guest pages.
+    std::memcpy(staging, reinterpret_cast<const void*>(base), size);
+    vkUnmapMemory(vk.device, imp->memory);
+    VkMemoryMapPlacedInfoEXT at{VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT};
+    at.pPlacedAddress = reinterpret_cast<void*>(base);
+    VkMemoryMapInfoKHR mi{VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR};
+    mi.pNext = &at; mi.flags = VK_MEMORY_MAP_PLACED_BIT_EXT; mi.memory = imp->memory; mi.offset = 0; mi.size = VK_WHOLE_SIZE;
+    void* mapped = nullptr;
+    if (map2(vk.device, &mi, &mapped) != VK_SUCCESS || mapped != reinterpret_cast<void*>(base))
+        Fatal("cannot map GPU memory at pool %#llx+%#llx", (unsigned long long)base, (unsigned long long)size);
+    static std::atomic<u64> total{0}; total += size;
+    static std::atomic<u32> shown{0};
+    if (shown++ < 6) RT_LOG("pool %#llx+%#llx in GPU memory at its address (%.0f MiB so far)", (unsigned long long)base, (unsigned long long)size, total / 1048576.0);
+    return imp;
+}
 std::shared_ptr<HostImport> CreateBacked(u64 base, u64 size) {
+    if (Vk().placed_maps) return CreatePlaced(base, size);
 #ifdef __linux__
     auto& vk = Vk();
     static auto get_fd = reinterpret_cast<PFN_vkGetMemoryFdKHR>(vkGetDeviceProcAddr(vk.device, "vkGetMemoryFdKHR"));
@@ -193,7 +244,8 @@ void ImportPool(Pool& p) {
     // imported. Larger shared chunks were tried: a later pool across a chunk's end could not be imported.)
     // (OOT_BACK_MIN_KB: the smallest pool put in GPU memory. Small pools imported were ~3800 userptr objects on the Deck,
     // and amdgpu checks each one at every submission: 18 ms a submission)
-    static const u64 back_min = std::getenv("OOT_BACK_MIN_KB") ? std::strtoull(std::getenv("OOT_BACK_MIN_KB"), nullptr, 10) << 10 : (1u << 20);
+    // (placed maps cost nothing per submission: every pool; exported memory is listed in every submission: large ones only)
+    static const u64 back_min = std::getenv("OOT_BACK_MIN_KB") ? std::strtoull(std::getenv("OOT_BACK_MIN_KB"), nullptr, 10) << 10 : Vk().placed_maps ? 4096 : (1u << 20);
     if (BackPools() && p.import_size >= back_min) {
         bool overlap = false;
         for (auto& [b, w] : imports) if (auto i = w.lock(); i && i->base < end && p.import_base < i->base + i->size) overlap = true;
@@ -691,6 +743,24 @@ HostImport::~HostImport() {
     auto& vk = Vk();
     { std::lock_guard lock{vk.queue_mutex}; VK_CHECK(vkQueueWaitIdle(vk.queue)); } // (presentation may still be queued)
     if (vk.copy_queue != vk.queue) { std::lock_guard copy{vk.copy_mutex}; VK_CHECK(vkQueueWaitIdle(vk.copy_queue)); } // (write-back copies)
+    if (placed) { // the contents back into ordinary memory at the same addresses (the driver leaves the range reserved)
+        void* keep = std::malloc(size);
+        if (!keep) Fatal("cannot keep a pool's contents");
+        std::memcpy(keep, reinterpret_cast<void*>(base), size);
+        static auto unmap2 = reinterpret_cast<PFN_vkUnmapMemory2KHR>(vkGetDeviceProcAddr(vk.device, "vkUnmapMemory2KHR"));
+        VkMemoryUnmapInfoKHR ui{VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO_KHR}; ui.memory = memory; ui.flags = VK_MEMORY_UNMAP_RESERVE_BIT_EXT;
+        unmap2(vk.device, &ui);
+#ifdef __linux__
+        if (mmap(reinterpret_cast<void*>(base), size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0) == MAP_FAILED)
+            Fatal("cannot give a pool's memory back");
+        madvise(reinterpret_cast<void*>(base), size, MADV_NOHUGEPAGE);
+#else
+        Fatal("placed pool maps are Linux-only here");
+#endif
+        std::memcpy(reinterpret_cast<void*>(base), keep, size);
+        std::free(keep);
+        backed = false;
+    }
 #ifdef __linux__
     if (backed) { // the contents back into ordinary memory at the same addresses
         void* keep = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
