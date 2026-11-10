@@ -2179,11 +2179,11 @@ void CounterDispatch(u32 mode,u32 first,u32 count,u64 guest,u32 copy_queries){
 }
 // Device address of guest memory (for the processing dispatch's report writes).
 u64 GuestDeviceAddress(u64 address){
-    static std::unordered_map<VkBuffer,VkDeviceAddress> bases;
+    // (not cached by VkBuffer handle: imports come and go and a new buffer often gets a destroyed one's handle, so
+    // a cached address pointed into whatever the driver placed there next - the report dispatch then wrote into it)
     const auto range=GpuLookupAddress(address);if(!range.pool)Fatal("report memory %#llx unmapped",(unsigned long long)address);
-    auto& base=bases[range.buffer];
-    if(!base){VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};info.buffer=range.buffer;base=vkGetBufferDeviceAddress(Vk().device,&info);}
-    return base+range.offset;
+    VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};info.buffer=range.buffer;
+    return vkGetBufferDeviceAddress(Vk().device,&info)+range.offset;
 }
 // Processes the pending reports: one copy of the new query results and one dispatch.
 void ProcessReports(){
