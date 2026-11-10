@@ -392,6 +392,7 @@ public:
     std::vector<MeshLineTarget> mesh_vertex_targets;
     std::vector<MeshLineTarget> mesh_primitive_targets;
     std::array<Id, 2> mesh_outputs_marker{};
+    bool mesh_zero_outputs_marker{}; ///< OpStore(zero, zero) becomes OpSetMeshOutputsEXT 0 0 (Hookshot d91d203)
     std::array<Id, 4> mesh_tasks_marker{};
 
     Id load_const_func_u8{};

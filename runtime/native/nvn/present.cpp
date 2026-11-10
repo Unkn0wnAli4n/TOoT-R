@@ -136,9 +136,12 @@ void Build() {
     }
     info.clipped = VK_TRUE;
     info.oldSwapchain = sc.swapchain;
-    VkSwapchainKHR next;
-    VK_CHECK(vkCreateSwapchainKHR(vk.device, &info, nullptr, &next));
-    if (sc.swapchain) vkDestroySwapchainKHR(vk.device, sc.swapchain, nullptr);
+    VkSwapchainKHR next = VK_NULL_HANDLE;
+    const VkResult created = vkCreateSwapchainKHR(vk.device, &info, nullptr, &next);
+    // ported from Hookshot 3e73435: a non-null oldSwapchain is retired even when creation fails, so it cannot be
+    // used again. Let it go either way; with no swapchain the next present builds one again.
+    if (sc.swapchain) { vkDestroySwapchainKHR(vk.device, sc.swapchain, nullptr); sc.swapchain = VK_NULL_HANDLE; sc.images.clear(); }
+    if (created != VK_SUCCESS) { RT_LOG("swapchain creation failed (%d): retrying at the next present", (int)created); return; }
     sc.swapchain = next;
     u32 count = 0;
     vkGetSwapchainImagesKHR(vk.device, sc.swapchain, &count, nullptr);
@@ -303,7 +306,10 @@ void PresentWindowTexture(u64 window, s32 index) {
     nvn::last_present_ns = nvn::GuestTimestampNs();
     if (CurrentFrameSkipped()) { NextFrame(); return; } // (frame skip: nothing rendered, nothing shown)
     auto& vk = Vk();
-    if (!sc.swapchain) return;
+    if (!sc.swapchain) { // (a failed replacement: build again)
+        std::lock_guard lock{vk.queue_mutex}; std::lock_guard copy{vk.copy_mutex}; vkDeviceWaitIdle(vk.device); Build();
+        if (!sc.swapchain) return;
+    }
     auto _pt=std::chrono::steady_clock::now();
     vkWaitForFences(vk.device, 1, &sc.fence, VK_TRUE, UINT64_MAX);
     {   // Rebuild for a new VSync choice or window size (Wayland reports no out-of-date swapchain on resize).
@@ -311,6 +317,7 @@ void PresentWindowTexture(u64 window, s32 index) {
         const bool resized = pw > 0 && ph > 0 && ((u32)pw != sc.extent.width || (u32)ph != sc.extent.height);
         if (built_vsync != gfx::Current().vsync || resized) { std::lock_guard lock{vk.queue_mutex}; std::lock_guard copy{vk.copy_mutex}; vkDeviceWaitIdle(vk.device); Build(); }
     }
+    if (!sc.swapchain) return; // (the rebuild failed: again at the next present)
     { const double _ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_pt).count(); if(_ms>30)RT_LOG("present step previous blit fence: %.1f ms",_ms); _pt=std::chrono::steady_clock::now(); }
     u32 image_index;
     // A hidden or occluded window may not return images for a long time: never block the game
@@ -324,6 +331,12 @@ void PresentWindowTexture(u64 window, s32 index) {
         vkDeviceWaitIdle(vk.device);
         Build();
         if (r == VK_ERROR_OUT_OF_DATE_KHR) return;
+        if (!sc.swapchain) { // (suboptimal, and the replacement failed: the acquire's signal is unused)
+            vkDestroySemaphore(vk.device, sc.acquired, nullptr);
+            VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+            vkCreateSemaphore(vk.device, &si, nullptr, &sc.acquired);
+            return;
+        }
     }
     vkResetFences(vk.device, 1, &sc.fence);
     vkResetCommandBuffer(sc.cmd, 0);
