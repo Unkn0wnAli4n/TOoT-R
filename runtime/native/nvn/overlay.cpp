@@ -92,7 +92,7 @@ const std::vector<Row>& Rows() {
         {"Window Size", {"Default", "1280 x 720", "1600 x 900", "1920 x 1080", "2560 x 1440", "3840 x 2160"}, "The size of the game's window on the desktop."},
         {"Display Mode", {"Windowed", "Fullscreen"}, "Fullscreen fills the display the window is on."},
         {"Quality Profile", {"Console", "Handheld"}, "Handheld renders at the game's lower handheld resolution. Takes effect after a restart."},
-        {"Frame Rate Cap", {"30", "60", "90", "120", "Uncapped"}, "The most frames shown per second. The game keeps its normal speed at every cap; Uncapped runs as fast as the GPU allows."},
+        {"Frame Rate Cap", {"15", "20", "30", "60", "90", "120", "144", "Uncapped"}, "The most frames shown per second. The game keeps its normal speed at every cap; Uncapped runs as fast as the GPU allows."},
         {"VSync", {"Off", "On"}, "On waits for the display: no tearing, a little more input delay. Frames above the display's refresh rate are not shown."},
         {"Texture Filtering", {"Original", "Bilinear", "Trilinear", "Anisotropic 2x", "Anisotropic 4x", "Anisotropic 8x", "Anisotropic 16x"}, "Sharper textures at an angle with anisotropic filtering."},
         {"Texture Detail", {"Original", "Low", "Medium", "High", "Ultra"}, "Lower detail uses smaller mipmaps: less memory bandwidth."},
@@ -114,7 +114,7 @@ int* Field(gfx::Settings& s, int r) {
     }
 }
 int ValueIndex(const gfx::Settings& s, int r) {
-    if (r == 4) return s.frame_cap == 0 ? 4 : s.frame_cap <= 30 ? 0 : s.frame_cap <= 60 ? 1 : s.frame_cap <= 90 ? 2 : 3;
+    if (r == 4) { for (int i = 0; i < (int)std::size(gfx::FrameCaps); ++i) if (gfx::FrameCaps[i] == s.frame_cap) return i; return 3; }
     if (r == 10) return s.sharpness / 25;
     if (r == 11) return s.show_fps; if (r == 12) return s.ai_upscaler; if (r == 13) return s.volume / 10;
     gfx::Settings copy = s; return *Field(copy, r);
@@ -127,8 +127,7 @@ void Change(int r, int delta) { // (delta from the current value)
         if (v == gfx::PresetCustom) return; // (Custom is what changing a single setting gives)
         s = gfx::PresetValues(v);
     } else {
-        static constexpr int caps[] = {30, 60, 90, 120, 0};
-        if (r == 4) s.frame_cap = caps[v]; else if (r == 10) s.sharpness = v * 25; else if (r == 13) s.volume = v * 10;
+        if (r == 4) s.frame_cap = gfx::FrameCaps[v]; else if (r == 10) s.sharpness = v * 25; else if (r == 13) s.volume = v * 10;
         else if (r == 11) s.show_fps = v; else if (r == 12) s.ai_upscaler = v; else *Field(s, r) = v;
         s.preset = gfx::PresetCustom;
     }

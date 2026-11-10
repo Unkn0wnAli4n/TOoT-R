@@ -182,10 +182,16 @@ double frame_worst_ms = 0;
 u32 frames_over_25 = 0, frames_over_50 = 0;
 // The game's thread: window events and frame pacing (the blit follows in queue order).
 std::atomic<u64> graphics_module{0};
-// The frame rate cap in effect: 30/60/90/120, 0 for none (the Graphics window; OOT_UNCAPPED=1 overrides, benchmarks).
+// The frame rate cap in effect: one of gfx::FrameCaps, 0 for none (the Graphics window; OOT_UNCAPPED=1 overrides, benchmarks).
 int EffectiveFrameCap() {
     static const bool uncapped = std::getenv("OOT_UNCAPPED") != nullptr;
     return uncapped ? 0 : gfx::Current().frame_cap;
+}
+// The game may run above 60 frames per second: its engine takes such rates only with a variable refresh rate display.
+bool AboveSixty() {
+    static const bool off = std::getenv("OOT_NO_VRR") != nullptr; // (diagnostic: the engine holds its rate to 60, as before)
+    const int cap = EffectiveFrameCap();
+    return !off && (cap == 0 || cap > 60);
 }
 namespace {
 // Real-time game speed (from Hookshot, host/nn_vi.c realtime_step). The engine advances each frame
@@ -213,7 +219,22 @@ void RealtimeStep() {
     double ratio = std::clamp(sum / count * 60.0 + carry, 60.0 / max_fps, 4.0);
     const int fps = std::clamp((int)(60.0 / ratio + 0.5), 15, max_fps);
     carry = std::clamp(ratio - 60.0 / fps, -0.5, 0.5);
+    // OOT_SPEED_TRACE=1: the game's speed, from the step the engine took (its global, 60 / the rate it accepted) against the clock.
+    {
+        static const bool trace = std::getenv("OOT_SPEED_TRACE") != nullptr;
+        static double game = 0, wall = 0; static int kept = 0, frames = 0, wrote = 0;
+        if (trace) {
+            float step; std::memcpy(&step, reinterpret_cast<const void*>(0x804d41fc8ull), 4);
+            game += step / 60.0; wall += dt; ++frames; kept += *slot == wrote;
+            if (wall >= 4.0) { RT_LOG("game speed %.3f (%.1f fps; the engine kept the rate in %d of %d frames, step now %.3f)", game / wall, frames / wall, kept, frames, step); game = wall = 0; kept = frames = 0; }
+            wrote = fps;
+        }
+    }
     *slot = fps;
+    // Above 60 the engine keeps a rate only on a display with a variable refresh rate (vi.cpp answers that it has one), and
+    // then sets its own frame limiter (+0xfc, which sleeps below 60) to the rate: held at the cap, it never waits.
+    // (ported from Hookshot, host/nn_vi.c realtime_step)
+    if (max_fps > 60) { int* limit = reinterpret_cast<int*>(module + 0xfc); if (*limit > 0 && *limit < 60) *limit = 60; }
     if (steps++ % 3000 == 0) RT_LOG("real-time step: ratio %.3f, game frame rate %d", ratio, fps);
 }
 }
@@ -243,7 +264,8 @@ void PresentPacing() {
     {
         static auto next = std::chrono::steady_clock::now();
         int cap = EffectiveFrameCap();
-        if (!RealtimeOn() && (cap > 60 || !cap)) cap = 60;
+        static const bool benchmark = std::getenv("OOT_UNCAPPED") != nullptr; // (never limited, as before)
+        if (!benchmark && !RealtimeOn() && (cap > 60 || !cap)) cap = 60;
         if (cap) {
             const auto period = std::chrono::nanoseconds(1000000000LL / cap);
             auto now = std::chrono::steady_clock::now();

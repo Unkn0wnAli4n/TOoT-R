@@ -41,7 +41,7 @@ Settings Sanitized(Settings s) {
     s.resolution = std::clamp(s.resolution, 0, 5);
     s.display_mode = std::clamp(s.display_mode, 0, 1);
     if (s.render_scale) s.render_scale = std::clamp(s.render_scale, 15, 100);
-    s.frame_cap = s.frame_cap <= 0 ? 0 : s.frame_cap <= 30 ? 30 : s.frame_cap <= 60 ? 60 : s.frame_cap <= 90 ? 90 : s.frame_cap <= 120 ? 120 : 0;
+    { int cap = 0; if (s.frame_cap > 0) for (int c : FrameCaps) if (c && s.frame_cap <= c) { cap = c; break; } s.frame_cap = cap; } // (the next cap up; past the highest: no limit)
     s.vsync = s.vsync ? 1 : 0;
     s.filtering = std::clamp(s.filtering, 0, 6);
     s.texture_detail = std::clamp(s.texture_detail, 0, 4);
