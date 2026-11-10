@@ -15,13 +15,16 @@ struct Settings {
     int resolution = 0;      // window size: 0 unchanged, 1 1280x720, 2 1600x900, 3 1920x1080, 4 2560x1440, 5 3840x2160
     int display_mode = 0;    // 0 windowed, 1 fullscreen
     int render_scale = 0;    // 0: the game's own; else 15..100 (engine fixed path: not effective yet, hidden in the menu)
-    int frame_cap = 60;      // 30 or 60
+    int frame_cap = 60;      // frames per second: 30, 60, 90, 120, or 0 for no limit
     int vsync = 0;           // 0 off, 1 on
     int filtering = 0;       // 0 original, 1 bilinear, 2 trilinear, 3..6 anisotropic 2x/4x/8x/16x
     int texture_detail = 0;  // 0 original, 1 low, 2 medium, 3 high, 4 ultra (mip LOD bias)
     int texture_memory = 0;  // 0 original, 1 low (more BC3), 2 quality (no BC3: RGBA8)
     int upscaling = 0;       // the game's 1080p frame to the window: 0 linear, 1 Catmull-Rom, 2 Lanczos, 3 FSR 1
     int sharpness = 0;       // percent, 0..100
+    int show_fps = 0;        // fps and frame time in a corner of the picture: 0 off, 1 on
+    int ai_upscaler = 0;     // the game's neural upscaler: 0 auto (on where the GPU runs it well), 1 off (linear upscale), 2 on
+    int volume = 100;        // master volume, percent (0..100, steps of 10)
     int handheld = 0;        // quality profile: 0 console (docked), 1 handheld (the game's own lower resolution; at start)
 };
 

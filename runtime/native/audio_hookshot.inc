@@ -597,7 +597,11 @@ static void output_frame(const int16_t *pcm) {
     if (!wout) return;
     /* (at most ~60 ms queued: the device is behind, this frame is dropped instead of adding latency) */
     if (SDL_GetAudioStreamQueued(wout) > RATE * 4 * 60 / 1000) return;
-    SDL_PutAudioStreamData(wout, pcm, FRAME * 4);
+    const int percent = master_volume_percent();   /* (tootr: the settings window's master volume) */
+    if (percent >= 100) { SDL_PutAudioStreamData(wout, pcm, FRAME * 4); return; }
+    int16_t scaled[FRAME * 2];
+    for (int i = 0; i < FRAME * 2; i++) scaled[i] = (int16_t)(pcm[i] * percent / 100);
+    SDL_PutAudioStreamData(wout, scaled, FRAME * 4);
 }
 
 /* ---- parameter updates ------------------------------------------------------------------------------------------
