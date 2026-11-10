@@ -7,12 +7,16 @@
 #include <algorithm>
 #include <cstring>
 #include <list>
+#include <deque>
 #include <map>
 #include <set>
 #include <array>
 #include <tuple>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
+#include <functional>
+#include <thread>
 #include <unordered_map>
 #include <atomic>
 #include <cstdlib>
@@ -232,7 +236,8 @@ std::shared_ptr<Texture> TextureReference(u64 object) {
     return it->second;
 }
 void FinalizeTexture(u64 object) {
-    std::lock_guard batch_lock{BatchMutex()};
+    // (not between two commands of a list the executor runs: later commands of it may still name this texture)
+    struct Patient { Patient() { BatchMutex().lock_patient(); } ~Patient() { BatchMutex().unlock(); } } batch_lock;
     std::shared_ptr<Texture> retired;
     {
         std::lock_guard lock{texture_owners_mutex};
@@ -342,12 +347,28 @@ namespace {
 // ~2 ms of a frame. A kept image is as good as a new one (contents undefined, layout UNDEFINED to the first use).
 // OOT_NO_SPARE_IMAGES=1: destroyed at once, as before.
 using SpareKey = std::tuple<u32, u32, u32, u32, u32, u32, u32, u32, u32, u32>;
-struct SpareImage { VkImage image; VkDeviceMemory memory; u64 size; };
+// Per description, newest last; the newest is taken, and over the budget the oldest of all goes. (Taken oldest
+// first, the images a description has too many of, more retired than needed, never aged: they filled the budget,
+// and descriptions needed every few frames were dropped before their turn, so a third of a frame's new render
+// targets, 8 of 24 in Castle Town, were made by the driver again: 3 ms of the executor's frame.) Spares nothing
+// took for 1800 frames go.
+struct SpareImage { VkImage image; VkDeviceMemory memory; u64 size; u64 frame; u64 sequence; };
+struct SpareKind { std::deque<SpareImage> images; u64 bytes = 0; };
 std::mutex spare_mutex;
-std::multimap<SpareKey, SpareImage> spare_images;
-std::list<std::multimap<SpareKey, SpareImage>::iterator> spare_order; // oldest first
+std::map<SpareKey, SpareKind> spare_images;
 u64 spare_bytes = 0;
-const u64 SpareBudget = std::getenv("OOT_SPARE_IMAGE_MB") ? std::strtoull(std::getenv("OOT_SPARE_IMAGE_MB"), nullptr, 10) << 20 : 192ull << 20;
+u64 SpareBudget() {
+    static const u64 budget = [] {
+        if (const char* e = std::getenv("OOT_SPARE_IMAGE_MB")) return std::strtoull(e, nullptr, 10) << 20;
+        auto& vk = Vk(); u64 local = 0;
+        for (u32 h = 0; h < vk.memory_properties.memoryHeapCount; ++h) if (vk.memory_properties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) local = std::max<u64>(local, vk.memory_properties.memoryHeaps[h].size);
+        const bool small = vk.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU || local < (6ull << 30);
+        return small ? 128ull << 20 : 384ull << 20; }();
+    return budget;
+}
+std::atomic<u64> stat_spare_hits{0}, stat_images_created{0}, stat_targets_created{0}, stat_spare_kept{0}, stat_spare_dropped{0}, stat_spare_refused{0};
+std::mutex kind_stats_mutex; std::map<SpareKey, std::array<u64, 4>> kind_stats; // (OOT_IMAGE_TRACE) created, from spares, kept, dropped
+void KindStat(const SpareKey& k, int what) { static const bool on = std::getenv("OOT_IMAGE_TRACE") != nullptr; if (!on) return; std::lock_guard l{kind_stats_mutex}; ++kind_stats[k][what]; }
 SpareKey SpareKeyOf(const VkImageCreateInfo& ii) {
     return {(u32)ii.imageType, (u32)ii.format, ii.extent.width, ii.extent.height, ii.extent.depth, ii.mipLevels, ii.arrayLayers,
             (u32)ii.samples, (u32)ii.usage, (u32)ii.flags};
@@ -358,26 +379,109 @@ bool TakeSpareImage(const VkImageCreateInfo& ii, Texture& t) {
     std::lock_guard lock{spare_mutex};
     auto it = spare_images.find(SpareKeyOf(ii));
     if (it == spare_images.end()) return false;
-    t.image = it->second.image; t.memory = it->second.memory; t.allocation_size = it->second.size; t.memory_offset = 0;
-    spare_bytes -= it->second.size;
-    spare_order.remove(it);
-    spare_images.erase(it);
+    const SpareImage s = it->second.images.back(); it->second.images.pop_back(); // (the newest: the oldest age out)
+    t.image = s.image; t.memory = s.memory; t.allocation_size = s.size; t.memory_offset = 0;
+    KindStat(it->first, 1);
+    spare_bytes -= s.size; it->second.bytes -= s.size;
+    if (it->second.images.empty()) spare_images.erase(it);
     return true;
 }
-void DestroySpare(const SpareImage& s) {
-    vkDestroyImage(Vk().device, s.image, nullptr);
-    vkFreeMemory(Vk().device, s.memory, nullptr);
+// The memory of render targets whose image goes is kept for the next one needing about as much: OoT's shadow maps
+// change size every frame (817, 818, 819... 1791, 1875 square), so no spare image of the same description is ever
+// there, and vkAllocateMemory (not vkCreateImage) was the cost: ~13% of the executor's time in Castle Town. Memory
+// of its own per image, as before (NVIDIA compresses attachments only so), just recycled. OOT_NO_SPARE_MEMORY=1: off.
+struct SpareMemory { VkDeviceMemory memory; u32 type; u64 frame; };
+std::multimap<u64, SpareMemory> spare_memory; // by size; spare_mutex held
+u64 spare_memory_bytes = 0;
+std::unordered_map<VkDeviceMemory, u32> attachment_memory_types; // allocations of render targets: their memory type
+std::atomic<u64> stat_memory_reused{0};
+// Destroying images and freeing their memory costs the driver about as much as making them, and ran on the executor
+// (in the actions of retired batches): a thread of its own does it. OOT_SYNC_DESTROY=1: in place, as before.
+void DestroyOffThread(std::function<void()> destroy) {
+    static const bool sync = std::getenv("OOT_SYNC_DESTROY") != nullptr;
+    if (sync) { destroy(); return; }
+    static std::mutex m; static std::condition_variable cv; static std::vector<std::function<void()>> queue;
+    static std::once_flag once;
+    std::call_once(once, [] { std::thread([] {
+        rt::SetThreadName("vk-destroy");
+        for (;;) {
+            std::vector<std::function<void()>> work;
+            { std::unique_lock lock{m}; cv.wait(lock, [] { return !queue.empty(); }); work.swap(queue); }
+            for (auto& f : work) f();
+        }
+    }).detach(); });
+    { std::lock_guard lock{m}; queue.push_back(std::move(destroy)); }
+    cv.notify_one();
+}
+void FreeSpareMemoryLocked(std::multimap<u64, SpareMemory>::iterator it) {
+    DestroyOffThread([memory = it->second.memory] { vkFreeMemory(Vk().device, memory, nullptr); });
+    attachment_memory_types.erase(it->second.memory);
+    spare_memory_bytes -= it->first; spare_memory.erase(it);
+}
+// (spare_mutex held) false: not memory of a render target, or not kept; the caller frees it.
+bool KeepSpareMemory(VkDeviceMemory memory, u64 size) {
+    static const bool off = std::getenv("OOT_NO_SPARE_MEMORY") != nullptr;
+    auto type = attachment_memory_types.find(memory);
+    if (off || type == attachment_memory_types.end()) { if (type != attachment_memory_types.end()) attachment_memory_types.erase(type); return false; }
+    spare_memory.emplace(size, SpareMemory{memory, type->second, CurrentFrameNumber()});
+    spare_memory_bytes += size;
+    while (spare_memory_bytes > SpareBudget() && !spare_memory.empty()) { // (the oldest goes)
+        auto oldest = spare_memory.begin();
+        for (auto it = spare_memory.begin(); it != spare_memory.end(); ++it) if (it->second.frame < oldest->second.frame) oldest = it;
+        FreeSpareMemoryLocked(oldest);
+    }
+    return true;
+}
+// Memory of type `type` holding at least `size`, not much more: taken from the spares.
+bool TakeSpareMemory(u64 size, u32 type, VkDeviceMemory* memory, u64* got) {
+    std::lock_guard lock{spare_mutex};
+    // (the shadow maps' sizes wander between frames: on GPUs of their own memory up to twice the size is taken)
+    const bool roomy = SpareBudget() > (128ull << 20);
+    const u64 limit = roomy ? size * 2 + (1ull << 20) : size + std::max<u64>(size / 4, 1ull << 20);
+    for (auto it = spare_memory.lower_bound(size); it != spare_memory.end() && it->first <= limit; ++it) {
+        if (it->second.type != type) continue;
+        *memory = it->second.memory; *got = it->first;
+        spare_memory_bytes -= it->first; spare_memory.erase(it);
+        ++stat_memory_reused;
+        return true;
+    }
+    return false;
+}
+void NoteAttachmentMemory(VkDeviceMemory memory, u32 type) { std::lock_guard lock{spare_mutex}; attachment_memory_types[memory] = type; }
+void DestroySpare(const SpareImage& s) { // (spare_mutex held)
+    const bool keep = KeepSpareMemory(s.memory, s.size);
+    DestroyOffThread([image = s.image, memory = keep ? VK_NULL_HANDLE : s.memory] {
+        vkDestroyImage(Vk().device, image, nullptr);
+        if (memory) vkFreeMemory(Vk().device, memory, nullptr); });
 }
 void DropSpareImages() { // (low on memory)
     std::lock_guard lock{spare_mutex};
-    for (auto& [k, s] : spare_images) DestroySpare(s);
-    spare_images.clear(); spare_order.clear(); spare_bytes = 0;
+    for (auto& [k, kind] : spare_images) for (auto& s : kind.images) { vkDestroyImage(Vk().device, s.image, nullptr); attachment_memory_types.erase(s.memory); vkFreeMemory(Vk().device, s.memory, nullptr); }
+    spare_images.clear(); spare_bytes = 0;
+    while (!spare_memory.empty()) FreeSpareMemoryLocked(spare_memory.begin());
+}
+// (spare_mutex held) The oldest spare of a description goes.
+void DropOldestSpare(std::map<SpareKey, SpareKind>::iterator kind) {
+    const SpareImage s = kind->second.images.front(); kind->second.images.pop_front();
+    KindStat(kind->first, 3);
+    spare_bytes -= s.size; kind->second.bytes -= s.size; DestroySpare(s); ++stat_spare_dropped;
+    if (kind->second.images.empty()) spare_images.erase(kind);
+}
+void AgeSpareImages() { // (now and then: what nothing took for 1800 frames)
+    std::lock_guard lock{spare_mutex};
+    const u64 now = CurrentFrameNumber();
+    for (auto it = spare_images.begin(); it != spare_images.end();) {
+        auto kind = it++;
+        while (now - kind->second.images.front().frame > 1800) { const bool last = kind->second.images.size() == 1; DropOldestSpare(kind); if (last) break; }
+    }
+    for (auto it = spare_memory.begin(); it != spare_memory.end();) { auto m = it++; if (now - m->second.frame > 1800) FreeSpareMemoryLocked(m); }
 }
 // (the image is no longer used by the GPU) true: kept.
 bool KeepSpareImage(const Texture& t) {
     static const bool off = std::getenv("OOT_NO_SPARE_IMAGES") != nullptr;
-    if (off || !t.image || !t.memory || t.block || t.allocation_size > SpareBudget / 2) return false;
-    if (!(t.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))) return false;
+    if (off || !t.image || !t.memory || t.block || t.allocation_size > SpareBudget() / 2) { ++stat_spare_refused; return false; }
+    if (!(t.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))) { ++stat_spare_refused; return false; }
+    ++stat_spare_kept;
     VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ii.imageType = t.target == Target::T3D ? VK_IMAGE_TYPE_3D : (t.target == Target::T1D || t.target == Target::T1DArray) ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
     ii.format = t.info.vk; ii.extent = {t.width, t.height, t.target == Target::T3D ? t.depth : 1};
@@ -387,12 +491,15 @@ bool KeepSpareImage(const Texture& t) {
     if (t.target == Target::T3D) ii.flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     if (t.info.block_w > 1 && !t.decoded_astc) ii.flags |= VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
     std::lock_guard lock{spare_mutex};
-    auto it = spare_images.emplace(SpareKeyOf(ii), SpareImage{t.image, t.memory, t.allocation_size});
-    spare_order.push_back(it);
-    spare_bytes += t.allocation_size;
-    while (spare_bytes > SpareBudget && !spare_order.empty()) {
-        auto old = spare_order.front(); spare_order.pop_front();
-        spare_bytes -= old->second.size; DestroySpare(old->second); spare_images.erase(old);
+    KindStat(SpareKeyOf(ii), 2);
+    auto& kind = spare_images[SpareKeyOf(ii)];
+    static u64 sequence = 0;
+    kind.images.push_back({t.image, t.memory, t.allocation_size, CurrentFrameNumber(), ++sequence});
+    kind.bytes += t.allocation_size; spare_bytes += t.allocation_size;
+    while (spare_bytes > SpareBudget() && !spare_images.empty()) {
+        auto oldest = spare_images.begin();
+        for (auto k = spare_images.begin(); k != spare_images.end(); ++k) if (k->second.images.front().sequence < oldest->second.images.front().sequence) oldest = k;
+        DropOldestSpare(oldest);
     }
     return true;
 }
@@ -465,7 +572,9 @@ void CreateImage(Texture& t) {
     if (trace) { static std::mutex m; static std::map<std::tuple<u32,u32,u32,u32,u32,u32>, u64> made; static u64 n = 0; std::lock_guard l{m};
         ++made[{t.width, t.height, t.format, t.levels, t.layers, (u32)!!(ii.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))}];
         if (++n % 500 == 0) { for (auto& [k, c] : made) if (c > 4) RT_LOG("images made: %ux%u fmt %u levels %u layers %u attachment %u: %llu", std::get<0>(k), std::get<1>(k), std::get<2>(k), std::get<3>(k), std::get<4>(k), std::get<5>(k), (unsigned long long)c); made.clear(); RT_LOG("(500 images made)"); } }
-    if (TakeSpareImage(ii, t)) { image_live_bytes += t.allocation_size; if (t.decoded_astc) image_astc_bytes += t.allocation_size; NoteLive(t, 1); return; }
+    if (TakeSpareImage(ii, t)) { ++stat_spare_hits; image_live_bytes += t.allocation_size; if (t.decoded_astc) image_astc_bytes += t.allocation_size; NoteLive(t, 1); return; }
+    KindStat(SpareKeyOf(ii), 0);
+    ++stat_images_created; if (ii.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) ++stat_targets_created;
     VK_CHECK(vkCreateImage(vk.device, &ii, nullptr, &t.image));
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(vk.device, t.image, &req);
@@ -479,6 +588,14 @@ void CreateImage(Texture& t) {
         VK_CHECK(vkBindImageMemory(vk.device,t.image,t.memory,t.memory_offset));
         return;
     }
+    const bool attachment=(ii.usage&(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))!=0;
+    if(attachment){u64 got=0;
+        if(TakeSpareMemory(req.size,ai.memoryTypeIndex,&t.memory,&got)){
+            {std::lock_guard lock{spare_mutex};attachment_memory_types[t.memory]=ai.memoryTypeIndex;}
+            t.allocation_size=got;image_live_bytes+=got;if(t.decoded_astc)image_astc_bytes+=got;NoteLive(t,1);
+            VK_CHECK(vkBindImageMemory(vk.device,t.image,t.memory,0));
+            return;
+        }}
     VkResult allocated=vkAllocateMemory(vk.device,&ai,nullptr,&t.memory);
     if(allocated!=VK_SUCCESS){
         // Out of device memory: release every cached image (destroyed after the GPU is done with
@@ -497,6 +614,7 @@ void CreateImage(Texture& t) {
     if(allocated!=VK_SUCCESS)RT_LOG("texture allocation failed: %ux%ux%u format %u, requested %llu MiB; live images %llu MiB, cached %llu MiB",t.width,t.height,t.depth,t.format,
         (unsigned long long)(req.size>>20),(unsigned long long)(image_live_bytes.load()>>20),(unsigned long long)(image_cached_bytes.load()>>20));
     VK_CHECK(allocated);
+    if(attachment)NoteAttachmentMemory(t.memory,ai.memoryTypeIndex);
     t.allocation_size=req.size;image_live_bytes+=req.size;if(t.decoded_astc)image_astc_bytes+=req.size;NoteLive(t,1);
     VK_CHECK(vkBindImageMemory(vk.device, t.image, t.memory, 0));
 }
@@ -570,14 +688,24 @@ std::map<ImageKey,CachedImage> image_cache;
 void DestroyLater(Texture* t) {
     ForgetImageHolder(t); // (on its way out: no other object takes its image now)
     AfterFlush([t] {
-        auto& vk = Vk();
-        if (t->view) vkDestroyImageView(vk.device, t->view, nullptr);
-        for (auto& [key, view] : t->views) vkDestroyImageView(vk.device, view, nullptr);
+        std::vector<VkImageView> views;
+        if (t->view) views.push_back(t->view);
+        for (auto& [key, view] : t->views) views.push_back(view);
+        t->view = VK_NULL_HANDLE; t->views.clear();
         if (t->block || t->memory) NoteLive(*t,-1);
         if (t->block) {SubFree(*t);image_live_bytes-=t->allocation_size;if(t->decoded_astc)image_astc_bytes-=t->allocation_size;} // (before the image goes: it reads its size)
-        if (t->image && !t->block && t->memory && KeepSpareImage(*t)) { image_live_bytes-=t->allocation_size;if(t->decoded_astc)image_astc_bytes-=t->allocation_size; delete t; return; }
-        if (t->image) vkDestroyImage(vk.device, t->image, nullptr);
-        if (t->memory) {vkFreeMemory(vk.device, t->memory, nullptr);image_live_bytes-=t->allocation_size;if(t->decoded_astc)image_astc_bytes-=t->allocation_size;}
+        if (t->image && !t->block && t->memory && KeepSpareImage(*t)) {
+            image_live_bytes-=t->allocation_size;if(t->decoded_astc)image_astc_bytes-=t->allocation_size; delete t;
+            if (!views.empty()) DestroyOffThread([views = std::move(views)] { for (VkImageView v : views) vkDestroyImageView(Vk().device, v, nullptr); });
+            return; }
+        VkDeviceMemory free_memory = VK_NULL_HANDLE;
+        if (t->memory && !t->block) {bool kept; {std::lock_guard lock{spare_mutex}; kept = KeepSpareMemory(t->memory, t->allocation_size);}
+            if (!kept) free_memory = t->memory; image_live_bytes-=t->allocation_size;if(t->decoded_astc)image_astc_bytes-=t->allocation_size;}
+        DestroyOffThread([views = std::move(views), image = t->image, free_memory] {
+            auto& vk = Vk();
+            for (VkImageView v : views) vkDestroyImageView(vk.device, v, nullptr);
+            if (image) vkDestroyImage(vk.device, image, nullptr);
+            if (free_memory) vkFreeMemory(vk.device, free_memory, nullptr); });
         delete t;
     });
 }
@@ -790,6 +918,20 @@ void ReportImageCache() {
            (unsigned long long)image_cache_adopted.exchange(0), (unsigned long long)image_cache_overlap.exchange(0), (unsigned long long)images_shared.exchange(0), (unsigned long long)images_reused.exchange(0),
            (unsigned long long)images_released.exchange(0), (unsigned long long)image_cache_evicted.exchange(0),
            image_cache.size(), image_cached_bytes / 1048576.0, image_live_bytes / 1048576.0, image_astc_bytes / 1048576.0);
+    AgeSpareImages();
+    RT_LOG("render target memory: %.1f per frame from spares, %.0f MiB spare", stat_memory_reused.exchange(0) / 300.0, spare_memory_bytes / 1048576.0);
+    RT_LOG("images per frame: %.1f created (%.1f render targets), %.1f from spares; spares: %.1f kept, %.1f dropped over the budget, %.1f not kept; %.0f MiB spare",
+           stat_images_created.exchange(0) / 300.0, stat_targets_created.exchange(0) / 300.0, stat_spare_hits.exchange(0) / 300.0,
+           stat_spare_kept.exchange(0) / 300.0, stat_spare_dropped.exchange(0) / 300.0, stat_spare_refused.exchange(0) / 300.0, spare_bytes / 1048576.0);
+    if (std::getenv("OOT_IMAGE_TRACE")) {
+        std::lock_guard l{kind_stats_mutex};
+        for (auto& [k, v] : kind_stats) if (v[0] + v[3] > 20) RT_LOG("  kind %ux%ux%u vkfmt %u levels %u layers %u usage %#x: %llu created, %llu from spares, %llu kept, %llu dropped", std::get<2>(k), std::get<3>(k), std::get<4>(k),
+            std::get<1>(k), std::get<5>(k), std::get<6>(k), std::get<8>(k), (unsigned long long)v[0], (unsigned long long)v[1], (unsigned long long)v[2], (unsigned long long)v[3]);
+        kind_stats.clear();
+        std::lock_guard sl{spare_mutex};
+        for (auto& [k, kind] : spare_images) RT_LOG("  spare %ux%ux%u vkfmt %u levels %u layers %u: %zu images, %.0f MiB, oldest %llu frames, newest %llu frames", std::get<2>(k), std::get<3>(k), std::get<4>(k), std::get<1>(k), std::get<5>(k), std::get<6>(k),
+            kind.images.size(), kind.bytes / 1048576.0, (unsigned long long)(CurrentFrameNumber() - kind.images.front().frame), (unsigned long long)(CurrentFrameNumber() - kind.images.back().frame));
+    }
     if (std::getenv("OOT_IMAGE_TRACE")) {
         std::lock_guard l{live_kinds_mutex}; std::vector<std::pair<s64,std::string>> top;
         for (auto& [k,v] : live_kinds) if (v.first) { char b[160]; std::snprintf(b,sizeof b,"%ux%u fmt %u%s%s: %lld images, %.0f MiB",std::get<0>(k),std::get<1>(k),std::get<2>(k),std::get<3>(k)?" attachment":"",std::get<4>(k)?" astc":"",(long long)v.first,v.second/1048576.0); top.push_back({v.second,b}); }

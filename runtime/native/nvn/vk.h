@@ -34,6 +34,7 @@ struct VulkanContext {
     u64 host_import_alignment = 0x1000;
     bool buffer_float32_atomic_add=false;
     bool device_fault=false;
+    PFN_vkCmdSetCheckpointNV checkpoint=nullptr;
     PFN_vkCmdPushDescriptorSetKHR push_descriptor_set=nullptr; // VK_KHR_push_descriptor
     u32 max_push_descriptors=0; // VK_EXT_device_fault enabled
     bool conditional_rendering=false; // VK_EXT_conditional_rendering enabled

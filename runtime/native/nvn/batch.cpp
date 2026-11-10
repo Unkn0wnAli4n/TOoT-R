@@ -19,6 +19,7 @@
 #include "commands.h"
 
 namespace nvn {
+extern std::atomic<u64> passes_begun; // (present.cpp)
 namespace {
 
 struct Batch {
@@ -73,6 +74,7 @@ std::vector<VkFence> spare_fences;
 std::vector<VkQueryPool> spare_timers;
 std::vector<VkDescriptorPool> spare_pools;
 u64 submitted_serial = 0, retired_serial = 0;
+std::atomic<u64> retired_serial_atomic{0};
 bool reopen_light = false;
 u64 record_serial = 0;
 u64 other_serial = 0; // changes when anything but a pass draw is recorded (draw state caching) // changes whenever anything is recorded or submitted
@@ -107,6 +109,15 @@ VkDescriptorPool MakePool() {
 BatchLock& BatchMutex() {
     static BatchLock mutex;
     return mutex;
+}
+void BatchLock::Yield() {
+    static const bool off = std::getenv("OOT_NO_BATCH_YIELD") != nullptr;
+    if (off || depth != 1 || !waiters.load(std::memory_order_relaxed)) return;
+    unlock();
+    // (until each waiter has the lock or had it: a futex wake takes a few microseconds; bounded, in case one went away)
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
+    while (waiters.load(std::memory_order_relaxed) && std::chrono::steady_clock::now() < until) std::this_thread::yield();
+    lock();
 }
 // Signalled with each batch's serial when it completes: an outermost waiter releases the batch lock
 // while it waits on this (a fence would be recycled by whichever thread retires the batch), so other
@@ -310,7 +321,7 @@ void PassDraw(const std::vector<u64>& key, const std::function<void(VkCommandBuf
             } else { work_kind = 2; BeginWork(); }
         }
         begin(batch.cmd);
-        ++stat_passes;
+        ++stat_passes; passes_begun.fetch_add(1, std::memory_order_relaxed); // (present.cpp: a loading screen draws next to nothing)
         reopen_light = false;
         batch.pass_open = true;
         batch.pass_key = key;
@@ -494,7 +505,7 @@ bool RetireOne(bool wait) {
     for (VkDescriptorPool pool : f.pools) { vkResetDescriptorPool(vk.device, pool, 0); spare_pools.push_back(pool); }
     auto actions = std::move(f.after);
     in_flight.pop_front();
-    ++retired_serial;
+    ++retired_serial; retired_serial_atomic.store(retired_serial, std::memory_order_release);
     for (auto& action : actions) action();
     ReapWritebacks();
     return true;
@@ -608,7 +619,13 @@ void Submit() {
             const VkSemaphore wb = WritebackTimeline();
             // On its own queue (the main queue's next submissions, such as the fence the game waits on,
             // do not queue behind it), after the batch (its timeline value).
-            const bool own = vk.copy_queue != vk.queue;
+            // The driver may expose two queues from this family, but a
+            // timeline wait between them is not guaranteed to establish
+            // execution order.  The copy queue can begin its writeback while
+            // the batch still has access to the same guest allocation.  Keep
+            // the copy on the main queue so the batch signal orders it even
+            // when both queues share the same family.
+            const bool own = false;
             VkTimelineSemaphoreSubmitInfo wti{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
             wti.signalSemaphoreValueCount = 1; wti.pSignalSemaphoreValues = &f.serial;
             wti.waitSemaphoreValueCount = own ? 1 : 0; wti.pWaitSemaphoreValues = &f.serial;
@@ -678,7 +695,16 @@ void RetireLoop() {
         wi.semaphoreCount = 1; wi.pSemaphores = &timeline; wi.pValues = &next;
         if (vkWaitSemaphores(vk.device, &wi, 20'000'000) != VK_SUCCESS) continue;
         VK_CHECK(vkGetSemaphoreCounterValue(vk.device, timeline, &done));
-        std::lock_guard lock{BatchMutex()};
+        // (without queueing for the lock: the executor, holding it while it records, retires completed batches
+        // itself at each submission, about every millisecond; handing it over cost it 9% of its time)
+        static const bool queue_for_lock = std::getenv("OOT_RETIRE_LOCKS") != nullptr;
+        std::unique_lock lock{BatchMutex(), std::defer_lock};
+        if (queue_for_lock) lock.lock();
+        else while (!lock.try_lock()) {
+            if (retired_serial_atomic.load(std::memory_order_acquire) >= done) break;
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+        if (!lock.owns_lock()) continue;
         while (RetireOne(false)) {}
         ReapWritebacks();
     }
@@ -716,10 +742,14 @@ void Flush() {
     Submit();
     while (RetireOne(true)) {}
     TraceWait(__builtin_return_address(0), batch.wait_ns - before);
-    // Actions deferred while no batch was open (AfterBatch) run now.
-    auto actions = std::move(batch.after);
-    batch.after.clear();
-    for (auto& action : actions) action();
+    // RetireOne can release the batch lock while waiting. Another thread may
+    // have recorded a new batch in that interval; its staging buffers and views
+    // must survive until that batch is submitted and completes.
+    if (!batch.cmd) {
+        auto actions = std::move(batch.after);
+        batch.after.clear();
+        for (auto& action : actions) action();
+    }
 }
 
 namespace {
@@ -853,7 +883,10 @@ void WaitForWrites(u64 address, u64 size) {
     static const bool trace = std::getenv("OOT_INVALIDATE_TRACE") != nullptr;
     if (trace) { static std::map<std::pair<u64,u64>, u64> seen; static u64 n = 0; ++seen[{address, size}];
         if (++n % 3000 == 0) { for (auto& [k, c] : seen) RT_LOG("invalidate %#llx+%#llx: %llu", (unsigned long long)k.first, (unsigned long long)k.second, (unsigned long long)c); seen.clear(); } }
+    const double tl_from = TimelineOn() ? TimelineMs() : 0;
+    struct TlEnd { double from; u64 a, s; double locked = 0; int open = 0, flight = 0; ~TlEnd() { if (TimelineOn() && TimelineMs() - from > 0.05) RT_LOG("T %.2f readback %#llx+%#llx waited %.2f (lock %.2f, open batch %d, in-flight waits %d)", TimelineMs(), (unsigned long long)a, (unsigned long long)s, TimelineMs() - from, locked - from, open, flight); } } tl_end{tl_from, address, size};
     std::lock_guard lock{BatchMutex()};
+    if (TimelineOn()) tl_end.locked = TimelineMs();
     RecallDeviceAhead(address, size);
     static const bool trace_waits = std::getenv("OOT_READBACK_TRACE") != nullptr;
     const auto show = [&](const char* what, const std::map<u64, u64>& ranges) {
@@ -865,13 +898,14 @@ void WaitForWrites(u64 address, u64 size) {
     };
     if (Overlaps(batch.pending_writes, address, size)) show("the open batch's writes", batch.pending_writes);
     else if (Overlaps(batch.pending_reports, address, size)) show("the open batch's reports", batch.pending_reports);
-    if (Overlaps(batch.pending_writes, address, size) || Overlaps(batch.pending_reports, address, size)) Submit();
+    if (Overlaps(batch.pending_writes, address, size) || Overlaps(batch.pending_reports, address, size)) { tl_end.open = 1; Submit(); }
     for (;;) {
         size_t last = in_flight.size();
         for (size_t i = in_flight.size(); i-- > 0;)
             if (Overlaps(in_flight[i].writes, address, size) || Overlaps(in_flight[i].reports, address, size)) { last = i; break; }
         if (last == in_flight.size()) break;
         if (trace_waits) show("a submitted batch", Overlaps(in_flight[last].writes, address, size) ? in_flight[last].writes : in_flight[last].reports);
+        ++tl_end.flight;
         RetireOne(true); // (oldest first, up to the last batch writing the range)
     }
 }

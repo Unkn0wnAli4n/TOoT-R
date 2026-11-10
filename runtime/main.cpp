@@ -13,6 +13,7 @@
 
 #include "kernel.h"
 #include "native.h"
+#include "native/nvn/prewarm.h"
 
 namespace rt {
 
@@ -89,6 +90,8 @@ int main(int argc, char** argv) {
             if (s.name == "_ZN2nn4init5StartEmmPFvvES2_S2_") start = s.address;
     if (!start) Fatal("nn::init::Start not found");
 
+    // The pipelines earlier runs created are made now, with a progress screen, before the game can stop for them.
+    nvn::PrewarmMain();
     const u64 argument_region = ArenaAlloc(0x9000, 0x1000);
     RT_LOG("starting the SDK on the main thread");
     CallGuest(main_thread->cpu, start,
@@ -96,5 +99,6 @@ int main(int argc, char** argv) {
                RegisterNative("rt::RtldInitializeModules", nullptr),
                RegisterNative("rt::RtldFinalizeModules", nullptr)});
     RT_LOG("nn::init::Start returned");
+    nvn::plist::Save(true);
     return 0;
 }

@@ -31,16 +31,20 @@ void CreateInstance(VulkanContext& vk) {
     std::vector<const char*> layers;
     if (std::getenv("OOT_VK_VALIDATION")) layers.push_back("VK_LAYER_KHRONOS_validation");
     const bool report = std::getenv("OOT_ADDRESS_REPORT") != nullptr;
-    if (report) { extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME); info.enabledExtensionCount = (u32)extensions.size(); info.ppEnabledExtensionNames = extensions.data(); }
+    const bool validation = std::getenv("OOT_VK_VALIDATION") != nullptr;
+    if (report || validation) { extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME); info.enabledExtensionCount = (u32)extensions.size(); info.ppEnabledExtensionNames = extensions.data(); }
     info.enabledLayerCount = (u32)layers.size();
     info.ppEnabledLayerNames = layers.data();
     VK_CHECK(vkCreateInstance(&info, nullptr, &vk.instance));
-    if (report) { // OOT_ADDRESS_REPORT=1 (diagnosis of GPU page faults): every GPU address binding, to <data>/address_report.txt
-        static FILE* out = std::fopen((rt::DataDir() + "/address_report.txt").c_str(), "w");
+    if (report || validation) { // OOT_ADDRESS_REPORT=1: every GPU address binding, to <data>/address_report.txt
+        static FILE* out = report ? std::fopen((rt::DataDir() + "/address_report.txt").c_str(), "w") : nullptr;
         VkDebugUtilsMessengerCreateInfoEXT mi{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
         mi.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
-        mi.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT;
-        mi.pfnUserCallback = [](VkDebugUtilsMessageSeverityFlagBitsEXT, VkDebugUtilsMessageTypeFlagsEXT, const VkDebugUtilsMessengerCallbackDataEXT* d, void*) -> VkBool32 {
+        mi.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+        if (report) mi.messageType |= VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT;
+        mi.pfnUserCallback = [](VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDebugUtilsMessageTypeFlagsEXT, const VkDebugUtilsMessengerCallbackDataEXT* d, void*) -> VkBool32 {
+            if (severity & (VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT))
+                RT_LOG("Vulkan validation: %s", d->pMessage);
             for (auto* n = static_cast<const VkBaseInStructure*>(d->pNext); n; n = n->pNext)
                 if (n->sType == VK_STRUCTURE_TYPE_DEVICE_ADDRESS_BINDING_CALLBACK_DATA_EXT && out) {
                     const auto* b = reinterpret_cast<const VkDeviceAddressBindingCallbackDataEXT*>(n);
@@ -123,6 +127,11 @@ void CreateDevice(VulkanContext& vk) {
     VK_CHECK(vkEnumerateDeviceExtensionProperties(vk.physical,nullptr,&extension_count,nullptr));
     std::vector<VkExtensionProperties> available(extension_count);
     VK_CHECK(vkEnumerateDeviceExtensionProperties(vk.physical,nullptr,&extension_count,available.data()));
+    bool checkpoints=false;
+    if(std::getenv("OOT_GPU_CHECKPOINTS"))for(const auto& extension:available)
+        if(!std::strcmp(extension.extensionName,VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)){
+            extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);checkpoints=true;break;
+        }
     VkPhysicalDeviceMapMemoryPlacedFeaturesEXT placed{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
     {   // (memory pools in GPU memory mapped at their guest addresses, without exporting it: memory.cpp)
         bool m2 = false, mp = false;
@@ -277,6 +286,7 @@ void CreateDevice(VulkanContext& vk) {
     info.enabledExtensionCount = (u32)extensions.size();
     info.ppEnabledExtensionNames = extensions.data();
     VK_CHECK(vkCreateDevice(vk.physical, &info, nullptr, &vk.device));
+    if(checkpoints)vk.checkpoint=reinterpret_cast<PFN_vkCmdSetCheckpointNV>(vkGetDeviceProcAddr(vk.device,"vkCmdSetCheckpointNV"));
     vkGetDeviceQueue(vk.device, vk.queue_family, 0, &vk.queue);
     if (queue.queueCount >= 2) vkGetDeviceQueue(vk.device, vk.queue_family, 1, &vk.copy_queue);
     else vk.copy_queue = vk.queue;
@@ -417,6 +427,16 @@ std::string DescribeDeviceAddress(u64 address); // memory.cpp
 void ReportDeviceLost() {
     static bool reported = false; if (reported) return; reported = true;
     auto& vk = Vk();
+    if(vk.checkpoint){
+        auto checkpoints=reinterpret_cast<PFN_vkGetQueueCheckpointDataNV>(vkGetDeviceProcAddr(vk.device,"vkGetQueueCheckpointDataNV"));
+        const VkQueue queues[]{vk.queue,vk.copy_queue};
+        for(u32 q=0;q<(vk.copy_queue!=vk.queue?2u:1u);++q){
+            u32 count=0;checkpoints(queues[q],&count,nullptr);
+            std::vector<VkCheckpointDataNV> data(count,{VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
+            checkpoints(queues[q],&count,data.data());
+            for(const auto& d:data)RT_LOG("GPU checkpoint queue %u stage %#x marker %#llx",q,(u32)d.stage,(unsigned long long)reinterpret_cast<u64>(d.pCheckpointMarker));
+        }
+    }
     if (!vk.device_fault) return;
     static auto get = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(vkGetDeviceProcAddr(vk.device, "vkGetDeviceFaultInfoEXT"));
     if (!get) return;

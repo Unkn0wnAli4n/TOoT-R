@@ -3,6 +3,7 @@
 // of one submit-and-wait per draw.
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <mutex>
 #include <vector>
@@ -74,12 +75,21 @@ void AfterBatch(std::function<void()> action);
 VkDescriptorSet AllocateBatchSet(VkDescriptorSetLayout layout);
 // Held while a command list executes so batches from other threads do not interleave.
 // (recursive; its depth tells whether a GPU wait may release it: only an outermost holder does)
+// The executor holds it for whole command lists (milliseconds), and took it again at once: the game's thread, which
+// needs it for a moment at each readback, submit and frame pacing call, stood behind it for most of a frame (16 ms of
+// 30 in Castle Town). Threads that find it taken count as waiters, and the executor lets them in between commands
+// (Yield). OOT_NO_BATCH_YIELD=1: as before.
 struct BatchLock {
     std::recursive_mutex m;
     int depth = 0; // (only read and written by the holder)
-    void lock() { m.lock(); ++depth; }
+    std::atomic<int> waiters{0};
+    void lock() { if (!m.try_lock()) { waiters.fetch_add(1, std::memory_order_relaxed); m.lock(); waiters.fetch_sub(1, std::memory_order_relaxed); } ++depth; }
+    // (waits without asking the executor to yield: it takes the lock between command lists, as before Yield)
+    void lock_patient() { m.lock(); ++depth; }
     bool try_lock() { if (!m.try_lock()) return false; ++depth; return true; }
     void unlock() { --depth; m.unlock(); }
+    // (the outermost holder, between two pieces of its work) Threads waiting for the lock take it first.
+    void Yield();
 };
 BatchLock& BatchMutex();
 // Write-back copies of GPU storage writes (memory.cpp): waits until the copy of batch `serial` is done.

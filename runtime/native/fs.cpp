@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cerrno>
 #include <filesystem>
 #include <fstream>
@@ -281,7 +282,9 @@ static ssize_t GuestPread(int fd, void* buffer, u64 size, s64 offset) {
     }
     return (ssize_t)done;
 }
+namespace nvn { extern std::atomic<s64> last_file_read_ns; } // (present.cpp: no frame cap while the game loads)
 static u32 DoRead(u64 h, s64 offset, void* buffer, u64 size, u64* read) {
+    nvn::last_file_read_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
     OpenFile* f = FindFile(h);
     if (!f) Fatal("nn::fs::ReadFile on an unknown handle");
     ssize_t n;

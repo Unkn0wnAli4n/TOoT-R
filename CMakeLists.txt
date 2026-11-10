@@ -77,7 +77,7 @@ if(WIN32)
     # Guest threads run recompiled code whose frames live on the host stack: give host threads the
     # 8+ MiB a Linux thread gets (address space only).
     target_link_options(tootr PRIVATE -Wl,--stack,0x1000000)
-    target_link_libraries(tootr PRIVATE ws2_32)
+    target_link_libraries(tootr PRIVATE ws2_32 psapi)
 else()
     target_link_options(tootr PRIVATE -Wl,--no-relax)
 endif()

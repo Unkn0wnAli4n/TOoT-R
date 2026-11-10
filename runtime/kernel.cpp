@@ -180,6 +180,15 @@ struct AddressWaiter {
     u32 type = 0; u64 value = 0, lr = 0, thread = 0; Clock::time_point since{};
 };
 std::list<AddressWaiter> address_waiters;
+using AddressWaiterIter = std::list<AddressWaiter>::iterator;
+std::unordered_map<u64, std::list<Waiter*>> address_waiter_index; // k_lock held; FIFO within each guest address
+std::unordered_map<Waiter*, AddressWaiterIter> address_waiter_nodes; // O(1) removal from the diagnostic/global list
+struct ArbiterWaitKey {
+    u64 addr, lr, thread; u32 type;
+    bool operator<(const ArbiterWaitKey& o) const { return std::tie(thread, addr, lr, type) < std::tie(o.thread, o.addr, o.lr, o.type); }
+};
+struct ArbiterWaitStat { u64 calls = 0, waited = 0, max_waited = 0; };
+std::map<ArbiterWaitKey, ArbiterWaitStat> arbiter_wait_stats; // OOT_ARB_PROFILE; k_lock held
 // (OOT_ARB_TRACE) recent arbiter operations, for the addresses a hang is stuck on.
 struct ArbiterOp { double t; u64 thread, addr, lr; u32 op, type; s64 value, count; u32 before, after; s32 result; };
 std::unordered_map<u64, std::deque<ArbiterOp>> arbiter_history; // last operations per address; k_lock held
@@ -203,8 +212,9 @@ std::list<SyncWaitInfo> sync_infos; // (OOT_ARB_TRACE) threads in WaitSynchroniz
 // OOT_ARB_TRACE: every 3 s, threads blocked in WaitForAddress for over 2 s (hang diagnosis).
 void StartArbiterWatchdog() {
     static const bool on = std::getenv("OOT_ARB_TRACE") != nullptr;
+    static const bool profile = std::getenv("OOT_ARB_PROFILE") != nullptr;
     static std::once_flag once;
-    if (!on) return;
+    if (!on && !profile) return;
     std::call_once(once, [] {
         std::thread([] {
             for (;;) {
@@ -212,6 +222,20 @@ void StartArbiterWatchdog() {
                 if (AudioUpdateCount) RT_LOG("watchdog: %llu audio renderer updates so far", AudioUpdateCount());
                 std::lock_guard lock{k_lock};
                 const auto now = Clock::now();
+                if (std::getenv("OOT_ARB_PROFILE")) {
+                    std::vector<std::pair<ArbiterWaitKey, ArbiterWaitStat>> top(arbiter_wait_stats.begin(), arbiter_wait_stats.end());
+                    std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.waited > b.second.waited; });
+                    RT_LOG("arbiter profile: %zu wait sites", top.size());
+                    for (size_t i = 0; i < std::min<size_t>(top.size(), 12); ++i) {
+                        const auto& [key, stat] = top[i];
+                        RT_LOG("  thread %llu addr %#llx type %u lr %#llx (%s): %llu waits, %.2f ms total, %.2f ms max",
+                               (unsigned long long)key.thread, (unsigned long long)key.addr, key.type, (unsigned long long)key.lr,
+                               DescribeAddress(key.lr).c_str(),
+                               (unsigned long long)stat.calls, stat.waited / 1e6, stat.max_waited / 1e6);
+                    }
+                    arbiter_wait_stats.clear();
+                }
+                if (!on) continue;
                 for (const auto& l : lock_waiters) {
                     const u32 word = __atomic_load_n(reinterpret_cast<u32*>(l.addr), __ATOMIC_SEQ_CST);
                     auto owner = std::dynamic_pointer_cast<KThread>(GetObject(word & ~HandleWaitMask));
@@ -341,21 +365,41 @@ void StartHangWatch() {
 }
 s32 WakeAddress(u64 addr, s32 count) {
     s32 woken = 0;
-    for (auto it = address_waiters.begin(); it != address_waiters.end() && (count <= 0 || woken < count);) {
-        if (it->addr == addr) {
-            it->w->woken = true;
-            it->w->cv.notify_one();
-            it = address_waiters.erase(it);
+    auto indexed = address_waiter_index.find(addr);
+    if (indexed == address_waiter_index.end()) return 0;
+    auto& waiters = indexed->second;
+    while (!waiters.empty() && (count <= 0 || woken < count)) {
+        Waiter* waiter = waiters.front();
+        waiters.pop_front();
+        if (auto node = address_waiter_nodes.find(waiter); node != address_waiter_nodes.end()) {
+            waiter->woken = true;
+            waiter->cv.notify_one();
+            address_waiters.erase(node->second);
+            address_waiter_nodes.erase(node);
             ++woken;
-        } else {
-            ++it;
         }
     }
+    if (waiters.empty()) address_waiter_index.erase(indexed);
     return woken;
 }
 
 s32 CountAddressWaiters(u64 addr) {
-    return (s32)std::count_if(address_waiters.begin(), address_waiters.end(), [&](auto& a) { return a.addr == addr; });
+    const auto it = address_waiter_index.find(addr);
+    return it == address_waiter_index.end() ? 0 : (s32)it->second.size();
+}
+
+void RemoveAddressWaiter(Waiter* waiter) {
+    auto node = address_waiter_nodes.find(waiter);
+    if (node == address_waiter_nodes.end()) return;
+    const u64 addr = node->second->addr;
+    address_waiters.erase(node->second);
+    address_waiter_nodes.erase(node);
+    auto indexed = address_waiter_index.find(addr);
+    if (indexed != address_waiter_index.end()) {
+        auto& queue = indexed->second;
+        queue.remove(waiter);
+        if (queue.empty()) address_waiter_index.erase(indexed);
+    }
 }
 
 // ---- memory ------------------------------------------------------------------------------------
@@ -380,6 +424,7 @@ struct StackMapping {
     u64 destination, source, size;
 };
 std::map<u64, StackMapping> stack_mappings; // destination -> mapping; protected by k_lock
+bool memory_regions_dirty = true; // k_lock held; cached SvcQueryMemory map
 
 bool ContainsRange(u64 base, u64 length, u64 address, u64 size) {
     return size && address >= base && size <= length && address - base <= length - size;
@@ -425,6 +470,7 @@ u32 SvcMapMemory(Cpu* c, bool map) {
         if (mprotect(reinterpret_cast<void*>(src), size, PROT_NONE) != 0)
             Fatal("cannot protect stack source pages");
         stack_mappings.emplace(dst, StackMapping{dst, src, size});
+        memory_regions_dirty = true;
     } else {
         const auto it = stack_mappings.find(dst);
         if (it == stack_mappings.end() || it->second.source != src || it->second.size != size)
@@ -443,6 +489,7 @@ u32 SvcMapMemory(Cpu* c, bool map) {
             Fatal("cannot restore stack source pages");
 #endif
         stack_mappings.erase(it);
+        memory_regions_dirty = true;
     }
     return ResultSuccess;
 }
@@ -490,6 +537,7 @@ u32 SvcMapPhysicalMemory(Cpu* c, bool map) {
         }
     }
     if (map) physical_mappings.emplace(begin, end - begin);
+    memory_regions_dirty = true;
     return 0;
 }
 
@@ -498,6 +546,7 @@ struct Region {
     u32 state, perm;
     u32 attr = 0;
 };
+std::vector<Region> memory_regions;
 
 } // namespace
 
@@ -754,10 +803,21 @@ u32 SvcWaitForAddressImpl(Cpu* c) {
     if (timeout == 0) return ResultTimedOut;
     Waiter w; w.lr = c->x[30]; w.thread = current_thread;
     address_waiters.push_back({addr, &w, type, c->x[2], c->x[30], current_thread ? current_thread->id : 0, Clock::now()});
+    address_waiter_index[addr].push_back(&w);
+    address_waiter_nodes[&w] = std::prev(address_waiters.end());
     StartArbiterWatchdog();
+    const auto wait_start = Clock::now();
     if (!Block(lock, w, Deadline(timeout))) {
-        address_waiters.remove_if([&](auto& a) { return a.w == &w; });
+        if (std::getenv("OOT_ARB_PROFILE")) {
+            const u64 waited = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - wait_start).count();
+            auto& stat = arbiter_wait_stats[{addr, c->x[30], current_thread ? current_thread->id : 0, type}]; ++stat.calls; stat.waited += waited; stat.max_waited = std::max(stat.max_waited, waited);
+        }
+        RemoveAddressWaiter(&w);
         return ResultTimedOut;
+    }
+    if (std::getenv("OOT_ARB_PROFILE")) {
+        const u64 waited = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - wait_start).count();
+        auto& stat = arbiter_wait_stats[{addr, c->x[30], current_thread ? current_thread->id : 0, type}]; ++stat.calls; stat.waited += waited; stat.max_waited = std::max(stat.max_waited, waited);
     }
     return ResultSuccess;
 }
@@ -929,6 +989,7 @@ u32 SvcSetHeapSize(Cpu* c) {
             return ResultOutOfResource;
     }
     heap_size = size;
+    memory_regions_dirty = true;
     RT_LOG("memory: heap %llu MiB", (unsigned long long)(size >> 20));
     c->x[1] = HeapBase;
     return ResultSuccess;
@@ -938,7 +999,9 @@ u32 SvcSetHeapSize(Cpu* c) {
 u32 SvcQueryMemory(Cpu* c) {
     const u64 addr = c->x[2];
     std::lock_guard lock{k_lock};
-    std::vector<Region> regions;
+    if (memory_regions_dirty) {
+    auto& regions = memory_regions;
+    regions.clear();
     for (const auto& m : Modules()) regions.push_back({m.base, (m.size + 0xfff) & ~0xfffULL, 3, 5});
     // Split the heap at locked stack source ranges so SDK memory queries see the
     // correct permissions, and neighbouring free heap pages remain allocatable.
@@ -962,14 +1025,19 @@ u32 SvcQueryMemory(Cpu* c) {
     regions.push_back({ArenaBase, ArenaSize, 0xb, 3});
     for (const auto& [base, size] : physical_mappings) normal_range(base, size);
     std::sort(regions.begin(), regions.end(), [](auto& a, auto& b) { return a.base < b.base; });
-    Region found{0, 0, 0, 0};
-    u64 prev_end = 0;
-    for (const auto& r : regions) {
-        if (addr < r.base) { found = {prev_end, r.base - prev_end, 0, 0}; break; }
-        if (addr < r.base + r.size) { found = r; break; }
-        prev_end = r.base + r.size;
+    memory_regions_dirty = false;
     }
-    if (!found.size) found = {prev_end, (1ULL << 39) - prev_end, 0, 0};
+    Region found{0, 0, 0, 0};
+    const auto next = std::upper_bound(memory_regions.begin(), memory_regions.end(), addr,
+        [](u64 address, const Region& region) { return address < region.base; });
+    const u64 prev_end = next == memory_regions.begin() ? 0 : std::prev(next)->base + std::prev(next)->size;
+    if (next != memory_regions.begin() && addr < std::prev(next)->base + std::prev(next)->size) {
+        found = *std::prev(next);
+    } else if (next != memory_regions.end()) {
+        found = {prev_end, next->base - prev_end, 0, 0};
+    } else {
+        found = {prev_end, (1ULL << 39) - prev_end, 0, 0};
+    }
     u8* out = reinterpret_cast<u8*>(c->x[0]);
     std::memset(out, 0, 0x28);
     std::memcpy(out, &found.base, 8);

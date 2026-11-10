@@ -94,6 +94,17 @@ CommandList& Recording(u64 object) {
 struct EventWait { u32* value = nullptr; u32 wanted = 0; bool equal = true; };
 enum class Step { Done, Call, Wait };
 Step ExecuteFrom(const CommandList& list, size_t& index, size_t end, std::vector<u64>& children, EventWait& wait);
+namespace { std::mutex sync_mutex; std::condition_variable sync_cv; }
+void NotifySyncSignalled() { { std::lock_guard lock{sync_mutex}; } sync_cv.notify_all(); }
+bool WaitSyncSignalled(const u32* state, std::chrono::nanoseconds timeout) {
+    std::unique_lock lock{sync_mutex};
+    sync_cv.wait_for(lock, timeout, [state] { return __atomic_load_n(state, __ATOMIC_ACQUIRE) != 0; });
+    return __atomic_load_n(state, __ATOMIC_ACQUIRE) != 0;
+}
+bool BackgroundGpuThreads() {
+    static const bool on = !std::getenv("OOT_SYNC_EXECUTOR") && !std::getenv("OOT_NO_RETIRE_THREAD") && !std::getenv("OOT_GPU_PROFILE") && !std::getenv("OOT_BUSY_SYNC_WAIT");
+    return on;
+}
 bool TimelineOn() { static const bool on = std::getenv("OOT_TIMELINE") != nullptr; return on; }
 double TimelineMs() { static const auto t0 = std::chrono::steady_clock::now(); return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
 namespace {
@@ -361,12 +372,29 @@ NATIVE("nvnDeviceFinalizeCommandHandle") {
 
 namespace nvn {
 
-VkImage WindowTextureImage(u64 window, s32 index, VkExtent2D* extent, VkCommandBuffer cmd) {
+void PrepareWindowTexture(u64 window, s32 index, std::shared_ptr<Texture>& frame) {
     const auto& textures=**reinterpret_cast<std::vector<u64>**>(window+0x78);
     if(index<0||(size_t)index>=textures.size())Fatal("invalid window texture index %d",index);
     auto& texture=*HostTexture(textures[index]);
-    Transition(cmd,texture,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    *extent={texture.width,texture.height};return texture.image;
+    if(!frame||frame->width!=texture.width||frame->height!=texture.height||frame->format!=texture.format){
+        frame=std::shared_ptr<Texture>(new Texture,RetireTexture);
+        frame->width=texture.width;frame->height=texture.height;
+        frame->format=texture.format;frame->info=texture.info;
+        frame->storage=reinterpret_cast<u64>(frame.get()); // private, never aliases a guest texture
+        EnsureImage(*frame);
+    }
+    // Guest images retire with the graphics batch. Presentation has its own
+    // fence, so copy inside that batch into an image owned by the presenter.
+    Immediate([&](VkCommandBuffer cmd){
+        Transition(cmd,texture,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        Transition(cmd,*frame,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkImageCopy copy{};
+        copy.srcSubresource=copy.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};
+        copy.extent={texture.width,texture.height,1};
+        vkCmdCopyImage(cmd,texture.image,texture.layout,frame->image,frame->layout,1,&copy);
+        Transition(cmd,texture,VK_IMAGE_LAYOUT_GENERAL);
+        Transition(cmd,*frame,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    });
 }
 
 namespace {
@@ -403,18 +431,22 @@ Step ExecuteFrom(const CommandList& list, size_t& index, size_t end, std::vector
         case Op::ReportCounter: case Op::ResetCounter: break;
         // These invalidate only when they change a value (their handlers in render.cpp check).
         case Op::BindProgram: case Op::BindTexture: case Op::SetRenderTargets: case Op::BindBlendState: case Op::BindColorState:
-        case Op::BindPolygonState: case Op::SetLineWidth: case Op::BindStorageBuffer: case Op::BindChannelMaskState:
-        case Op::SetPrimitiveRestart: case Op::SetPointSize: break;
+        case Op::BindPolygonState: case Op::BindDepthStencilState: case Op::SetLineWidth: case Op::BindStorageBuffer: case Op::BindChannelMaskState:
+        case Op::SetPrimitiveRestart: case Op::SetPointSize: case Op::SetDepthClamp: break;
+        // Dynamic stencil state is emitted by Draw for both full and fast draws.
+        case Op::SetStencilMask: case Op::SetStencilValueMask: case Op::SetStencilRef: break;
         case Op::SetBlendColor: case Op::SetDepthBias: break; // (dynamic state, set per draw)
         // No effect on what a draw resolves: render enable is evaluated per draw; barriers are
         // already implied by submission order here.
-        case Op::SetRenderEnable: case Op::SetRenderEnableConditional: case Op::Barrier: break;
+        case Op::SetRenderEnable: case Op::SetRenderEnableConditional: case Op::Barrier:
+        case Op::SetTiledCacheAction: case Op::SetTiledCacheTileSize: case Op::SetAlphaRef: break;
         default: if (fast_draw_allowed) ++fast_draw_breakers[std::min<u32>(command.op, 127)]; fast_draw_allowed = false;
         }
         if (FrameLogged() && command.op > 7 && command.op != 55 && command.op != 56 && command.op != 77 && command.op != 79) RT_LOG("cmd op %u x %#llx %#llx %#llx", command.op, (unsigned long long)command.x[0], (unsigned long long)command.x[1], (unsigned long long)command.x[2]);
         if (op_stats) { static u64 counts[128]; static u64 total = 0; ++counts[std::min<u32>(command.op, 127)];
             if (++total % 1000000 == 0) { std::string t; for (u32 i = 0; i < 128; ++i) if (counts[i] > 10000) { char b[32]; std::snprintf(b, sizeof b, " %u:%llu", i, (unsigned long long)(counts[i] / 1000)); t += b; } RT_LOG("ops (thousands per million):%s", t.c_str()); std::memset(counts, 0, sizeof counts); } }
         if (submit_every && ++since_submit >= submit_every) { since_submit = 0; nvn::Submit(); }
+        BatchMutex().Yield(); // (the game's thread waits for the batch lock: its readback or submit goes first)
         static const bool slow_ops = std::getenv("OOT_SLOW_OP") != nullptr;
         struct OpTimer { bool on; u32 op; std::chrono::steady_clock::time_point t0; u64 x0;
             ~OpTimer() { if (!on) return; const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -464,7 +496,8 @@ Step ExecuteFrom(const CommandList& list, size_t& index, size_t end, std::vector
             if (TimelineOn()) RT_LOG("T %.2f fence %p recorded", TimelineMs(), (void*)sync);
             AfterFlush([sync] { __atomic_store_n(sync, 1u, __ATOMIC_RELEASE);
                 if (TimelineOn()) RT_LOG("T %.2f fence %p signalled", TimelineMs(), (void*)sync);
-                std::lock_guard lock{event_mutex}; pending_events.erase(sync); });
+                { std::lock_guard lock{event_mutex}; pending_events.erase(sync); }
+                NotifySyncSignalled(); });
             break;
         }
         case Op::SignalEvent: {

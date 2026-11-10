@@ -27,6 +27,7 @@ extern "C" volatile unsigned long long oot_dynres_context;
 #include "commands.h"
 #include "texture.h"
 #include "batch.h"
+#include "pipeline_list.h"
 
 std::atomic<int> profile_present_tid{0}; // (profiler.cpp: OOT_PROFILE_WALL=present)
 namespace nvn {
@@ -40,7 +41,9 @@ struct Swapchain {
     VkSemaphore acquired = VK_NULL_HANDLE;
     std::vector<VkSemaphore> rendered; // reused only after its swapchain image is acquired again
     VkFence fence = VK_NULL_HANDLE;
+    VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
+    std::shared_ptr<Texture> frame;
     u64 frames = 0;
 };
 
@@ -140,7 +143,7 @@ void Build() {
     const VkResult created = vkCreateSwapchainKHR(vk.device, &info, nullptr, &next);
     // ported from Hookshot 3e73435: a non-null oldSwapchain is retired even when creation fails, so it cannot be
     // used again. Let it go either way; with no swapchain the next present builds one again.
-    if (sc.swapchain) { vkDestroySwapchainKHR(vk.device, sc.swapchain, nullptr); sc.swapchain = VK_NULL_HANDLE; sc.images.clear(); }
+    if (sc.swapchain) { overlay::ReleaseSwapchainViews(); vkDestroySwapchainKHR(vk.device, sc.swapchain, nullptr); sc.swapchain = VK_NULL_HANDLE; sc.images.clear(); }
     if (created != VK_SUCCESS) { RT_LOG("swapchain creation failed (%d): retrying at the next present", (int)created); return; }
     sc.swapchain = next;
     u32 count = 0;
@@ -160,18 +163,25 @@ void CreateSwapchain() {
     if (sc.swapchain) return;
     Build();
     VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-    vkCreateSemaphore(vk.device, &si, nullptr, &sc.acquired);
+    VK_CHECK(vkCreateSemaphore(vk.device, &si, nullptr, &sc.acquired));
     VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    vkCreateFence(vk.device, &fi, nullptr, &sc.fence);
+    VK_CHECK(vkCreateFence(vk.device, &fi, nullptr, &sc.fence));
+    // The executor records graphics batches concurrently with presentation.
+    // Recording or resetting either command buffer also accesses its pool, so
+    // allocation locks alone cannot make a shared pool safe here.
+    VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pool.queueFamilyIndex = vk.queue_family;
+    VK_CHECK(vkCreateCommandPool(vk.device, &pool, nullptr, &sc.pool));
     VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    ai.commandPool = vk.command_pool;
+    ai.commandPool = sc.pool;
     ai.commandBufferCount = 1;
-    vkAllocateCommandBuffers(vk.device, &ai, &sc.cmd);
+    VK_CHECK(vkAllocateCommandBuffers(vk.device, &ai, &sc.cmd));
 }
 
 // Blits the actual game window texture to the desktop swapchain.
-VkImage WindowTextureImage(u64 window, s32 index, VkExtent2D* extent, VkCommandBuffer cmd);
+void PrepareWindowTexture(u64 window, s32 index, std::shared_ptr<Texture>& frame);
 
 void ReportDrawStats(u64 window_texture);
 void NextFrame();
@@ -183,9 +193,26 @@ u32 frames_over_25 = 0, frames_over_50 = 0;
 // The game's thread: window events and frame pacing (the blit follows in queue order).
 std::atomic<u64> graphics_module{0};
 // The frame rate cap in effect: one of gfx::FrameCaps, 0 for none (the Graphics window; OOT_UNCAPPED=1 overrides, benchmarks).
+// Loading: no cap, whatever the setting (the game's loader advances with its frames). A frame counts as loading when it drew
+// next to nothing (a loading screen: at most 8 render passes; the title's scene has 16, play near 200), the game read files
+// in the last 300 ms, and no movie is playing (a movie reads its file too). Held for 250 ms. OOT_NO_LOAD_UNCAP=1: off.
+std::atomic<s64> last_file_read_ns{0}, last_movie_ns{0}; // (fs.cpp, video.cpp: steady clock)
+std::atomic<u64> passes_begun{0};                        // (batch.cpp)
+std::atomic<bool> loading{false};
+static s64 LoadClockNs() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+void NoteFrameForLoading() { // (the game's thread, once a frame)
+    static const bool off = std::getenv("OOT_NO_LOAD_UNCAP") != nullptr;
+    if (off) return;
+    static u64 passes_before = 0; static s64 held_until = 0;
+    const u64 passes = passes_begun.load(std::memory_order_relaxed); const u64 drawn = passes - passes_before; passes_before = passes;
+    const s64 now = LoadClockNs();
+    if (drawn <= 8 && now - last_file_read_ns.load(std::memory_order_relaxed) < 300'000'000 && now - last_movie_ns.load(std::memory_order_relaxed) > 500'000'000) held_until = now + 250'000'000;
+    const bool is = now < held_until;
+    if (is != loading.exchange(is)) { static int told = 0; if (told++ < 8) RT_LOG("frame cap: %s", is ? "off while the game loads" : "back after loading"); }
+}
 int EffectiveFrameCap() {
     static const bool uncapped = std::getenv("OOT_UNCAPPED") != nullptr;
-    return uncapped ? 0 : gfx::Current().frame_cap;
+    return uncapped || loading.load(std::memory_order_relaxed) ? 0 : gfx::Current().frame_cap;
 }
 // The game may run above 60 frames per second: its engine takes such rates only with a variable refresh rate display.
 bool AboveSixty() {
@@ -247,8 +274,10 @@ void PresentPacing() {
         left = std::chrono::steady_clock::now(); wait_ms += std::chrono::duration<double, std::milli>(left - entered).count();
         if (++calls % 300 == 0) { RT_LOG("game thread per frame: %.2f ms own work, %.2f ms waiting in present pacing", work_ms / 300, wait_ms / 300); work_ms = wait_ms = 0; } } } leave{entered};
     rt::CoreRelease release; // waits on the GPU
+    if (nvn::TimelineOn()) RT_LOG("T %.2f pacing enter", nvn::TimelineMs());
+    struct TlLeave { ~TlLeave() { if (nvn::TimelineOn()) RT_LOG("T %.2f pacing leave", nvn::TimelineMs()); } } tl_leave;
     { static const char* t = std::getenv("OOT_THROTTLE_MS"); if (t) std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(t))); } // diagnostic
-    nvn::Submit();
+    if (!nvn::BackgroundGpuThreads()) nvn::Submit();
     // Frame pacing as on the console: the GPU may still run this frame while the game prepares
     // the next, but no further. The game double-buffers per-frame data on that assumption;
     // running further ahead overwrites buffers the GPU still reads.
@@ -263,6 +292,7 @@ void PresentPacing() {
     // (OOT_REALTIME=0, frame skip) the game advances one fixed step per frame, so frames are held to 60 at most.
     {
         static auto next = std::chrono::steady_clock::now();
+        NoteFrameForLoading();
         int cap = EffectiveFrameCap();
         static const bool benchmark = std::getenv("OOT_UNCAPPED") != nullptr; // (never limited, as before)
         if (!benchmark && !RealtimeOn() && (cap > 60 || !cap)) cap = 60;
@@ -324,10 +354,79 @@ void PresentPacing() {
     }
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
-        if (e.type == SDL_EVENT_QUIT) { SavePipelineCacheBlocking(); std::_Exit(0); }
+        if (e.type == SDL_EVENT_QUIT) { SavePipelineCacheBlocking(); plist::Save(true); std::_Exit(0); }
         nvn::overlay::Event(e);
     }
 }
+// One frame of the pre-game progress screen (prewarm.cpp), on the thread that polls events: the window cleared and the
+// ImGui screen over it. True when its Skip button was clicked.
+bool PresentProgress(const overlay::Progress& progress) {
+    auto& vk = Vk();
+    CreateSwapchain();
+    if (!sc.swapchain) return false;
+    vkWaitForFences(vk.device, 1, &sc.fence, VK_TRUE, UINT64_MAX);
+    {
+        int pw = 0, ph = 0; SDL_GetWindowSizeInPixels(vk.window, &pw, &ph);
+        const bool resized = pw > 0 && ph > 0 && ((u32)pw != sc.extent.width || (u32)ph != sc.extent.height);
+        if (built_vsync != gfx::Current().vsync || resized) { std::lock_guard lock{vk.queue_mutex}; std::lock_guard copy{vk.copy_mutex}; vkDeviceWaitIdle(vk.device); Build(); }
+    }
+    u32 image_index;
+    VkResult r = vkAcquireNextImageKHR(vk.device, sc.swapchain, 100'000'000, sc.acquired, VK_NULL_HANDLE, &image_index);
+    if (r == VK_TIMEOUT || r == VK_NOT_READY) return false;
+    std::lock_guard lock{vk.queue_mutex};
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) { std::lock_guard copy{vk.copy_mutex}; vkDeviceWaitIdle(vk.device); Build(); return false; }
+    vkResetFences(vk.device, 1, &sc.fence);
+    vkResetCommandBuffer(sc.cmd, 0);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(sc.cmd, &bi);
+    const VkImage dst = sc.images[image_index];
+    VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_dst.image = dst; to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(sc.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_dst);
+    VkClearColorValue black{{0, 0, 0, 1.0f}};
+    vkCmdClearColorImage(sc.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &to_dst.subresourceRange);
+    VkMemoryBarrier cleared{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    cleared.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; cleared.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(sc.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &cleared, 0, nullptr, 0, nullptr);
+    const bool skip = nvn::overlay::RecordProgress(sc.cmd, dst, sc.format, sc.extent, progress);
+    // (a file named "snap" in the OOT_PRESENT_DUMP directory takes this image, as in the game's frames)
+    const bool dumping = dump.dir && std::remove((std::string(dump.dir) + "/snap").c_str()) == 0;
+    VkImageLayout last = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    if (dumping) {
+        EnsureDumpBuffer((VkDeviceSize)sc.extent.width * sc.extent.height * 4);
+        VkImageMemoryBarrier to_src = to_dst;
+        to_src.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        to_src.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        vkCmdPipelineBarrier(sc.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_src);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; copy.imageExtent = {sc.extent.width, sc.extent.height, 1};
+        vkCmdCopyImageToBuffer(sc.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dump.buffer, 1, &copy);
+        last = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    }
+    VkImageMemoryBarrier to_present = to_dst;
+    to_present.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT; to_present.dstAccessMask = 0;
+    to_present.oldLayout = last; to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    vkCmdPipelineBarrier(sc.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_present);
+    vkEndCommandBuffer(sc.cmd);
+    const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.waitSemaphoreCount = 1; submit.pWaitSemaphores = &sc.acquired; submit.pWaitDstStageMask = &wait_stage;
+    submit.commandBufferCount = 1; submit.pCommandBuffers = &sc.cmd;
+    submit.signalSemaphoreCount = 1; submit.pSignalSemaphores = &sc.rendered[image_index];
+    VK_CHECK(vkQueueSubmit(vk.queue, 1, &submit, sc.fence));
+    VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    present.waitSemaphoreCount = 1; present.pWaitSemaphores = &sc.rendered[image_index];
+    present.swapchainCount = 1; present.pSwapchains = &sc.swapchain; present.pImageIndices = &image_index;
+    r = vkQueuePresentKHR(vk.queue, &present);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) { std::lock_guard copy{vk.copy_mutex}; vkDeviceWaitIdle(vk.device); Build(); }
+    static u64 shots = 0;
+    if (dumping) { vkWaitForFences(vk.device, 1, &sc.fence, VK_TRUE, UINT64_MAX); WriteDump(1000000 + shots++); }
+    return skip;
+}
+
 // In the presenting queue's order: after the frame's rendering was recorded.
 void PresentWindowTexture(u64 window, s32 index) {
     rt::CoreRelease release; // waits on the swapchain
@@ -339,16 +438,17 @@ void PresentWindowTexture(u64 window, s32 index) {
       const int tid = 0;
 #endif
       ::profile_present_tid.store(tid, std::memory_order_relaxed); }
-    nvn::Submit(); // the frame executes before the blit (queue order)
     nvn::last_present_ns = nvn::GuestTimestampNs();
-    if (CurrentFrameSkipped()) { NextFrame(); return; } // (frame skip: nothing rendered, nothing shown)
+    if (CurrentFrameSkipped()) { nvn::Submit(); NextFrame(); return; } // (frame skip: nothing rendered, nothing shown)
     auto& vk = Vk();
     if (!sc.swapchain) { // (a failed replacement: build again)
         std::lock_guard lock{vk.queue_mutex}; std::lock_guard copy{vk.copy_mutex}; vkDeviceWaitIdle(vk.device); Build();
-        if (!sc.swapchain) return;
     }
+    if (!sc.swapchain) { nvn::Submit(); return; }
     auto _pt=std::chrono::steady_clock::now();
-    vkWaitForFences(vk.device, 1, &sc.fence, VK_TRUE, UINT64_MAX);
+    VK_CHECK(vkWaitForFences(vk.device, 1, &sc.fence, VK_TRUE, UINT64_MAX));
+    PrepareWindowTexture(window,index,sc.frame);
+    nvn::Submit(); // includes the private frame copy, before its presentation in queue order
     {   // Rebuild for a new VSync choice or window size (Wayland reports no out-of-date swapchain on resize).
         int pw = 0, ph = 0; SDL_GetWindowSizeInPixels(vk.window, &pw, &ph);
         const bool resized = pw > 0 && ph > 0 && ((u32)pw != sc.extent.width || (u32)ph != sc.extent.height);
@@ -363,23 +463,22 @@ void PresentWindowTexture(u64 window, s32 index) {
     { const double _ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_pt).count(); if(_ms>30)RT_LOG("present step acquire: %.1f ms",_ms); _pt=std::chrono::steady_clock::now(); }
     if (r == VK_TIMEOUT || r == VK_NOT_READY) return;
     std::lock_guard lock{vk.queue_mutex};
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) {
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         std::lock_guard copy{vk.copy_mutex};
-        vkDeviceWaitIdle(vk.device);
+        VK_CHECK(vkDeviceWaitIdle(vk.device));
         Build();
-        if (r == VK_ERROR_OUT_OF_DATE_KHR) return;
-        if (!sc.swapchain) { // (suboptimal, and the replacement failed: the acquire's signal is unused)
-            vkDestroySemaphore(vk.device, sc.acquired, nullptr);
-            VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-            vkCreateSemaphore(vk.device, &si, nullptr, &sc.acquired);
-            return;
-        }
+        return;
     }
-    vkResetFences(vk.device, 1, &sc.fence);
-    vkResetCommandBuffer(sc.cmd, 0);
+    const bool acquired_suboptimal = r == VK_SUBOPTIMAL_KHR;
+    if (!acquired_suboptimal) VK_CHECK(r);
+    // SUBOPTIMAL still acquired an image and scheduled the semaphore signal.
+    // Submit/present that image before replacing its swapchain and semaphores.
+    VK_CHECK(vkResetFences(vk.device, 1, &sc.fence));
+    VK_CHECK(vkResetCommandBuffer(sc.cmd, 0));
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(sc.cmd, &bi);
+    VK_CHECK(vkBeginCommandBuffer(sc.cmd, &bi));
+    if(vk.checkpoint)vk.checkpoint(sc.cmd,reinterpret_cast<void*>(3));
     const VkImage dst = sc.images[image_index];
     VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     to_dst.srcAccessMask = 0;
@@ -388,10 +487,10 @@ void PresentWindowTexture(u64 window, s32 index) {
     to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     to_dst.image = dst;
     to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdPipelineBarrier(sc.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+    vkCmdPipelineBarrier(sc.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                          nullptr, 1, &to_dst);
-    VkExtent2D src_extent{};
-    const VkImage src = WindowTextureImage(window, index, &src_extent, sc.cmd);
+    const VkExtent2D src_extent{sc.frame->width,sc.frame->height};
+    const VkImage src = sc.frame->image;
     if (src) {
         VkImageBlit blit{};
         blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -450,7 +549,7 @@ void PresentWindowTexture(u64 window, s32 index) {
     to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     vkCmdPipelineBarrier(sc.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0,
                          nullptr, 1, &to_present);
-    vkEndCommandBuffer(sc.cmd);
+    VK_CHECK(vkEndCommandBuffer(sc.cmd));
     const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.waitSemaphoreCount = 1;
@@ -470,11 +569,11 @@ void PresentWindowTexture(u64 window, s32 index) {
     r = vkQueuePresentKHR(vk.queue, &present);
     { const double _ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_pt).count(); if(_ms>30)RT_LOG("present step submit+present: %.1f ms",_ms); _pt=std::chrono::steady_clock::now(); }
 
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) {
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || (r == VK_SUCCESS && acquired_suboptimal)) {
         std::lock_guard copy{vk.copy_mutex};
-        vkDeviceWaitIdle(vk.device);
+        VK_CHECK(vkDeviceWaitIdle(vk.device));
         Build();
-    }
+    } else VK_CHECK(r);
     static auto last_report = std::chrono::steady_clock::now();
     static u64 last_flushes = FlushCount();
     ++sc.frames;
@@ -508,6 +607,7 @@ void PresentWindowTexture(u64 window, s32 index) {
         last_report = now;
         last_flushes = flushes;
         SavePipelineCache(); // persists pipelines built since the last save
+        std::thread([] { plist::Save(false); }).detach(); // (the list of pipelines to make before the next start: use counts)
         ReportCompileTime();
         ReportPredicateStats();
         ReportBatchStats();
