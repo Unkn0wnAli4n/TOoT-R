@@ -182,6 +182,11 @@ double frame_worst_ms = 0;
 u32 frames_over_25 = 0, frames_over_50 = 0;
 // The game's thread: window events and frame pacing (the blit follows in queue order).
 std::atomic<u64> graphics_module{0};
+// The frame rate cap in effect: 30/60/90/120, 0 for none (the Graphics window; OOT_UNCAPPED=1 overrides, benchmarks).
+int EffectiveFrameCap() {
+    static const bool uncapped = std::getenv("OOT_UNCAPPED") != nullptr;
+    return uncapped ? 0 : gfx::Current().frame_cap;
+}
 namespace {
 // Real-time game speed (from Hookshot, host/nn_vi.c realtime_step). The engine advances each frame
 // by 60 / <its graphics module's nominal frame rate, an int at +0x2c8>, so below 60 fps the game
@@ -194,7 +199,7 @@ void RealtimeStep() {
     const u64 module = graphics_module.load(std::memory_order_relaxed);
     if (!module) return;
     int* slot = reinterpret_cast<int*>(module + 0x2c8);
-    if (*slot < 15 || *slot > 60) { static bool told = false; if (!told) { told = true; RT_LOG("real-time step: the graphics module's frame rate reads %d; left alone", *slot); } return; }
+    if (*slot < 15 || *slot > 1000) { static bool told = false; if (!told) { told = true; RT_LOG("real-time step: the graphics module's frame rate reads %d; left alone", *slot); } return; }
     static auto last = std::chrono::steady_clock::now();
     static double samples[5], carry = 0; static unsigned count = 0, next = 0; static u64 steps = 0;
     const auto now = std::chrono::steady_clock::now();
@@ -202,8 +207,11 @@ void RealtimeStep() {
     if (dt <= 0 || dt > 0.25) { count = next = 0; carry = 0; return; } // (a load: start again)
     samples[next++ % 5] = dt; if (count < 5) ++count;
     double sum = 0; for (unsigned i = 0; i < count; ++i) sum += samples[i];
-    double ratio = std::clamp(sum / count * 60.0 + carry, 1.0, 4.0);
-    const int fps = std::clamp((int)(60.0 / ratio + 0.5), 15, gfx::Current().frame_cap <= 30 ? 30 : 60);
+    // (the engine takes any rate: it steps by 60 / rate, so 90 or 120 give steps of 2/3 and 1/2 of a 60 Hz frame)
+    const int cap = EffectiveFrameCap();
+    const int max_fps = cap ? cap : 1000;
+    double ratio = std::clamp(sum / count * 60.0 + carry, 60.0 / max_fps, 4.0);
+    const int fps = std::clamp((int)(60.0 / ratio + 0.5), 15, max_fps);
     carry = std::clamp(ratio - 60.0 / fps, -0.5, 0.5);
     *slot = fps;
     if (steps++ % 3000 == 0) RT_LOG("real-time step: ratio %.3f, game frame rate %d", ratio, fps);
@@ -230,17 +238,24 @@ void PresentPacing() {
         WaitForBatches(sync_frames ? this_frame : previous_frame);
         previous_frame = this_frame;
     }
-    // 60 frames per second at most when frame skip is on (or OOT_FPS_LIMIT): the game advances
-    // one fixed step per frame, so faster frames would run it fast.
+    // The cap (30/60/90/120, or none): with the real-time step the game's speed follows the clock at any rate; without it
+    // (OOT_REALTIME=0, frame skip) the game advances one fixed step per frame, so frames are held to 60 at most.
     {
-        // (OOT_UNCAPPED=1, benchmarks: no limit, to measure how far above 60 frames per second the game could run)
-        static const bool limit = std::getenv("OOT_UNCAPPED") == nullptr && (FrameSkipEnabled() || RealtimeOn() || std::getenv("OOT_FPS_LIMIT") != nullptr);
         static auto next = std::chrono::steady_clock::now();
-        if (limit) {
-            const auto now = std::chrono::steady_clock::now();
-            if (next > now) std::this_thread::sleep_until(next);
-            next = std::max(next, now - std::chrono::milliseconds(50)) + std::chrono::nanoseconds(gfx::Current().frame_cap <= 30 ? 33333333 : 16666667);
-        }
+        int cap = EffectiveFrameCap();
+        if (!RealtimeOn() && (cap > 60 || !cap)) cap = 60;
+        if (cap) {
+            const auto period = std::chrono::nanoseconds(1000000000LL / cap);
+            auto now = std::chrono::steady_clock::now();
+            if (next > now) {
+                // (precise: sleep to just short of the time, then spin; a plain sleep overshoots by a scheduler tick)
+                const auto spin = std::chrono::microseconds(1200);
+                if (next - now > spin) std::this_thread::sleep_until(next - spin);
+                while (std::chrono::steady_clock::now() < next) { }
+                now = std::chrono::steady_clock::now();
+            }
+            next = std::max(next, now - std::chrono::milliseconds(50)) + period;
+        } else next = std::chrono::steady_clock::now();
     }
     RealtimeStep();
     {   // Frame intervals (smoothness): median, 99th percentile, worst, and how many missed a 60 Hz refresh.

@@ -92,13 +92,16 @@ const std::vector<Row>& Rows() {
         {"Window Size", {"Default", "1280 x 720", "1600 x 900", "1920 x 1080", "2560 x 1440", "3840 x 2160"}, "The size of the game's window on the desktop."},
         {"Display Mode", {"Windowed", "Fullscreen"}, "Fullscreen fills the display the window is on."},
         {"Quality Profile", {"Console", "Handheld"}, "Handheld renders at the game's lower handheld resolution. Takes effect after a restart."},
-        {"Frame Rate Cap", {"30", "60"}, "30 halves the work per second; the game keeps its normal speed."},
-        {"VSync", {"Off", "On"}, "On waits for the display: no tearing, a little more input delay."},
+        {"Frame Rate Cap", {"30", "60", "90", "120", "Uncapped"}, "The most frames shown per second. The game keeps its normal speed at every cap; Uncapped runs as fast as the GPU allows."},
+        {"VSync", {"Off", "On"}, "On waits for the display: no tearing, a little more input delay. Frames above the display's refresh rate are not shown."},
         {"Texture Filtering", {"Original", "Bilinear", "Trilinear", "Anisotropic 2x", "Anisotropic 4x", "Anisotropic 8x", "Anisotropic 16x"}, "Sharper textures at an angle with anisotropic filtering."},
         {"Texture Detail", {"Original", "Low", "Medium", "High", "Ultra"}, "Lower detail uses smaller mipmaps: less memory bandwidth."},
         {"Texture Memory", {"Original", "Low", "High Quality"}, "Low compresses more textures (less video memory). Applies to newly loaded areas."},
         {"Upscaling", {"Linear", "Catmull-Rom", "Lanczos", "FSR 1"}, "How the game's 1080p picture is scaled to a larger window."},
         {"Sharpness", {"Off", "25%", "50%", "75%", "100%"}, "Sharpens the picture as it goes to the window, without halos."},
+        {"FPS Counter", {"Off", "On"}, "Shows the frame rate and frame time in the top left corner."},
+        {"AI Upscaler", {"Auto", "Off", "On"}, "The game's neural upscaler. Off is a plain linear upscale: about 3.7 ms less GPU time per frame and a slightly softer picture. Auto runs it where the GPU is fast enough for it."},
+        {"Volume", {"0%", "10%", "20%", "30%", "40%", "50%", "60%", "70%", "80%", "90%", "100%"}, "The game's master volume."},
     };
     return rows;
 }
@@ -111,8 +114,9 @@ int* Field(gfx::Settings& s, int r) {
     }
 }
 int ValueIndex(const gfx::Settings& s, int r) {
-    if (r == 4) return s.frame_cap <= 30 ? 0 : 1;
+    if (r == 4) return s.frame_cap == 0 ? 4 : s.frame_cap <= 30 ? 0 : s.frame_cap <= 60 ? 1 : s.frame_cap <= 90 ? 2 : 3;
     if (r == 10) return s.sharpness / 25;
+    if (r == 11) return s.show_fps; if (r == 12) return s.ai_upscaler; if (r == 13) return s.volume / 10;
     gfx::Settings copy = s; return *Field(copy, r);
 }
 void Change(int r, int delta) { // (delta from the current value)
@@ -123,7 +127,9 @@ void Change(int r, int delta) { // (delta from the current value)
         if (v == gfx::PresetCustom) return; // (Custom is what changing a single setting gives)
         s = gfx::PresetValues(v);
     } else {
-        if (r == 4) s.frame_cap = v == 0 ? 30 : 60; else if (r == 10) s.sharpness = v * 25; else *Field(s, r) = v;
+        static constexpr int caps[] = {30, 60, 90, 120, 0};
+        if (r == 4) s.frame_cap = caps[v]; else if (r == 10) s.sharpness = v * 25; else if (r == 13) s.volume = v * 10;
+        else if (r == 11) s.show_fps = v; else if (r == 12) s.ai_upscaler = v; else *Field(s, r) = v;
         s.preset = gfx::PresetCustom;
     }
     if (r == 3 || (r == 0 && s.handheld != gfx::Current().handheld)) restart_notice = true;
@@ -218,6 +224,9 @@ void Window() {
                 ImGui::EndCombo();
             }
             if (ImGui::IsItemHovered() || ImGui::IsItemFocused()) help = rows[r].help;
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_DelayNormal) && ImGui::BeginTooltip()) {
+                ImGui::PushTextWrapPos(ImGui::GetFontSize() * 22.0f); ImGui::TextUnformatted(rows[r].help); ImGui::PopTextWrapPos(); ImGui::EndTooltip();
+            }
             ImGui::PopID();
         }
         ImGui::EndTable();
@@ -230,6 +239,19 @@ void Window() {
     ImGui::TextDisabled("%.0f fps", ImGui::GetIO().Framerate);
     ImGui::End();
     if (!open) shown = false;
+}
+
+// The FPS counter: a corner of the picture, no input. (ImGui's own average of the last frames.)
+void Counter() {
+    const float scale = ImGui::GetStyle().FramePadding.y / 3.0f;
+    ImGui::SetNextWindowPos(ImVec2(12 * scale, 12 * scale));
+    ImGui::SetNextWindowBgAlpha(0.45f);
+    if (ImGui::Begin("##fps", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
+                                          ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs)) {
+        const float fps = ImGui::GetIO().Framerate;
+        ImGui::Text("%.0f fps  %.1f ms", fps, fps > 0 ? 1000.0f / fps : 0.0f);
+    }
+    ImGui::End();
 }
 
 VkImageView ViewOf(VkImage image, VkFormat format) {
@@ -262,9 +284,10 @@ void FilterInput(u64& buttons, s32& lx, s32& ly, s32& rx, s32& ry, const bool*) 
 }
 
 void Record(VkCommandBuffer cmd, VkImage dst, VkFormat format, VkExtent2D extent, VkRect2D) {
+    const bool counter = gfx::Current().show_fps != 0;
     if (!shown) {
         if (ui.context) { std::lock_guard lock{events_mutex}; events.clear(); }
-        return;
+        if (!counter) return;
     }
     if (!ui.context) CreateContext(extent);
     InitVulkan(format);
@@ -276,7 +299,8 @@ void Record(VkCommandBuffer cmd, VkImage dst, VkFormat format, VkExtent2D extent
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
-    Window();
+    if (shown) Window();
+    if (counter) Counter();
     ImGui::Render();
     ImDrawData* data = ImGui::GetDrawData();
     if (!data || data->CmdListsCount == 0) return;

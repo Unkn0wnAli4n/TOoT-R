@@ -1690,6 +1690,8 @@ bool IsNetwork(const ShaderCode& code){
     return known[&code]=network;
 }
 bool SlowNetworks(){
+    const int choice=gfx::Current().ai_upscaler; // (the settings window: 1 off, 2 on; 0 as below; read every call, so it is live)
+    if(choice)return choice==1;
     static const bool slow=[]{const char* e=std::getenv("OOT_NETWORKS");if(e)return std::atoi(e)==0;
         const u32 vendor=Vk().properties.vendorID;const bool s=vendor==0x1002||vendor==0x8086;
         if(s)RT_LOG("upscaling networks: a linear upscale instead (this GPU's matrix multiplies are emulated slowly)");return s;}();

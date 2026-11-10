@@ -24,6 +24,7 @@ constexpr Field fields[] = {
     {"preset", &Settings::preset}, {"resolution", &Settings::resolution}, {"display_mode", &Settings::display_mode},
     {"render_scale", &Settings::render_scale}, {"frame_cap", &Settings::frame_cap}, {"vsync", &Settings::vsync},
     {"filtering", &Settings::filtering}, {"texture_detail", &Settings::texture_detail}, {"texture_memory", &Settings::texture_memory}, {"handheld", &Settings::handheld}, {"upscaling", &Settings::upscaling}, {"sharpness", &Settings::sharpness},
+    {"show_fps", &Settings::show_fps}, {"ai_upscaler", &Settings::ai_upscaler}, {"volume", &Settings::volume},
 };
 
 void Save(const Settings& s) {
@@ -40,7 +41,7 @@ Settings Sanitized(Settings s) {
     s.resolution = std::clamp(s.resolution, 0, 5);
     s.display_mode = std::clamp(s.display_mode, 0, 1);
     if (s.render_scale) s.render_scale = std::clamp(s.render_scale, 15, 100);
-    s.frame_cap = s.frame_cap <= 30 ? 30 : 60;
+    s.frame_cap = s.frame_cap <= 0 ? 0 : s.frame_cap <= 30 ? 30 : s.frame_cap <= 60 ? 60 : s.frame_cap <= 90 ? 90 : s.frame_cap <= 120 ? 120 : 0;
     s.vsync = s.vsync ? 1 : 0;
     s.filtering = std::clamp(s.filtering, 0, 6);
     s.texture_detail = std::clamp(s.texture_detail, 0, 4);
@@ -48,6 +49,9 @@ Settings Sanitized(Settings s) {
     s.handheld = s.handheld ? 1 : 0;
     s.upscaling = std::clamp(s.upscaling, 0, 3);
     s.sharpness = std::clamp(s.sharpness / 25 * 25, 0, 100);
+    s.show_fps = s.show_fps ? 1 : 0;
+    s.ai_upscaler = std::clamp(s.ai_upscaler, 0, 2);
+    s.volume = std::clamp((s.volume + 5) / 10 * 10, 0, 100);
     return s;
 }
 } // namespace
@@ -69,6 +73,7 @@ Settings PresetValues(int preset) {
     s.resolution = current.resolution;     // (the window is the player's choice in every preset)
     s.upscaling = current.upscaling; s.sharpness = current.sharpness; // (and how it is filled)
     s.display_mode = current.display_mode;
+    s.show_fps = current.show_fps; s.ai_upscaler = current.ai_upscaler; s.volume = current.volume; // (and what is not about quality)
     switch (preset) {
     case PresetLow:    s.handheld = 1; s.frame_cap = 30; s.filtering = 1; s.texture_detail = 1; s.texture_memory = 1; break;
     case PresetMedium: s.handheld = 1; s.frame_cap = 60; s.filtering = 2; s.texture_detail = 2; s.texture_memory = 1; break;

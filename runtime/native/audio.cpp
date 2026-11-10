@@ -17,6 +17,7 @@
 
 #include "../kernel.h"
 #include "../native.h"
+#include "graphics_settings.h"
 using namespace rt;
 
 namespace {
@@ -63,6 +64,7 @@ void AudioStubLog(const char* name) {
     std::lock_guard lock{m}; if (told.insert(name).second) RT_LOG("audio: %s is not modelled (answered 0)", name);
 }
 } // namespace
+static int master_volume_percent() { return gfx::Current().volume; } // (the settings window's Volume; used by output_frame)
 
 #include "audio_hookshot.inc"
 #include "audio_stubs.inc"
