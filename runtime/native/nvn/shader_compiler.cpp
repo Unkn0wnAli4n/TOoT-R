@@ -1,5 +1,6 @@
 // Native Ampere instructions -> the existing compiler's IR -> Vulkan SPIR-V.
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include "shader_compiler.h"
@@ -209,8 +210,11 @@ Result Compile(const Request& request) {
         passes::GuardFragmentOutputs(program, float_targets);
     }
     passes::ScaleFogIntegration(program, passes::FogScale());
-    if (program.stage == Stage::Task && passes::MeshNoCull() && passes::MeshletCullingOff(program))
-        Shader::Optimization::DeadCodeEliminationPass(program);
+    if (program.stage == Stage::Task && passes::MeshNoCull()) {
+        const size_t made = passes::MeshletCullingOff(program);
+        if (made) Shader::Optimization::DeadCodeEliminationPass(program);
+        if (std::getenv("OOT_MESH_NOCULL_TRACE")) std::fprintf(stderr, "[rt] task program: %zu culling tests replaced\n", made);
+    }
     Shader::Profile profile{};
     profile.supported_spirv = 0x00010400; profile.unified_descriptor_binding = true;
     profile.min_ssbo_alignment = request.storage_alignment;
