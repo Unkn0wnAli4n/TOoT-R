@@ -51,9 +51,11 @@ NATIVE("nvnQueueSubmitCommands") {
     for (s32 i = 0; i < count; ++i) Executor().Submit(c->x[0], handles[i]);
     // Submitted without waiting: results become CPU-visible (fences, events, written buffers) as
     // the batch retires, while the game prepares the next frame.
-    nvn::Submit();
+    // (the executor submits what it records, as it goes and when it runs out of work; from here the call only cut its
+    // open batch in two and took the batch lock from it)
+    if (!nvn::BackgroundGpuThreads()) nvn::Submit();
 }
-NATIVE("nvnQueueFlush") { nvn::Submit(); }
+NATIVE("nvnQueueFlush") { if (!nvn::BackgroundGpuThreads()) nvn::Submit(); else Executor().Resume(); }
 NATIVE("nvnQueueFinish") {
     const auto t0 = std::chrono::steady_clock::now();
     Executor().Finish();
@@ -64,7 +66,7 @@ NATIVE("nvnQueueFenceSync") {
     // FenceSync(queue, sync, condition, flags): signalled when the queue's prior work completes.
     __atomic_store_n(Ptr<u32>(c, 1), 0u, __ATOMIC_RELEASE); // (unsignalled from now, also while the queue is parked)
     Executor().QueueOperation(c->x[0], nvn::Op::FenceSync, c->x[1]);
-    nvn::Submit();
+    if (!nvn::BackgroundGpuThreads()) nvn::Submit();
 }
 NATIVE("nvnQueueWaitSync") {
     // WaitSync(queue, sync): the queue's later work runs after the sync's fence.
@@ -110,6 +112,21 @@ NATIVE("nvnSyncWait") {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(std::min<u64>(timeout, 60'000'000'000ull));
     {
         rt::CoreRelease release;
+        // The executor submits what it records and the retire thread signals fences as their batches complete: the
+        // waiting thread sleeps until then. (It used to drive both itself, taking the batch lock every 50 us and
+        // submitting the executor's open batch each time: a quarter more submissions a frame, and the executor
+        // waited 12% of its time to get the lock back.) Every 4 ms it still does, in case nothing else moves.
+        // OOT_BUSY_SYNC_WAIT=1: as before.
+        if (nvn::BackgroundGpuThreads()) {
+            for (;;) {
+                const auto now = std::chrono::steady_clock::now();
+                if (timeout == 0 || now >= deadline) break;
+                if (nvn::WaitSyncSignalled(state, std::min<std::chrono::nanoseconds>(deadline - now, std::chrono::milliseconds(4)))) break;
+                WaitUntil([state] { return __atomic_load_n(state, __ATOMIC_ACQUIRE) != 0; });
+                if (__atomic_load_n(state, __ATOMIC_ACQUIRE)) break;
+                Executor().Resume();
+            }
+        } else
         for (;;) {
             WaitUntil([state] { return __atomic_load_n(state, __ATOMIC_ACQUIRE) != 0; });
             if (__atomic_load_n(state, __ATOMIC_ACQUIRE) || timeout == 0 || std::chrono::steady_clock::now() >= deadline) break;

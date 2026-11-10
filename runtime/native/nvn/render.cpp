@@ -29,6 +29,7 @@
 #include "texture.h"
 #include "shader_compiler.h"
 #include "batch.h"
+#include "pipeline_list.h"
 using namespace rt;
 namespace nvn {
 void PreSubmit(); // (before each submission: report processing and timestamps)
@@ -260,7 +261,22 @@ void WriteUnwrittenUniformUpdates(){
     if(unwritten_uniform_updates.empty())return;
     auto updates=std::move(unwritten_uniform_updates);
     unwritten_uniform_updates.clear();unwritten_uniform_pages.clear();unwritten_lo=~0ull;unwritten_hi=0;uniform_overlay_cache.clear();
-    Immediate([&](VkCommandBuffer cmd){for(const auto& u:updates)vkCmdUpdateBuffer(cmd,u.buffer,u.offset,u.bytes.size(),u.bytes.data());});
+    Immediate([&](VkCommandBuffer cmd){
+        std::map<VkBuffer,std::map<u64,u64>> written;
+        for(const auto& u:updates){
+            const u64 end=u.offset+u.bytes.size();
+            const auto overlaps=[&]{const auto& ranges=written[u.buffer];const auto next=ranges.lower_bound(u.offset);
+                return (next!=ranges.end()&&next->first<end)||(next!=ranges.begin()&&std::prev(next)->second>u.offset);};
+            if(overlaps()){
+                VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                barrier.srcAccessMask=barrier.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
+                vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&barrier,0,nullptr,0,nullptr);
+                written.clear();
+            }
+            vkCmdUpdateBuffer(cmd,u.buffer,u.offset,u.bytes.size(),u.bytes.data());
+            written[u.buffer][u.offset]=end;
+        }
+    });
 }
 void WriteUniformUpdatesOverlapping(u64 cpu,u64 size){if(UnwrittenUniformOverlap(cpu,size))WriteUnwrittenUniformUpdates();}
 // Hardware constant banks as NVN2 lays them out: the game's uniform binding N is bank N + 3;
@@ -587,12 +603,15 @@ VkSampler Sampler(u32 handle) {
     VK_CHECK(vkCreateSampler(Vk().device,&info,nullptr,&e.sampler)); return e.sampler;
 }
 // SET_MESH_SHADER_A/B and SET_MESH_INIT_SHADER from the NVN2 control header: +0x58 threads
-// (15:0) and task payload lines (31:24); +0x5c output topology (31:24, 3 = triangles); +0x60
+// (15:0) and task payload bytes (31:16); +0x5c output topology (31:24, 3 = triangles); +0x60
 // max vertices (31:16) and max primitives (15:0).
 std::array<u32,3> MeshRegisters(const ShaderCode& code){
     const auto word=[&](u32 offset){u32 v=0;if(offset+4<=code.control.size())std::memcpy(&v,code.control.data()+offset,4);return v;};
     const u32 c58=word(0x58),c5c=word(0x5c),c60=word(0x60);
-    const u32 threads=std::min(c58&0xffff,0x3fu),lines=c58>>24,topology=c5c>>24;
+    // The control header stores bytes, whereas SET_MESH_INIT_SHADER stores 128-byte
+    // lines. Reading only the high byte halved the fog task's 256-byte payload:
+    // its final meshlet records aliased the last word and generated tiled strips.
+    const u32 threads=std::min(c58&0xffff,0x3fu),lines=((c58>>16)+127)/128,topology=c5c>>24;
     // (Hookshot, mesh_registers_of: NVN's topology 3 (triangles) is the register's 4; points and lines go as they are.
     // Lines were a Fatal here: the shader compiler emits them, or the program is skipped as untranslatable.)
     if(code.stage==7&&topology!=3){static std::set<u64> told;if(told.insert(code.address).second)RT_LOG("mesh shader %#llx outputs topology %u (not triangles)",(unsigned long long)code.address,topology);}
@@ -650,7 +669,8 @@ u32 CurrentDependencyValue(StageState& stage,const nvshader::Dependency& d){
     default:return Cbuf(&stage,d.bank,d.offset);
     }
 }
-struct ShaderVariant { const ShaderCode* source; nvshader::Request request; nvshader::Result compiled; VkShaderModule module=VK_NULL_HANDLE; std::vector<std::array<u32,3>> texture_dependencies; };
+struct ShaderVariant { const ShaderCode* source; nvshader::Request request; nvshader::Result compiled; VkShaderModule module=VK_NULL_HANDLE; std::vector<std::array<u32,3>> texture_dependencies;
+    u64 cache_key=0,identity=0; }; // (identity: what the translation is, the same in every run; cache_key 0: not in the shader cache)
 struct CompileTime { double translate=0, pipelines=0; u32 created=0, cached=0; } compile_time; // seconds since the last report
 // This frame's executor time in work that varies with new content (slow-frame diagnosis).
 struct Hitch { double translate=0, pipeline_wait=0; } hitch;
@@ -684,7 +704,7 @@ u8 AttributeType(VkFormat format) {
 // match above compares; a later run whose constants match uses it instead of translating.
 // Bump ShaderCacheVersion when the translator's output changes. OOT_NO_SHADER_CACHE=1 disables it.
 // (Mesh programs carry a "u" in the key: since the empty-output ending of unreachable branches, only they were retranslated.)
-constexpr u32 ShaderCacheVersion=7; // 2: subgroup operations in task/mesh programs; 3: NaN guard, fog scale (in the key); 4: guard clamp 65000; 5: NaN-safe min/max/saturate; 6: local memory starts at zero; 7: mesh stage buffer starts at zero
+constexpr u32 ShaderCacheVersion=8; // 8: task payload byte size converted to 128-byte lines correctly
 bool ShaderCacheEnabled(){static const bool on=std::getenv("OOT_NO_SHADER_CACHE")==nullptr;return on;}
 std::string ShaderCacheDirectory(){
     static const std::string dir=[]{std::string d=rt::DataDir()+"/shader_cache";
@@ -726,17 +746,43 @@ bool DeserializeResult(ShaderCacheReader& rd,nvshader::Result& r){
 }
 std::unordered_map<u64,std::vector<nvshader::Result>> shader_cache_entries; // key -> cached translations (loaded on first use)
 std::unordered_set<u64> shader_cache_loaded;
-const std::vector<nvshader::Result>& ShaderCacheLookup(u64 key){
+std::mutex shader_cache_mutex; // (the executor and the prewarm threads)
+// What a translation is, the same in every run: its SPIR-V (before the address table is patched in) and the layout of its resources.
+u64 ShaderIdentity(const nvshader::Result& r,u32 stage){
+    u64 h=0xcbf29ce484222325ull^stage;
+    for(u32 w:r.spirv)h=(h^w)*0x100000001b3ull;
+    for(const auto& x:r.resources){h=(h^(u64)x.binding)*0x100000001b3ull;h=(h^(u64)(u32)x.kind)*0x100000001b3ull;h=(h^(u64)x.count)*0x100000001b3ull;}
+    return h;
+}
+// (an entry used again after a day gets its file's time renewed: the storage cleanup in prewarm.cpp removes what is long unused)
+void ShaderCacheRenew(const std::string& path){
+    std::error_code ec;const auto now=std::filesystem::file_time_type::clock::now();
+    const auto written=std::filesystem::last_write_time(path,ec);
+    if(!ec&&now-written>std::chrono::hours(24))std::filesystem::last_write_time(path,now,ec);
+}
+const std::vector<nvshader::Result>& ShaderCacheLookupLocked(u64 key){
     auto& list=shader_cache_entries[key];
     if(shader_cache_loaded.insert(key).second){
         char path[64];std::snprintf(path,sizeof path,"/%016llx.bin",(unsigned long long)key);
-        if(FILE* f=std::fopen((ShaderCacheDirectory()+path).c_str(),"rb")){
+        const std::string file=ShaderCacheDirectory()+path;
+        if(FILE* f=std::fopen(file.c_str(),"rb")){
             std::vector<u8> data;u8 buf[65536];size_t n;while((n=std::fread(buf,1,sizeof buf,f))>0)data.insert(data.end(),buf,buf+n);std::fclose(f);
             ShaderCacheReader rd{data.data(),data.data()+data.size()};
             while(rd.p<rd.end){nvshader::Result r;if(!DeserializeResult(rd,r))break;list.push_back(std::move(r));}
+            ShaderCacheRenew(file);
         }
     }
     return list;
+}
+const std::vector<nvshader::Result>& ShaderCacheLookup(u64 key){
+    std::lock_guard lock{shader_cache_mutex};
+    return ShaderCacheLookupLocked(key);
+}
+// The translation a pipeline record names (prewarm threads): a copy, the cache's lists belong to the executor.
+bool ShaderCacheFind(u64 key,u64 identity,u32 stage,nvshader::Result& out){
+    std::lock_guard lock{shader_cache_mutex};
+    for(const auto& r:ShaderCacheLookupLocked(key))if(ShaderIdentity(r,stage)==identity){out=r;return true;}
+    return false;
 }
 // Programs reading global memory embed the address of this run's guest address table: they are translated with
 // a placeholder there, cached as such, and get the real address just before their module is made
@@ -750,6 +796,7 @@ void ShaderCacheStore(u64 key,const nvshader::Result& r){
     ShaderCacheWriter w;SerializeResult(w,r);
     char path[64];std::snprintf(path,sizeof path,"/%016llx.bin",(unsigned long long)key);
     if(FILE* f=std::fopen((ShaderCacheDirectory()+path).c_str(),"ab")){std::fwrite(w.bytes.data(),1,w.bytes.size(),f);std::fclose(f);}
+    std::lock_guard lock{shader_cache_mutex};
     shader_cache_entries[key].push_back(r);
 }
 ShaderVariant& CompileShader(const ShaderCode& code, u32 binding_base, const ShaderVariant* previous) {
@@ -826,6 +873,7 @@ ShaderVariant& CompileShader(const ShaderCode& code, u32 binding_base, const Sha
         if(f){std::vector<u32> words;u32 w;while(std::fread(&w,4,1,f)==1)words.push_back(w);std::fclose(f);
             RT_LOG("shader %#llx stage %u: using override %s (%zu words)",(unsigned long long)code.address,code.stage,path,words.size());variant->compiled.spirv=std::move(words);}
     }
+    variant->cache_key=cache_key;variant->identity=ShaderIdentity(variant->compiled,code.stage);
     if(variant->compiled.global_loads||variant->compiled.global_stores)PatchAddressTable(variant->compiled.spirv);
     VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO}; info.codeSize=variant->compiled.spirv.size()*4;info.pCode=variant->compiled.spirv.data();
     VK_CHECK(vkCreateShaderModule(Vk().device,&info,nullptr,&variant->module));
@@ -854,8 +902,14 @@ struct Pipeline {
     bool push=false; // push-descriptor layout: draws push their descriptors (no set)
     std::vector<ShaderVariant*> shaders;
     std::vector<VkDescriptorSetLayoutBinding> bindings;
+    u64 record=0;       // its pipeline list record (0: none)
+    bool touched=true;  // false for a pipeline made before the game, until a draw first asks for it (the executor's)
 };
-std::map<std::string,std::unique_ptr<Pipeline>> pipelines;
+// (by a hash of the key: a std::map compared keys of ~400 bytes several times per draw, 5% of the executor's time)
+struct PipelineKeyHash{size_t operator()(const std::string& k)const{u64 h=0xcbf29ce484222325ull;size_t i=0;
+    for(;i+8<=k.size();i+=8){u64 w;std::memcpy(&w,k.data()+i,8);h=(h^w)*0x9E3779B97F4A7C15ull;h^=h>>29;}
+    for(;i<k.size();++i)h=(h^(u8)k[i])*0x100000001b3ull;return h;}};
+std::unordered_map<std::string,std::unique_ptr<Pipeline>,PipelineKeyHash> pipelines;
 
 VkDescriptorType DescriptorType(nvshader::ResourceKind kind) {
     using K=nvshader::ResourceKind;
@@ -894,7 +948,102 @@ VkPrimitiveTopology Topology(u32 primitive) {
     default:Fatal("NVN primitive %u requires index conversion",primitive);
     }
 }
-Pipeline& GetPipeline(bool mesh) {
+// Everything pipeline creation reads of the draw state, normalized (bits it does not read are zero) so that equal pipelines
+// look equal; also the key of the pipeline tables and, as raw bytes, the state a pipeline list record holds (pipeline_list.h).
+struct PipelineDesc {
+    u64 blends[8];
+    u64 depth;
+    u32 depth_bounds_range[2]; // (float bits)
+    u32 attributes[32];
+    u32 streams[16][2];
+    u32 color_count,color_blend,channel,polygon,primitive,sample_mask,samples;
+    u32 colors[8];             // VkFormat
+    u32 depth_format,stencil_format;
+    u32 restart,depth_clamp,discard,depth_bounds,lower_left,mesh;
+    u32 reserved;
+};
+static_assert(std::has_unique_object_representations_v<PipelineDesc>,"pipeline descriptions are compared and stored as bytes");
+PipelineDesc MakeDesc(bool mesh,const std::array<VkFormat,8>& colors,VkFormat depth,VkFormat stencil,u32 samples){
+    PipelineDesc d{};
+    for(u32 i=0;i<32;++i){const u32 a=state.attributes[i];d.attributes[i]=a&0x40?a&(31u|0x40u|0x3fffu<<7|0x3ffu<<21):0u;}
+    {std::array<bool,16> used{};for(u32 i=0;i<32;++i)if(state.attributes[i]&0x40)used[state.attributes[i]&31]=true;
+     for(u32 i=0;i<16;++i){d.streams[i][0]=used[i]?state.streams[i][0]:0u;d.streams[i][1]=used[i]?state.streams[i][1]:0u;}}
+    d.color_count=state.color_count;
+    constexpr u64 DefaultBlend=0x01020102110c0000ULL&~0xffffffull; // (what an unblended attachment carries: never read)
+    for(u32 i=0;i<state.color_count;++i){const bool blended=(state.color>>(8+i))&1;
+        if(blended)d.color_blend|=1u<<i;
+        d.blends[i]=blended?state.blends[i]&~0xffffffull:DefaultBlend;d.channel|=(state.channel>>(i*4)&15)<<(i*4);}
+    d.polygon=state.polygon&(0x1fu|0xfu<<15);d.lower_left=WindowOriginLowerLeft();
+    d.depth=(state.depth&0xf7)|(((state.depth>>2)&1?state.depth:0x1118111800000022ULL)&0xffffffff00000000ull);
+    d.depth_bounds=state.depth_bounds;
+    if(state.depth_bounds)for(u32 i=0;i<2;++i)std::memcpy(&d.depth_bounds_range[i],&state.depth_bounds_range[i],4);
+    d.primitive=state.primitive;d.restart=state.restart;d.depth_clamp=state.depth_clamp;d.discard=state.discard;d.sample_mask=state.sample_mask;d.mesh=mesh;
+    for(u32 i=0;i<8;++i)d.colors[i]=colors[i];d.depth_format=depth;d.stencil_format=stencil;d.samples=samples;
+    return d;
+}
+std::string PipelineKey(const PipelineDesc& d,const std::vector<u64>& identities){
+    std::string key(reinterpret_cast<const char*>(&d),sizeof d);
+    for(u64 id:identities)key.append(reinterpret_cast<const char*>(&id),sizeof id);
+    return key;
+}
+// Descriptor set layout and pipeline layout from the resources of the pipeline's shaders.
+using StageResources=std::pair<VkShaderStageFlagBits,const std::vector<nvshader::Resource>*>;
+void BuildPipelineLayout(Pipeline& pipeline,const std::vector<StageResources>& stages){
+    auto& vk=Vk();
+    for(const auto& [stage,resources]:stages)for(const auto& r:*resources){
+        const bool buffer=r.kind==nvshader::ResourceKind::UniformBuffer||r.kind==nvshader::ResourceKind::StorageBuffer;
+        pipeline.bindings.push_back({r.binding,DescriptorType(r.kind),buffer?1:r.count,stage,nullptr});
+    }
+    VkDescriptorSetLayoutCreateInfo di{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};di.bindingCount=pipeline.bindings.size();di.pBindings=pipeline.bindings.data();
+    // (graphics only: dispatches bind a descriptor set. A compute pipeline with a push-descriptor layout got a null set bound:
+    // its passes ran without resources, and the 3D image and movies went black, now and then)
+    bool compute=false;for(const auto& [stage,resources]:stages)compute|=stage==VK_SHADER_STAGE_COMPUTE_BIT;
+    {u32 total=0;for(const auto& b:pipeline.bindings)total+=b.descriptorCount;
+     if(!compute&&vk.push_descriptor_set&&total<=vk.max_push_descriptors){di.flags=VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;pipeline.push=true;}}
+    VK_CHECK(vkCreateDescriptorSetLayout(vk.device,&di,nullptr,&pipeline.descriptors));
+    VkPushConstantRange push{VK_SHADER_STAGE_ALL,0,128};
+    VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};li.setLayoutCount=1;li.pSetLayouts=&pipeline.descriptors;li.pushConstantRangeCount=1;li.pPushConstantRanges=&push;
+    VK_CHECK(vkCreatePipelineLayout(vk.device,&li,nullptr,&pipeline.layout));
+}
+// The Vulkan pipeline for a description (a worker, or a prewarm thread: those pass fatal=false and get null for a failure).
+VkPipeline CreateGraphicsPipeline(const PipelineDesc& d,VkPipelineLayout layout,const std::vector<VkPipelineShaderStageCreateInfo>& stages,u64 fragment_address,bool fatal){
+    auto& vk=Vk();const bool mesh=d.mesh;
+    std::vector<VkVertexInputAttributeDescription> attributes;
+    std::vector<VkVertexInputBindingDescription> vertex_bindings;
+    std::array<bool,16> used{};
+    for(u32 i=0;i<32;++i){const u32 a=d.attributes[i];if(!(a&0x40))continue;const u32 stream=a&31;if(stream>=16)Fatal("vertex stream exceeds native limit");
+        attributes.push_back({i,stream,GetFormat(a>>21&0x3ff).vk,(a>>7)&0x3fff});used[stream]=true;}
+    for(u32 i=0;i<16;++i)if(used[i]){if(d.streams[i][1]>1)Fatal("vertex instance divisor %u not enabled",d.streams[i][1]);vertex_bindings.push_back({i,d.streams[i][0],d.streams[i][1]?VK_VERTEX_INPUT_RATE_INSTANCE:VK_VERTEX_INPUT_RATE_VERTEX});}
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};vi.vertexAttributeDescriptionCount=attributes.size();vi.pVertexAttributeDescriptions=attributes.data();vi.vertexBindingDescriptionCount=vertex_bindings.size();vi.pVertexBindingDescriptions=vertex_bindings.data();
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};ia.topology=Topology(d.primitive);ia.primitiveRestartEnable=d.restart;
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};vp.viewportCount=1;vp.scissorCount=1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};rs.cullMode=d.polygon&3;{static const char* nocull=std::getenv("OOT_CULL_NONE");if(nocull&&fragment_address){char a[24];std::snprintf(a,sizeof a,"%llx",(unsigned long long)fragment_address);if(std::strstr(nocull,a))rs.cullMode=VK_CULL_MODE_NONE;}}
+    // Lower-left origin keeps NVN's memory layout with an unflipped Vulkan viewport, which mirrors
+    // the window y axis and with it the winding: OpenGL's counter-clockwise is Vulkan's clockwise.
+    const bool ccw=(d.polygon&4)!=0;rs.frontFace=ccw!=(d.lower_left!=0)?VK_FRONT_FACE_COUNTER_CLOCKWISE:VK_FRONT_FACE_CLOCKWISE;
+    const VkPolygonMode modes[]={VK_POLYGON_MODE_POINT,VK_POLYGON_MODE_LINE,VK_POLYGON_MODE_FILL};u32 mode=d.polygon>>3&3;if(mode>2)Fatal("invalid polygon mode");rs.polygonMode=modes[mode];rs.lineWidth=1;rs.depthBiasEnable=(d.polygon>>15&15)!=0;rs.depthClampEnable=d.depth_clamp;rs.rasterizerDiscardEnable=d.discard;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};ms.rasterizationSamples=(VkSampleCountFlagBits)d.samples;const VkSampleMask mask=d.sample_mask;ms.pSampleMask=&mask;
+    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};ds.depthTestEnable=d.depth&1;ds.depthWriteEnable=(d.depth>>1)&1;ds.depthCompareOp=(VkCompareOp)(((d.depth>>4)&15)-1);{static const bool relax=std::getenv("OOT_DEPTH_EQUAL_RELAX")!=nullptr;if(relax&&ds.depthCompareOp==VK_COMPARE_OP_EQUAL)ds.depthCompareOp=VK_COMPARE_OP_LESS_OR_EQUAL;}ds.stencilTestEnable=(d.depth>>2)&1;{static const char* always=std::getenv("OOT_DEPTH_ALWAYS");if(always&&fragment_address){char a[24];std::snprintf(a,sizeof a,"%llx",(unsigned long long)fragment_address);if(std::strstr(always,a))ds.depthTestEnable=VK_FALSE;}}ds.depthBoundsTestEnable=d.depth_bounds;std::memcpy(&ds.minDepthBounds,&d.depth_bounds_range[0],4);std::memcpy(&ds.maxDepthBounds,&d.depth_bounds_range[1],4);
+    for(u32 i=0;i<2;++i){const u32 p=(u32)(d.depth>>32)>>(i*16);auto& st=i?ds.back:ds.front;st.compareOp=(VkCompareOp)((p&15)-1);st.failOp=(VkStencilOp)(((p>>4)&15)-1);st.depthFailOp=(VkStencilOp)(((p>>8)&15)-1);st.passOp=(VkStencilOp)(((p>>12)&15)-1);}
+    std::vector<VkPipelineColorBlendAttachmentState> blend(d.color_count);
+    for(u32 i=0;i<blend.size();++i){const u64 b=d.blends[i];auto& out=blend[i];static const bool no_blend=std::getenv("OOT_DEBUG_NOBLEND")!=nullptr;out.blendEnable=!no_blend&&((d.color_blend>>i)&1);out.colorWriteMask=d.channel>>(i*4)&15;
+        out.srcColorBlendFactor=BlendFactor(b>>32&127);out.dstColorBlendFactor=BlendFactor(b>>40&127);out.srcAlphaBlendFactor=BlendFactor(b>>48&127);out.dstAlphaBlendFactor=BlendFactor(b>>56&127);
+        const VkBlendOp ops[]={VK_BLEND_OP_ADD,VK_BLEND_OP_SUBTRACT,VK_BLEND_OP_REVERSE_SUBTRACT,VK_BLEND_OP_MIN,VK_BLEND_OP_MAX};
+        const u32 rgb=b>>24&7,alpha=b>>28&7;if(rgb<1||rgb>5||alpha<1||alpha>5)Fatal("invalid blend equation");out.colorBlendOp=ops[rgb-1];out.alphaBlendOp=ops[alpha-1];}
+    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};cb.attachmentCount=blend.size();cb.pAttachments=blend.data();
+    const VkDynamicState dynamics[]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR,VK_DYNAMIC_STATE_BLEND_CONSTANTS,VK_DYNAMIC_STATE_DEPTH_BIAS,VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,VK_DYNAMIC_STATE_STENCIL_REFERENCE};
+    VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};dy.dynamicStateCount=std::size(dynamics);dy.pDynamicStates=dynamics;
+    VkFormat colors[8];for(u32 i=0;i<8;++i)colors[i]=(VkFormat)d.colors[i];
+    VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};ri.colorAttachmentCount=d.color_count;ri.pColorAttachmentFormats=colors;ri.depthAttachmentFormat=(VkFormat)d.depth_format;ri.stencilAttachmentFormat=(VkFormat)d.stencil_format;
+    VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};pi.pNext=&ri;pi.stageCount=stages.size();pi.pStages=stages.data();pi.pVertexInputState=mesh?nullptr:&vi;pi.pInputAssemblyState=mesh?nullptr:&ia;pi.pViewportState=&vp;pi.pRasterizationState=&rs;pi.pMultisampleState=&ms;pi.pDepthStencilState=&ds;pi.pColorBlendState=&cb;pi.pDynamicState=&dy;pi.layout=layout;
+    VkPipeline created=VK_NULL_HANDLE;
+    const VkResult result=vkCreateGraphicsPipelines(vk.device,PipelineCache(),1,&pi,nullptr,&created);
+    if(fatal)VK_CHECK(result);else if(result!=VK_SUCCESS)return VK_NULL_HANDLE;
+    return created;
+}
+std::mutex pipeline_tables_mutex; // pipelines and compute_pipelines: the executor and the prewarm threads (a hit is a lookup under it)
+std::atomic<u32> prewarm_hits{0};  // pipelines made before the game that play needed (since the last report)
+Pipeline& GetPipelineOld(bool mesh) {
     std::vector<ShaderVariant*> active;
     ShaderVariant* previous=nullptr;u32 binding=0;
     const std::initializer_list<u32> order=mesh?std::initializer_list<u32>{6u,7u,1u}:std::initializer_list<u32>{0u,3u,4u,2u,1u};
@@ -906,7 +1055,7 @@ Pipeline& GetPipeline(bool mesh) {
     for(auto* v:active)if(!v->module)return untranslatable;
     if(!mesh&&!state.stages[0].shader)Fatal("draw has no vertex shader");
     if(mesh&&!state.stages[7].shader)Fatal("mesh draw has no mesh shader");
-    std::string key;
+    static thread_local std::string key;key.clear();
     const auto add=[&](const auto& value){key.append(reinterpret_cast<const char*>(&value),sizeof value);};
     // Only the state bits pipeline creation reads below: the raw NVN words also carry unrelated
     // (often uninitialized) bits, which would make every draw look like a new pipeline.
@@ -979,6 +1128,74 @@ Pipeline& GetPipeline(bool mesh) {
         target->pipeline.store(created,std::memory_order_release);
         std::lock_guard timing{compile_time_mutex};
         compile_time.pipelines+=std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();++compile_time.created;}
+    };
+    static const bool synchronous=std::getenv("OOT_SYNC_PIPELINES")!=nullptr;
+    if(synchronous)job();
+    else{
+        PipelineWorkers().Run(std::move(job));
+        const auto waited_from=std::chrono::steady_clock::now();
+        const auto deadline=waited_from+std::chrono::microseconds(3000);
+        while(!target->pipeline.load(std::memory_order_acquire)&&std::chrono::steady_clock::now()<deadline)std::this_thread::yield();
+        hitch.pipeline_wait+=std::chrono::duration<double>(std::chrono::steady_clock::now()-waited_from).count();
+    }
+    }
+    auto* result=pipeline.get();pipelines.emplace(std::move(key),std::move(pipeline));return *result;
+}
+Pipeline& GetPipeline(bool mesh);
+Pipeline& GetPipeline(bool mesh) {
+    {static const bool old=std::getenv("OOT_OLD_PIPELINE")!=nullptr;if(old)return GetPipelineOld(mesh);}
+    std::vector<ShaderVariant*> active;
+    ShaderVariant* previous=nullptr;u32 binding=0;
+    const std::initializer_list<u32> order=mesh?std::initializer_list<u32>{6u,7u,1u}:std::initializer_list<u32>{0u,3u,4u,2u,1u};
+    for(u32 i:order) if(state.stages[i].shader) {
+        auto& v=CompileShader(*state.stages[i].shader,binding,previous);previous=&v;active.push_back(&v);
+        for(auto& r:v.compiled.resources)binding=std::max(binding,r.binding+(r.kind==nvshader::ResourceKind::UniformBuffer||r.kind==nvshader::ResourceKind::StorageBuffer?r.count:1));
+    }
+    static Pipeline untranslatable;
+    for(auto* v:active)if(!v->module)return untranslatable;
+    if(!mesh&&!state.stages[0].shader)Fatal("draw has no vertex shader");
+    if(mesh&&!state.stages[7].shader)Fatal("mesh draw has no mesh shader");
+    std::array<VkFormat,8> colors{};VkFormat depth=VK_FORMAT_UNDEFINED,stencil=VK_FORMAT_UNDEFINED;u32 samples=1;
+    for(u32 i=0;i<state.color_count;++i)if(state.targets.colors[i]){auto* t=HostTexture(state.targets.colors[i]);colors[i]=state.targets.color_views[i].format?GetFormat(state.targets.color_views[i].format).vk:t->info.vk;samples=t->samples;}
+    if(state.targets.depth){auto* t=HostTexture(state.targets.depth);if(t->info.depth)depth=t->info.vk;if(t->info.stencil)stencil=t->info.vk;samples=t->samples;}
+    // Only the state bits pipeline creation reads: the raw NVN words also carry unrelated (often uninitialized) bits,
+    // which would make every draw look like a new pipeline. Shaders count by what they are, not by this run's handles.
+    const PipelineDesc desc=MakeDesc(mesh,colors,depth,stencil,samples);
+    std::vector<u64> identities;for(auto* shader:active)identities.push_back(shader->identity);
+    std::string key=PipelineKey(desc,identities);
+    {static const bool by_module=std::getenv("OOT_PIPELINE_KEY_MODULE")!=nullptr;if(by_module)for(auto* shader:active)key.append(reinterpret_cast<const char*>(&shader->module),sizeof shader->module);} // (diagnostic: one pipeline per module, as before)
+    std::unique_lock tables{pipeline_tables_mutex};
+    auto found=pipelines.find(key);
+    if(found!=pipelines.end()){
+        Pipeline& hit=*found->second;
+        if(!hit.touched){hit.touched=true;++prewarm_hits;plist::Use(hit.record);} // (made before the game: now it is in use)
+        if(hit.shaders!=active)hit.shaders=active; // (the variants this draw uses: another run's, or another program with the same code)
+        return hit;
+    }
+    auto pipeline=std::make_unique<Pipeline>();pipeline->shaders=active;
+    {std::vector<StageResources> stages;for(auto* shader:active)stages.emplace_back(ShaderVkStage[shader->source->stage],&shader->compiled.resources);BuildPipelineLayout(*pipeline,stages);}
+    // Pipeline compilation runs on a worker; the draw waits briefly and is skipped (this frame only) if the
+    // pipeline is not ready, instead of stalling the frame.
+    {
+    plist::Record record; // (what the next run needs to make this one before the game: pipeline_list.h)
+    bool listed=plist::Enabled();for(auto* shader:active)listed&=shader->cache_key!=0;
+    if(listed){
+        record.kind=mesh?plist::Kind::Mesh:plist::Kind::Graphics;
+        for(auto* shader:active)record.shaders.push_back({shader->source->stage,shader->cache_key,shader->identity});
+        record.state.assign(reinterpret_cast<const u8*>(&desc),reinterpret_cast<const u8*>(&desc)+sizeof desc);
+        record.id=plist::MakeId(record.kind,record.shaders,record.state);pipeline->record=record.id;
+    }
+    const u64 fragment_address=state.stages[1].shader?state.stages[1].shader->address:0;
+    Pipeline* target=pipeline.get();
+    auto job=[desc,target,active,fragment_address,listed,record=std::move(record)]{
+        std::vector<VkPipelineShaderStageCreateInfo> stages;
+        for(auto* shader:active){VkPipelineShaderStageCreateInfo si{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};si.stage=ShaderVkStage[shader->source->stage];si.module=shader->module;si.pName="main";stages.push_back(si);}
+        const auto t0=std::chrono::steady_clock::now();
+        VkPipeline created=CreateGraphicsPipeline(desc,target->layout,stages,fragment_address,true);
+        target->pipeline.store(created,std::memory_order_release);
+        {std::lock_guard timing{compile_time_mutex};
+        compile_time.pipelines+=std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();++compile_time.created;}
+        if(listed&&!plist::Add(record))plist::Use(record.id);
     };
     static const bool synchronous=std::getenv("OOT_SYNC_PIPELINES")!=nullptr;
     if(synchronous)job();
@@ -1202,12 +1419,66 @@ thread_local bool descriptor_fast_eligible = false;
 // writes: compute dispatches use them to skip barriers between independent dispatches.
 std::vector<std::pair<u64,u64>> descriptor_buffer_reads,descriptor_buffer_writes;
 std::vector<Texture*> descriptor_image_writes;
+std::shared_ptr<Texture> SnapshotAttachment(Texture& source){
+    auto copy=std::shared_ptr<Texture>(new Texture,RetireTexture);
+    copy->format=source.format;copy->target=source.target;
+    copy->width=source.width;copy->height=source.height;copy->depth=source.depth;
+    copy->levels=source.levels;copy->layers=source.layers;copy->samples=source.samples;
+    copy->flags=source.flags;copy->info=source.info;
+    std::memcpy(copy->swizzle,source.swizzle,sizeof copy->swizzle);
+    copy->depth_stencil_mode=source.depth_stencil_mode;
+    // Private storage identity: never adopt/steal an image belonging to guest memory.
+    copy->storage=reinterpret_cast<u64>(copy.get());
+    EnsureImage(*copy);
+    Immediate([&](VkCommandBuffer cmd){
+        Transition(cmd,source,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        Transition(cmd,*copy,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        std::vector<VkImageCopy> regions;
+        for(u32 level=0;level<source.levels;++level){
+            VkImageCopy region{};
+            region.srcSubresource=region.dstSubresource={AspectOf(source),level,0,source.layers};
+            region.extent={std::max(1u,source.width>>level),std::max(1u,source.height>>level),source.target==Target::T3D?std::max(1u,source.depth>>level):1};
+            regions.push_back(region);
+        }
+        vkCmdCopyImage(cmd,source.image,source.layout,copy->image,copy->layout,regions.size(),regions.data());
+        Transition(cmd,source,VK_IMAGE_LAYOUT_GENERAL);
+        Transition(cmd,*copy,VK_IMAGE_LAYOUT_GENERAL);
+    });
+    copy->uploaded=true;
+    AfterBatch([copy]{}); // descriptor views survive through this draw's GPU submission
+    return copy;
+}
 // Fills the pipeline's (reused) descriptor set from the current state.
 bool WriteDescriptors(Pipeline& pipeline){
     auto& vk=Vk();static const bool gpu_trace=std::getenv("OOT_GPU_TRACE")!=nullptr;
     // Texture handles and buffer pointers read from guest memory on the CPU must see GPU writes
     // recorded earlier in the open batch: submit first only when such a write is pending.
     if(HandleMemoryPending(pipeline))Flush();
+    if(LogThisFrame())if(const char* dir=std::getenv("OOT_INPUT_DUMP")){
+        const u64 address=std::getenv("OOT_INPUT_DUMP_SHADER")?std::strtoull(std::getenv("OOT_INPUT_DUMP_SHADER"),nullptr,16):0;
+        for(auto* shader:pipeline.shaders)if(shader->source->address==address){
+            for(const auto& r:shader->compiled.resources)if(r.kind==nvshader::ResourceKind::Texture)
+                for(u32 element=0;element<r.count;++element){
+                    const u32 handle=ResourceHandle(r,*shader,element);if(!HandleRegistered(handle))continue;
+                    auto& texture=*Binding(handle).host;EnsureUploaded(texture);
+                    const auto bytes=ReadTexels(texture);
+                    char path[512];std::snprintf(path,sizeof path,"%s/%llx-%x-%x-%u.bin",dir,(unsigned long long)address,r.bank,r.offset,element);
+                    if(FILE* f=std::fopen(path,"wb")){
+                        std::fprintf(f,"%u %u %u %u %u\n",texture.width,texture.height,texture.depth,texture.format,texture.info.bytes);
+                        std::fwrite(bytes.data(),1,bytes.size(),f);std::fclose(f);
+                    }
+                }
+            auto& stage=state.stages[ShaderPublicStage[shader->source->stage]];
+            for(u32 bank=3;bank<=4;++bank){
+                char path[512];std::snprintf(path,sizeof path,"%s/%llx-cbuf%u.bin",dir,(unsigned long long)address,bank);
+                if(FILE* f=std::fopen(path,"wb")){
+                    const u32 size=std::min<u64>(stage.uniforms[bank-UniformBankBase].size,0x10000);
+                    for(u32 offset=0;offset+4<=size;offset+=4){const u32 word=Cbuf(&stage,bank,offset);std::fwrite(&word,4,1,f);}
+                    std::fclose(f);
+                }
+            }
+        }
+    }
     descriptor_reads.clear();descriptor_writes=false;
     // Readback flushes the batch and resets its descriptor pools. Finish debug
     // captures before allocating this draw's set, so it survives until submission.
@@ -1225,6 +1496,7 @@ bool WriteDescriptors(Pipeline& pipeline){
     // Uploads below may flush, retiring this batch's descriptor pools: then write a fresh set.
     for(u64 flushes=~0ull;flushes!=FlushCount();){
     flushes=FlushCount();
+    std::map<Texture*,std::shared_ptr<Texture>> attachment_snapshots;
     descriptor_reads.clear();descriptor_writes=false;
     descriptor_buffer_reads.clear();descriptor_buffer_writes.clear();descriptor_image_writes.clear();
     uniform_write_slots.clear();descriptor_fast_eligible=true;
@@ -1339,6 +1611,8 @@ bool WriteDescriptors(Pipeline& pipeline){
                         continue;}
                     ++array_valid;
                     auto& binding=Binding(handle);auto& t=*binding.host.get();EnsureUploaded(t);
+                    if(t.layout!=VK_IMAGE_LAYOUT_GENERAL)
+                        Immediate([&](VkCommandBuffer cmd){Transition(cmd,t,VK_IMAGE_LAYOUT_GENERAL);});
                     descriptor_reads.push_back(&t);if(r.kind==nvshader::ResourceKind::Image&&r.written){descriptor_writes=true;descriptor_image_writes.push_back(&t);}
                     if(LogThisFrame()&&t.format==1&&t.storage&&t.storage_size){std::vector<u8> bytes(t.storage_size);std::memcpy(bytes.data(),ResolveAddress(t.storage,bytes.size()),bytes.size());u64 nz=0;for(u8 b:bytes)nz+=b!=0;RT_LOG("  (R8 texture %#llx: %llu/%zu nonzero guest bytes, uploaded frame %llu, upload seq %u)",(unsigned long long)binding.texture,(unsigned long long)nz,bytes.size(),(unsigned long long)t.upload_frame,t.upload_sequence);}
                     if(LogThisFrame()){const u32* sw=t.swizzle;RT_LOG("  stage %u texture resource bank %u offset %#x element %u: handle %#x -> texture %#llx %ux%u fmt %u written %d storage %#llx swizzle %u %u %u %u view %d (%u %u %u %u)",shader->source->stage,r.bank,r.offset,element,handle,(unsigned long long)binding.texture,t.width,t.height,t.format,(int)t.gpu_written,(unsigned long long)t.storage,sw[0],sw[1],sw[2],sw[3],binding.view.present,binding.view.swizzle[0],binding.view.swizzle[1],binding.view.swizzle[2],binding.view.swizzle[3]);}
@@ -1346,7 +1620,15 @@ bool WriteDescriptors(Pipeline& pipeline){
                         RT_LOG("image binding: shader %#llx bank %u+%#x texture fmt %u %ux%u, shader image format %u written %d",(unsigned long long)shader->source->address,r.bank,r.offset,t.format,t.width,t.height,r.image_format,(int)r.written);}}
                     TextureView view=binding.view;view.target=ShaderViewTarget(r.texture_type,t)+1;
                     if(r.kind==nvshader::ResourceKind::Image){view.swizzle[0]=2;view.swizzle[1]=3;view.swizzle[2]=4;view.swizzle[3]=5;} // storage views: identity
-                    images.push_back({r.kind==nvshader::ResourceKind::Texture?Sampler(handle):VK_NULL_HANDLE,ImageView(t,view),VK_IMAGE_LAYOUT_GENERAL});}
+                    Texture* sampled=&t;
+                    if(r.kind==nvshader::ResourceKind::Texture&&shader->source->stage!=5){
+                        for(u32 color=0;color<state.color_count;++color)if(state.targets.colors[color]&&HostTexture(state.targets.colors[color])==&t&&((state.channel>>(color*4))&15)){
+                            auto& snapshot=attachment_snapshots[&t];
+                            if(!snapshot)snapshot=SnapshotAttachment(t);
+                            sampled=snapshot.get();descriptor_fast_eligible=false;break;
+                        }
+                    }
+                    images.push_back({r.kind==nvshader::ResourceKind::Texture?Sampler(handle):VK_NULL_HANDLE,ImageView(*sampled,view),VK_IMAGE_LAYOUT_GENERAL});}
                 if(r.storage_index!=~0u){static std::map<std::pair<u64,u32>,bool> seen;
                     if(!seen[{shader->source->address,r.binding}]){seen[{shader->source->address,r.binding}]=true;
                         RT_LOG("storage texture array shader %#llx binding %u: %u/%u valid, storage %u+%#x stride %u",(unsigned long long)shader->source->address,r.binding,array_valid,r.count,r.storage_index,r.storage_offset,r.storage_stride);}}
@@ -1475,6 +1757,11 @@ void Draw(const Command& command) {
     if(!skipped_shaders.empty())for(const auto& st:state.stages)if(st.shader&&std::find(skipped_shaders.begin(),skipped_shaders.end(),st.shader->address)!=skipped_shaders.end())return;
     for(const auto& st:state.stages)if(st.shader&&SkippedByFile(st.shader->address))return;
     if(SkipDraw())return;
+    // A render target the game finalized after recording this draw (its object has no host texture any more): the
+    // draw is dropped. (It crashed here when pausing: textures are finalized while the executor is behind.)
+    {bool gone=state.targets.depth&&!HostTexture(state.targets.depth);
+     for(u32 i=0;i<state.color_count;++i)gone|=state.targets.colors[i]&&!HostTexture(state.targets.colors[i]);
+     if(gone){static int told=0;if(told++<8)RT_LOG("draw skipped: a render target was finalized before it executed");return;}}
     static const bool gpu_trace=std::getenv("OOT_GPU_TRACE")!=nullptr;
     if(gpu_trace){
         std::string stages;
@@ -1489,6 +1776,18 @@ void Draw(const Command& command) {
             VK_CHECK(vkCreateQueryPool(Vk().device,&qi,nullptr,&pool));}
         stats_pool=pool;}
     const bool mesh=(Op)command.op==Op::DrawMeshTasks;
+    // A first GPU lookup can allocate a device copy and record a transfer,
+    // which ends an open render pass. Resolve all geometry before beginning it.
+    std::array<bool,16> used_streams{};
+    std::array<BufferRange,16> vertex_ranges{};
+    if(!mesh)for(u32 a=0;a<32;++a)if((state.attributes[a]&0x40)&&(state.attributes[a]&31)<16)
+        used_streams[state.attributes[a]&31]=true;
+    for(u32 i=0;i<16;++i)if(used_streams[i]&&state.vertices[i].address)
+        vertex_ranges[i]=GpuLookupAddress(state.vertices[i].address);
+    const Op draw_op=(Op)command.op;
+    const bool indexed_draw=draw_op==Op::DrawElements||draw_op==Op::DrawElementsInstanced||draw_op==Op::DrawElementsBaseVertex;
+    const BufferRange index_range=indexed_draw?GpuLookupAddress(command.x[3]):BufferRange{};
+    if(indexed_draw&&!index_range.pool){static int told=0;if(told++<16)RT_LOG("draw skipped: index buffer %#llx is not mapped",(unsigned long long)command.x[3]);return;}
     const u64 indirect_slot=mesh?mesh_indirect_slot:0; // (DrawMeshTasksIndirect: arguments in indirect_clamp's slot - 1)
     // Fast path: draws that differ from the previous one only in uniform/vertex buffer bindings
     // (most of the game's per-object draws) reuse its pipeline, attachments and descriptor writes,
@@ -1579,9 +1878,8 @@ void Draw(const Command& command) {
         // Only the streams this draw's attributes read. A binding left over from earlier draws may
         // name memory the game has since released (it crashed here: "unmapped vertex buffer"); an
         // attribute reading unmapped memory gets zeros (the zero buffer; reads past it are robust).
-        {std::array<bool,32> used{};for(u32 a=0;a<32;++a)if(state.attributes[a]&0x40)used[state.attributes[a]&31]=true;
-        for(u32 i=0;i<16;++i)if(used[i]){
-            BufferRange range{};if(state.vertices[i].address)range=GpuLookupAddress(state.vertices[i].address);
+        {for(u32 i=0;i<16;++i)if(used_streams[i]){
+            const BufferRange& range=vertex_ranges[i];
             VkBuffer buffer=range.buffer;VkDeviceSize offset=range.offset;
             if(!range.pool){const auto zero=ZeroBuffer();buffer=zero.buffer;offset=0;
                 static std::set<std::pair<u64,u64>> told;const u64 fs=state.stages[1].shader?state.stages[1].shader->address:0;
@@ -1595,6 +1893,8 @@ void Draw(const Command& command) {
         if(sample_query!=~0u)vkCmdBeginQuery(cmd,samples.pool,sample_query,VK_QUERY_CONTROL_PRECISE_BIT);
         const bool indexed=op==Op::DrawElements||op==Op::DrawElementsInstanced||op==Op::DrawElementsBaseVertex;
         const bool instanced=op==Op::DrawElementsInstanced||op==Op::DrawArraysInstanced;
+        if(vk.checkpoint){const u64 address=state.stages[1].shader?state.stages[1].shader->address:0;
+            vk.checkpoint(cmd,reinterpret_cast<void*>(address|1));}
         if(mesh){
             if(x[0])Fatal("nonzero first mesh task %llu requires workgroup base support",(unsigned long long)x[0]);
             static const auto draw_mesh=reinterpret_cast<PFN_vkCmdDrawMeshTasksEXT>(vkGetDeviceProcAddr(vk.device,"vkCmdDrawMeshTasksEXT"));
@@ -1603,7 +1903,7 @@ void Draw(const Command& command) {
             if(indirect_slot)draw_mesh_indirect(cmd,indirect_clamp.buffer,indirect_slot-1,1,16);
             else draw_mesh(cmd,(u32)x[1],1,1);
         }
-        else if(indexed){const auto range=GpuLookupAddress(x[3]);if(!range.pool){static int told=0;if(told++<16)RT_LOG("draw skipped: index buffer %#llx is not mapped",(unsigned long long)x[3]);return;}const VkIndexType types[]={VK_INDEX_TYPE_UINT8_KHR,VK_INDEX_TYPE_UINT16,VK_INDEX_TYPE_UINT32};if(x[1]>2)Fatal("invalid index type %llu",(unsigned long long)x[1]);vkCmdBindIndexBuffer(cmd,range.buffer,range.offset,types[x[1]]);
+        else if(indexed){const VkIndexType types[]={VK_INDEX_TYPE_UINT8_KHR,VK_INDEX_TYPE_UINT16,VK_INDEX_TYPE_UINT32};if(x[1]>2)Fatal("invalid index type %llu",(unsigned long long)x[1]);vkCmdBindIndexBuffer(cmd,index_range.buffer,index_range.offset,types[x[1]]);
             const s32 base_vertex=op==Op::DrawElements?0:(s32)x[4];vkCmdDrawIndexed(cmd,(u32)x[2],instanced?(u32)x[6]:1,0,base_vertex,instanced?(u32)x[5]:0);}
         else vkCmdDraw(cmd,x[2],instanced?x[4]:1,x[1],instanced?x[3]:0);
         if(stats_pool)vkCmdEndQuery(cmd,stats_pool,0);
@@ -1672,7 +1972,61 @@ void Draw(const Command& command) {
 }
 namespace { u64 GuestDeviceAddress(u64 address); }
 // Compute: one pipeline per compiled compute variant; dispatches run synchronously.
-std::map<VkShaderModule,std::unique_ptr<Pipeline>> compute_pipelines;
+std::map<u64,std::unique_ptr<Pipeline>> compute_pipelines; // by the translation's identity (guarded by pipeline_tables_mutex)
+std::vector<std::unique_ptr<Pipeline>> compute_orphans;
+// Creates the pipeline of a pipeline list record without the guest (a prewarm thread) and enters it in the tables the executor's draws and
+// dispatches look in. False when it could not be made (its translation is gone from the shader cache, the driver refused it, a large AMD
+// compute program that is not in the driver's cache: that takes minutes and is left to the moment the game needs it).
+bool PrewarmPipeline(const plist::Record& rec){
+    auto& vk=Vk();
+    const bool compute=rec.kind==plist::Kind::Compute;
+    PipelineDesc desc{};
+    if(!compute){
+        if(rec.state.size()!=sizeof desc||rec.shaders.empty())return false;
+        std::memcpy(&desc,rec.state.data(),sizeof desc);
+        if((rec.kind==plist::Kind::Mesh)!=(desc.mesh!=0))return false;
+    }else if(rec.shaders.size()!=1)return false;
+    std::vector<nvshader::Result> results(rec.shaders.size());
+    std::vector<u64> identities;
+    for(size_t i=0;i<rec.shaders.size();++i){
+        const auto& ref=rec.shaders[i];
+        if(ref.stage>7||!ShaderCacheFind(ref.cache_key,ref.identity,ref.stage,results[i]))return false;
+        identities.push_back(ref.identity);
+    }
+    const std::string key=compute?std::string():PipelineKey(desc,identities);
+    {std::lock_guard tables{pipeline_tables_mutex};if(compute?compute_pipelines.count(identities[0])!=0:pipelines.count(key)!=0)return true;} // (the game got there first)
+    struct Modules{std::vector<VkShaderModule> list;~Modules(){for(auto m:list)vkDestroyShaderModule(Vk().device,m,nullptr);}} modules;
+    for(auto& r:results){
+        if(r.global_loads||r.global_stores)PatchAddressTable(r.spirv);
+        VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};info.codeSize=r.spirv.size()*4;info.pCode=r.spirv.data();
+        VkShaderModule module=VK_NULL_HANDLE;
+        if(vkCreateShaderModule(vk.device,&info,nullptr,&module)!=VK_SUCCESS)return false;
+        modules.list.push_back(module);
+    }
+    auto pipeline=std::make_unique<Pipeline>();pipeline->record=rec.id;pipeline->touched=false;
+    {std::vector<StageResources> stages;
+     for(size_t i=0;i<results.size();++i)stages.emplace_back(compute?VK_SHADER_STAGE_COMPUTE_BIT:ShaderVkStage[rec.shaders[i].stage],&results[i].resources);
+     BuildPipelineLayout(*pipeline,stages);}
+    VkPipeline created=VK_NULL_HANDLE;
+    if(compute){
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};ci.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        ci.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;ci.stage.module=modules.list[0];ci.stage.pName="main";ci.layout=pipeline->layout;
+        static const u64 noopt_words=std::getenv("OOT_NOOPT_WORDS")?std::strtoull(std::getenv("OOT_NOOPT_WORDS"),nullptr,10):40000;
+        if(vk.properties.vendorID==0x1002&&noopt_words&&results[0].spirv.size()>noopt_words)ci.flags|=VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+        if(vkCreateComputePipelines(vk.device,PipelineCache(),1,&ci,nullptr,&created)!=VK_SUCCESS)created=VK_NULL_HANDLE;
+    }else{
+        std::vector<VkPipelineShaderStageCreateInfo> stages;
+        for(size_t i=0;i<results.size();++i){VkPipelineShaderStageCreateInfo si{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};si.stage=ShaderVkStage[rec.shaders[i].stage];si.module=modules.list[i];si.pName="main";stages.push_back(si);}
+        created=CreateGraphicsPipeline(desc,pipeline->layout,stages,0,false);
+    }
+    const auto discard=[&](VkPipeline p){if(p)vkDestroyPipeline(vk.device,p,nullptr);vkDestroyPipelineLayout(vk.device,pipeline->layout,nullptr);vkDestroyDescriptorSetLayout(vk.device,pipeline->descriptors,nullptr);};
+    if(!created){discard(VK_NULL_HANDLE);return false;}
+    pipeline->pipeline.store(created,std::memory_order_release);
+    std::lock_guard tables{pipeline_tables_mutex};
+    const bool placed=compute?compute_pipelines.try_emplace(identities[0],std::move(pipeline)).second:pipelines.try_emplace(key,std::move(pipeline)).second;
+    if(!placed)discard(created); // (the game made it while this thread did: pipeline is intact because try_emplace leaves it alone)
+    return true;
+}
 // indirect: guest address of {x, y, z} workgroup counts written by GPU work in the open batch;
 // they are read on the GPU (vkCmdDispatchIndirect, and copied into the driver bank's +0x4..+0xc).
 // ---- the game's neural upscaler, where its matrix multiplies are slow --------------------------------------
@@ -1710,12 +2064,24 @@ void NetworkStandIn(ShaderVariant& v){
     Texture* out=nullptr;for(auto* t:images)if(t->depth<=1&&!has(textures,t)&&(!out||area(t)>area(out)))out=t;
     if(!out)return; // (an earlier pass: feature maps in buffers)
     Texture* in=nullptr;for(auto* t:textures)if(t->depth<=1&&t->target==out->target&&!has(images,t)&&!t->info.depth&&(!in||area(t)>area(in)))in=t;
-    if(!in||area(in)>=area(out))return;
+    // Some networks first convert the decoded movie into an equally sized
+    // intermediate, then upscale it in a later pass. Keep that conversion in
+    // the stand-in chain too, or the final upscale reads an unwritten image.
+    if(!in||area(in)>area(out))return;
     EnsureUploaded(*in);EnsureImage(*out);
     auto& vk=Vk();VkFormatProperties fi,fo;vkGetPhysicalDeviceFormatProperties(vk.physical,in->info.vk,&fi);vkGetPhysicalDeviceFormatProperties(vk.physical,out->info.vk,&fo);
     if(!(fi.optimalTilingFeatures&VK_FORMAT_FEATURE_BLIT_SRC_BIT)||!(fi.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)||!(fo.optimalTilingFeatures&VK_FORMAT_FEATURE_BLIT_DST_BIT)){
         static int told=0;if(told++<8)RT_LOG("upscaling network stand-in: formats %d -> %d cannot be blitted",(int)in->info.vk,(int)out->info.vk);return;}
     {static int shown=0;if(shown++<8)RT_LOG("upscaling network stand-in: %ux%u fmt %u -> %ux%u fmt %u",in->width,in->height,in->format,out->width,out->height,out->format);}
+    {   // (OOT_STANDIN_TRACE: every candidate, when the choice changes)
+        static const bool trace=std::getenv("OOT_STANDIN_TRACE")!=nullptr;
+        static std::map<u64,std::pair<const Texture*,const Texture*>> last;static int told=0;
+        auto& l=last[v.source->address];
+        if(trace&&(l.first!=in||l.second!=out)&&told++<200){l={in,out};
+            std::string c;for(auto* t:textures){char b[160];std::snprintf(b,sizeof b," [tex %p %ux%u f%u st %#llx w%d u%d img %p]",(void*)t,t->width,t->height,t->format,(unsigned long long)t->storage,(int)t->gpu_written,(int)t->uploaded,(void*)t->image);c+=b;}
+            for(auto* t:images){char b[160];std::snprintf(b,sizeof b," [img %p %ux%u f%u st %#llx w%d]",(void*)t,t->width,t->height,t->format,(unsigned long long)t->storage,(int)t->gpu_written);c+=b;}
+            RT_LOG("stand-in %#llx frame %llu: in %p out %p;%s",(unsigned long long)v.source->address,(unsigned long long)CurrentFrameNumber(),(void*)in,(void*)out,c.c_str());}
+    }
     Texture* src=in;Texture* dst=out;
     Immediate([src,dst](VkCommandBuffer cmd){
         Transition(cmd,*src,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);Transition(cmd,*dst,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -1742,16 +2108,21 @@ void Dispatch(u32 gx,u32 gy,u32 gz,u64 indirect=0){
     if(IsNetwork(*stage.shader)&&SlowNetworks()){NetworkStandIn(v);return;}
     if(v.compiled.global_loads||v.compiled.global_stores)GlobalAddressTable(); // (pools may have changed)
     phases.mark(1);
-    auto& slot=compute_pipelines[v.module];
-    if(!slot){
+    Pipeline* slot_ptr=nullptr;
+    static const bool by_module=std::getenv("OOT_PIPELINE_KEY_MODULE")!=nullptr; // (diagnostic: one pipeline per module, as before)
+    const u64 compute_key=by_module?(u64)(uintptr_t)v.module:v.identity;
+    {std::lock_guard tables{pipeline_tables_mutex};const auto it=compute_pipelines.find(compute_key);if(it!=compute_pipelines.end())slot_ptr=it->second.get();}
+    if(slot_ptr&&!slot_ptr->touched){slot_ptr->touched=true;++prewarm_hits;plist::Use(slot_ptr->record);} // (made before the game)
+    if(slot_ptr&&(slot_ptr->shaders.size()!=1||slot_ptr->shaders[0]!=&v))slot_ptr->shaders={&v};
+    std::unique_ptr<Pipeline> slot;
+    if(!slot_ptr){
         slot=std::make_unique<Pipeline>();slot->shaders={&v};
-        for(const auto& r:v.compiled.resources){const bool buffer=r.kind==nvshader::ResourceKind::UniformBuffer||r.kind==nvshader::ResourceKind::StorageBuffer;
-            slot->bindings.push_back({r.binding,DescriptorType(r.kind),buffer?1:r.count,VK_SHADER_STAGE_COMPUTE_BIT,nullptr});}
-        VkDescriptorSetLayoutCreateInfo di{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};di.bindingCount=slot->bindings.size();di.pBindings=slot->bindings.data();
-        VK_CHECK(vkCreateDescriptorSetLayout(vk.device,&di,nullptr,&slot->descriptors));
-        VkPushConstantRange push{VK_SHADER_STAGE_ALL,0,128};
-        VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};li.setLayoutCount=1;li.pSetLayouts=&slot->descriptors;li.pushConstantRangeCount=1;li.pPushConstantRanges=&push;
-        VK_CHECK(vkCreatePipelineLayout(vk.device,&li,nullptr,&slot->layout));
+        {std::vector<StageResources> stages;stages.emplace_back(VK_SHADER_STAGE_COMPUTE_BIT,&v.compiled.resources);BuildPipelineLayout(*slot,stages);}
+        if(plist::Enabled()&&v.cache_key){
+            plist::Record record;record.kind=plist::Kind::Compute;record.shaders.push_back({v.source->stage,v.cache_key,v.identity});
+            record.id=plist::MakeId(record.kind,record.shaders,record.state);slot->record=record.id;
+            if(!plist::Add(record))plist::Use(record.id);
+        }
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};ci.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         ci.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;ci.stage.module=v.module;ci.stage.pName="main";ci.layout=slot->layout;
         // AMD (RADV's optimizer): OoT's largest compute programs (300k+ SPIR-V words) took up to 3.5 minutes to build on the
@@ -1786,8 +2157,12 @@ void Dispatch(u32 gx,u32 gy,u32 gz,u64 indirect=0){
          if(ms>20){u64 h=0xcbf29ce484222325ull;for(u32 w:v.compiled.spirv)h=(h^w)*0x100000001b3ull;
              RT_LOG("compute pipeline for shader %#llx built in %.0f ms (SPIR-V %zu words, hash %016llx%s%s)",(unsigned long long)stage.shader->address,ms,v.compiled.spirv.size(),(unsigned long long)h,
                     v.compiled.global_loads||v.compiled.global_stores?", global memory":"",quick?", without the optimizer":"");}}
+        slot_ptr=slot.get();
+        {std::lock_guard tables{pipeline_tables_mutex};
+         const auto placed=compute_pipelines.try_emplace(compute_key,std::move(slot));
+         if(!placed.second){slot_ptr=placed.first->second.get();compute_orphans.push_back(std::move(slot));}} // (a prewarm thread made it meanwhile: ours stays alive for a worker that may hold it)
     }
-    auto& pipeline=*slot;phases.mark(2);
+    auto& pipeline=*slot_ptr;phases.mark(2);
     if(!WriteDescriptors(pipeline))return;
     phases.mark(3);
     // Storage images the shader writes now hold GPU-produced contents.
@@ -1838,6 +2213,7 @@ void Dispatch(u32 gx,u32 gy,u32 gz,u64 indirect=0){
         vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline.pipeline);
         vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline.layout,0,1,&pipeline.descriptor_set,0,nullptr);
         float push[32]{};push[8]=1;vkCmdPushConstants(cmd,pipeline.layout,VK_SHADER_STAGE_ALL,0,sizeof push,push);
+        if(vk.checkpoint)vk.checkpoint(cmd,reinterpret_cast<void*>(stage.shader->address|2));
         if(indirect)vkCmdDispatchIndirect(cmd,indirect_clamp.buffer,slot);
         else vkCmdDispatch(cmd,gx,gy,gz);
     };
@@ -1950,7 +2326,7 @@ bool ExecuteRenderCommand(const Command& command) {
     case Op::BindBlendState: {u64 blend;std::memcpy(&blend,data,8);if(state.blends[blend&7]!=blend){state.blends[blend&7]=blend;fast_draw_allowed=false;}break;}
     case Op::BindColorState: {u32 v;std::memcpy(&v,data,4);if(v!=state.color){state.color=v;fast_draw_allowed=false;}break;}
     case Op::BindChannelMaskState: {u32 v;std::memcpy(&v,data,4);if(v!=state.channel){state.channel=v;fast_draw_allowed=false;}break;}
-    case Op::BindDepthStencilState: std::memcpy(&state.depth,data,8);break;
+    case Op::BindDepthStencilState: {u64 value;std::memcpy(&value,data,8);if(value!=state.depth){state.depth=value;fast_draw_allowed=false;}break;}
     case Op::BindPolygonState: {u32 v;std::memcpy(&v,data,4);if(v!=state.polygon){state.polygon=v;fast_draw_allowed=false;}break;}
     case Op::BindMultisampleState: break;
     case Op::SetBlendColor: std::memcpy(state.blend_color,data,16);break;
@@ -1970,7 +2346,7 @@ bool ExecuteRenderCommand(const Command& command) {
         if(!DrawEnabled())break;
         const u32 predicate=draw_predicate;const bool inverted=draw_inverted;draw_predicate=~0u;
         ++stats.clears;
-        const u64 object=state.targets.colors[x[0]];if(!object)break;auto& t=*HostTexture(object);
+        const u64 object=state.targets.colors[x[0]];if(!object||!HostTexture(object))break;auto& t=*HostTexture(object);
         if(LogThisFrame()){float f[4];std::memcpy(f,data,16);RT_LOG("clear color %llu target %#llx %ux%u fmt %u to (%g %g %g %g)",(unsigned long long)x[0],(unsigned long long)object,t.width,t.height,t.format,f[0],f[1],f[2],f[3]);}
         if(x[2]!=15)Fatal("partial color clear requires attachment clear");
         if(predicate!=~0u){PredicatedClear(predicate,inverted,&t,state.targets.color_views[x[0]],VK_IMAGE_ASPECT_COLOR_BIT,data,0,0);t.gpu_written=true;break;}
@@ -1981,14 +2357,14 @@ bool ExecuteRenderCommand(const Command& command) {
     case Op::ClearDepthStencil: {
         if(!DrawEnabled())break;
         const u32 predicate=draw_predicate;const bool inverted=draw_inverted;draw_predicate=~0u;
-        if(!state.targets.depth)break;auto& t=*HostTexture(state.targets.depth);
+        if(!state.targets.depth||!HostTexture(state.targets.depth))break;auto& t=*HostTexture(state.targets.depth);
         const auto& view=state.targets.depth_view;
         VkImageAspectFlags aspect=(x[0]?VK_IMAGE_ASPECT_DEPTH_BIT:0)|(x[2]?VK_IMAGE_ASPECT_STENCIL_BIT:0);aspect &= AspectOf(t);if(!aspect)break;
         if(predicate!=~0u){PredicatedClear(predicate,inverted,&t,view,aspect,nullptr,command.f[0],(u32)x[1]);t.gpu_written=true;break;}
         Immediate([&](VkCommandBuffer cmd){Transition(cmd,t,VK_IMAGE_LAYOUT_GENERAL);VkClearDepthStencilValue value{command.f[0],(u32)x[1]};
             VkImageSubresourceRange range{aspect,view.levels_base,1,view.layers_base,view.layers_count?view.layers_count:1};vkCmdClearDepthStencilImage(cmd,t.image,t.layout,&value,1,&range);});t.gpu_written=true;break;
     }
-    case Op::SetDepthClamp: state.depth_clamp=x[0];break;
+    case Op::SetDepthClamp: if(state.depth_clamp!=(bool)x[0]){state.depth_clamp=x[0];fast_draw_allowed=false;}break;
     case Op::SetPointSize: if(state.point_size!=command.f[0]){state.point_size=command.f[0];fast_draw_allowed=false;}break;
     case Op::SetRasterizerDiscard: state.discard=x[0];break;
     case Op::SetSampleMask: state.sample_mask=(u32)x[0];break;
@@ -2476,7 +2852,16 @@ void ReportSlowFrame(double ms){
         ms,hitch.translate*1000,hitch.pipeline_wait*1000,(unsigned long long)pending,up,(unsigned long long)n,st,sw,dc,fence,idle,parked);
     hitch={};
 }
+u32 TakePrewarmHits(){return prewarm_hits.exchange(0);}
+u64 ShaderCacheBytes(u64 key){
+    char path[64];std::snprintf(path,sizeof path,"/%016llx.bin",(unsigned long long)key);
+    std::error_code ec;const auto size=std::filesystem::file_size(ShaderCacheDirectory()+path,ec);return ec?0:(u64)size;
+}
+std::string ShaderCacheDir(){return ShaderCacheDirectory();}
+u32 ShaderCacheVersionValue(){return ShaderCacheVersion;}
+bool PrewarmBuild(const plist::Record& record){return PrewarmPipeline(record);}
 void ReportCompileTime() {
+    static u64 total_hits=0;if(const u32 hits=TakePrewarmHits()){total_hits+=hits;RT_LOG("prewarmed pipelines first used: %u since the last report (%llu this run)",hits,(unsigned long long)total_hits);}
     if(compile_time.created||compile_time.translate>0||compile_time.cached)RT_LOG("compile time: %.0f ms shader translation (%u variants from the disk cache), %.0f ms for %u graphics pipelines",
         compile_time.translate*1000,compile_time.cached,compile_time.pipelines*1000,compile_time.created);
     compile_time={};

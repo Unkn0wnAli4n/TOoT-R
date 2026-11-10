@@ -1,5 +1,6 @@
 // Recorded NVN command lists and their execution on Vulkan.
 #pragma once
+#include <chrono>
 
 #include <memory>
 #include <variant>
@@ -84,6 +85,12 @@ public:
 };
 CommandExecutor& Executor();
 bool TimelineOn(); double TimelineMs(); // (OOT_TIMELINE)
+// A fence's sync was signalled (its batch retired): threads in nvnSyncWait look again.
+void NotifySyncSignalled();
+// Sleeps until some sync is signalled or `timeout` passes; true if `state` is signalled.
+bool WaitSyncSignalled(const u32* state, std::chrono::nanoseconds timeout);
+// True when a thread of their own executes submissions and retires batches (nothing for a waiting game thread to drive).
+bool BackgroundGpuThreads();
 extern u64 current_queue; // queue of the submission being executed
 
 // Command list storage: a handle names a list until a new list is recorded at the same handle.

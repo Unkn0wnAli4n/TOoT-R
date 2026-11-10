@@ -264,6 +264,66 @@ VkImageView ViewOf(VkImage image, VkFormat format) {
     return view;
 }
 
+void Draw(VkCommandBuffer cmd, VkImage dst, VkFormat format, VkExtent2D extent);
+
+// The screen shown while pipelines of earlier runs are made before the game starts (prewarm.cpp). True: Skip was clicked.
+bool ProgressWindow(const Progress& p) {
+    ImGuiIO& io = ImGui::GetIO();
+    ImGuiStyle& style = ImGui::GetStyle();
+    const float scale = style.FramePadding.y / 3.0f;
+    const ImVec2 size = io.DisplaySize;
+    ImDrawList* background = ImGui::GetBackgroundDrawList();
+    const ImU32 top = IM_COL32(14, 18, 28, 255), bottom = IM_COL32(6, 8, 12, 255);
+    background->AddRectFilledMultiColor(ImVec2(0, 0), size, top, top, bottom, bottom);
+    ImGui::SetNextWindowPos(ImVec2(size.x * 0.5f, size.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(std::min(760.0f * scale, size.x * 0.9f), 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(30 * scale, 26 * scale));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10 * scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5 * scale);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.075f, 0.09f, 0.125f, 0.97f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.30f, 0.26f, 0.14f, 0.7f));
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.90f, 0.72f, 0.28f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.14f, 0.16f, 0.21f, 1.0f));
+    bool skip = false;
+    if (ImGui::Begin("##prewarm", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings)) {
+        ImGui::SetWindowFontScale(1.55f);
+        ImGui::TextColored(ImVec4(0.95f, 0.82f, 0.45f, 1.0f), "Preparing shaders");
+        ImGui::SetWindowFontScale(1.0f);
+        ImGui::Dummy(ImVec2(0, 6 * scale));
+        ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x);
+        ImGui::TextDisabled("Building the graphics pipelines used in earlier sessions, so new areas load without stutter.");
+        ImGui::PopTextWrapPos();
+        ImGui::Dummy(ImVec2(0, 20 * scale));
+        const float fraction = p.total ? std::min(1.0f, (float)p.done / (float)p.total) : 0.0f;
+        char percent[16]; std::snprintf(percent, sizeof percent, "%d%%", (int)(fraction * 100.0f));
+        ImGui::ProgressBar(fraction, ImVec2(-FLT_MIN, 28 * scale), percent);
+        ImGui::Dummy(ImVec2(0, 6 * scale));
+        ImGui::Text("%u / %u shaders", p.done, p.total);
+        char eta[48];
+        if (p.eta < 0) std::snprintf(eta, sizeof eta, "estimating...");
+        else if (p.eta < 1.5) std::snprintf(eta, sizeof eta, "almost done");
+        else if (p.eta < 90) std::snprintf(eta, sizeof eta, "about %d s left", (int)(p.eta + 0.5));
+        else std::snprintf(eta, sizeof eta, "about %d min left", (int)(p.eta / 60 + 0.5));
+        ImGui::SameLine(ImGui::GetContentRegionMax().x - ImGui::CalcTextSize(eta).x);
+        ImGui::TextUnformatted(eta);
+        ImGui::Dummy(ImVec2(0, 18 * scale));
+        ImGui::Separator();
+        ImGui::Dummy(ImVec2(0, 10 * scale));
+        ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x);
+        ImGui::TextDisabled("Press any key or button to skip. What is left is built while you play.");
+        ImGui::PopTextWrapPos();
+        ImGui::Dummy(ImVec2(0, 8 * scale));
+        const char* label = "Skip";
+        const float button = ImGui::CalcTextSize(label).x + style.FramePadding.x * 8;
+        ImGui::SetCursorPosX(ImGui::GetContentRegionMax().x - button);
+        if (ImGui::Button(label, ImVec2(button, 0))) skip = true;
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(4);
+    ImGui::PopStyleVar(3);
+    return skip;
+}
+
 } // namespace
 
 void Event(const SDL_Event& e) {
@@ -280,6 +340,11 @@ void FilterInput(u64& buttons, s32& lx, s32& ly, s32& rx, s32& ry, const bool*) 
         if (!buttons && !lx && !ly && !rx && !ry) blocking = false;
         else { buttons = 0; lx = ly = rx = ry = 0; }
     }
+}
+
+void ReleaseSwapchainViews() {
+    for (auto& [image, view] : ui.views) vkDestroyImageView(Vk().device, view, nullptr);
+    ui.views.clear();
 }
 
 void Record(VkCommandBuffer cmd, VkImage dst, VkFormat format, VkExtent2D extent, VkRect2D) {
@@ -301,6 +366,33 @@ void Record(VkCommandBuffer cmd, VkImage dst, VkFormat format, VkExtent2D extent
     if (shown) Window();
     if (counter) Counter();
     ImGui::Render();
+    Draw(cmd, dst, format, extent);
+}
+
+bool RecordProgress(VkCommandBuffer cmd, VkImage dst, VkFormat format, VkExtent2D extent, const Progress& progress) {
+    if (!ui.context) CreateContext(extent);
+    InitVulkan(format);
+    {
+        std::deque<SDL_Event> pending;
+        { std::lock_guard lock{events_mutex}; pending.swap(events); }
+        for (const SDL_Event& e : pending) ImGui_ImplSDL3_ProcessEvent(&e);
+    }
+    ImGui_ImplVulkan_NewFrame();
+    ImGui_ImplSDL3_NewFrame();
+    ImGui::NewFrame();
+    const bool skip = ProgressWindow(progress);
+    ImGui::Render();
+    Draw(cmd, dst, format, extent);
+    return skip;
+}
+
+void ProgressEvent(const SDL_Event& e) {
+    std::lock_guard lock{events_mutex};
+    if (events.size() < 256) events.push_back(e);
+}
+
+namespace {
+void Draw(VkCommandBuffer cmd, VkImage dst, VkFormat format, VkExtent2D extent) {
     ImDrawData* data = ImGui::GetDrawData();
     if (!data || data->CmdListsCount == 0) return;
 
@@ -325,5 +417,6 @@ void Record(VkCommandBuffer cmd, VkImage dst, VkFormat format, VkExtent2D extent
     back.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; back.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &back);
 }
+} // namespace
 
 } // namespace nvn::overlay

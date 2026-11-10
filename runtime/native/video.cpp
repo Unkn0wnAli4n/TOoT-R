@@ -1,6 +1,7 @@
 // nn::codec's hardware video decoders on FFmpeg (video_hookshot.inc, from Hookshot): the game's movie library
 // (subsdk0 movie:: over the SDK's nn::movie) runs as recompiled code and decodes through these. AV1 (the game's
 // movies) uses libdav1d. HOS_VIDEO_LOG=1: submissions and acquisitions.
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -18,6 +19,7 @@ extern "C" {
 #include "../kernel.h"
 #include "../native.h"
 using namespace rt;
+namespace nvn { extern std::atomic<s64> last_movie_ns; } // (present.cpp: a movie is not the game loading)
 
 namespace {
 using Ctx = Cpu;
@@ -35,8 +37,14 @@ using Ctx = Cpu;
 #define HLE(sym) VIDEO_DEFINE(#sym, __COUNTER__)
 #define hos_log(...) RT_LOG(__VA_ARGS__)
 #define HOS_WRITTEN(p, n) ((void)0) // (CPU writes to tracked guest memory are seen by the write-protection handler)
-void hos_sleep_ns(int64_t ns) { if (ns > 0) std::this_thread::sleep_for(std::chrono::nanoseconds(ns)); }
+void hos_sleep_ns(int64_t ns) {
+    if (ns > 0) {
+        rt::CoreRelease release; // submissions on this guest core must run while acquisition waits
+        std::this_thread::sleep_for(std::chrono::nanoseconds(ns));
+    }
+}
 int64_t hos_now_ns() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+static void movie_decoding() { nvn::last_movie_ns.store(hos_now_ns(), std::memory_order_relaxed); }
 std::mutex events_mutex;
 std::unordered_map<uint64_t, u32> event_handles;
 void EventInit(Cpu* c, uint64_t key, int autoclear) {

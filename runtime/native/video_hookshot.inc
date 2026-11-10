@@ -281,6 +281,7 @@ static void decode_pending(Dec *d) {
 }
 /* one submission decoded (its pictures into the queue, if any) */
 static void decode_next(Dec *d) {
+    movie_decoding();   /* (tootr) */
     if (d->phead) {
         Pending *n = d->phead;
         d->phead = n->next;
