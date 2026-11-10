@@ -68,6 +68,47 @@ inline size_t ScaleFogIntegration(IR::Program& program, f32 scale) {
     return matches.size();
 }
 
+// The meshlet culling task shader (Hookshot b2d948b, issue 817): it walks every cell of a coarse depth grid a meshlet
+// covers, and on RDNA 2 (the Steam Deck) one draw ran past the kernel's GPU timeout: the GPU was reset (and the Deck
+// froze). Its answer is visible = (result & 1) | (c3[2320] & 4), bit 4 being the game's own "draw everything": that
+// test becomes true and dead code elimination removes the grid walk. Every meshlet is drawn (the rasterizer clips what
+// is off screen), none is left out. Returns the tests replaced.
+inline bool ReadsBank3Word2320Bit4(const IR::Value& v) {
+    const IR::Value r = v.Resolve();
+    if (r.IsImmediate()) return false;
+    const IR::Inst* a = r.InstRecursive();
+    if (a->GetOpcode() != IR::Opcode::BitwiseAnd32) return false;
+    bool four = false, cbuf = false;
+    for (size_t i = 0; i < 2; ++i) {
+        const IR::Value x = a->Arg(i).Resolve();
+        if (x.IsImmediate()) { four = four || x.U32() == 4; continue; }
+        const IR::Inst* c = x.InstRecursive();
+        if (c->GetOpcode() != IR::Opcode::GetCbufU32) continue;
+        const IR::Value bank = c->Arg(0).Resolve(), off = c->Arg(1).Resolve();
+        cbuf = cbuf || (bank.IsImmediate() && off.IsImmediate() && bank.U32() == 3 && off.U32() == 2320);
+    }
+    return four && cbuf;
+}
+inline size_t MeshletCullingOff(IR::Program& program) {
+    size_t made = 0;
+    for (IR::Block* block : program.blocks)
+        for (IR::Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() != IR::Opcode::INotEqual) continue;
+            const IR::Value zero = inst.Arg(1).Resolve();
+            if (!zero.IsImmediate() || zero.U32() != 0) continue;
+            const IR::Value orv = inst.Arg(0).Resolve();
+            if (orv.IsImmediate()) continue;
+            const IR::Inst* o = orv.InstRecursive();
+            if (o->GetOpcode() != IR::Opcode::BitwiseOr32) continue;
+            if (!ReadsBank3Word2320Bit4(o->Arg(0)) && !ReadsBank3Word2320Bit4(o->Arg(1))) continue;
+            inst.ReplaceUsesWith(IR::Value{true});
+            ++made;
+        }
+    return made;
+}
+// OOT_MESH_NOCULL=1/0 (vk.cpp sets 1 on AMD and Intel unless given).
+inline bool MeshNoCull() { static const bool on = std::getenv("OOT_MESH_NOCULL") && std::atoi(std::getenv("OOT_MESH_NOCULL")) != 0; return on; }
+
 // OOT_FOG_SCALE (default 1: off; Hookshot uses 0.08, Orchid 0.25). OOT_NAN_GUARD=0 disables the guard.
 inline f32 FogScale() { static const f32 s = std::getenv("OOT_FOG_SCALE") ? (f32)std::atof(std::getenv("OOT_FOG_SCALE")) : 1.0f; return s; }
 inline bool NanGuard() { static const bool on = !std::getenv("OOT_NAN_GUARD") || std::atoi(std::getenv("OOT_NAN_GUARD")) != 0; return on; }

@@ -172,9 +172,12 @@ void CreateDevice(VulkanContext& vk) {
 #ifdef _WIN32
     if (!std::getenv("OOT_LOCAL_ZERO") && vk.properties.vendorID != 0x10DE) _putenv_s("OOT_LOCAL_ZERO", "0");
     if (!std::getenv("OOT_LOCAL_CRS") && vk.properties.vendorID != 0x10DE) _putenv_s("OOT_LOCAL_CRS", "0");
+    if (!std::getenv("OOT_MESH_NOCULL") && vk.properties.vendorID != 0x10DE) _putenv_s("OOT_MESH_NOCULL", "1");
 #else
     if (!std::getenv("OOT_LOCAL_ZERO") && vk.properties.vendorID != 0x10DE) setenv("OOT_LOCAL_ZERO", "0", 0);
     if (!std::getenv("OOT_LOCAL_CRS") && vk.properties.vendorID != 0x10DE) setenv("OOT_LOCAL_CRS", "0", 0); // (shader_compiler.cpp)
+    // (the meshlet culling task shader's grid walk ran past the GPU timeout on the Steam Deck: oot_ir_passes.h)
+    if (!std::getenv("OOT_MESH_NOCULL") && vk.properties.vendorID != 0x10DE) setenv("OOT_MESH_NOCULL", "1", 0);
 #endif
     robustness.robustBufferAccess2=vk.robust;
     robustness.robustImageAccess2=vk.robust;
