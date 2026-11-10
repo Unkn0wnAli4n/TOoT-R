@@ -337,6 +337,66 @@ void Transition(VkCommandBuffer cmd, Texture& t, VkImageLayout layout) {
 
 namespace {
 
+// Images of attachment textures (own memory) that go away are kept for the next texture of the same description:
+// OoT makes ~2 new render targets a frame, and the driver's vkCreateImage + vkAllocateMemory + bind cost the executor
+// ~2 ms of a frame. A kept image is as good as a new one (contents undefined, layout UNDEFINED to the first use).
+// OOT_NO_SPARE_IMAGES=1: destroyed at once, as before.
+using SpareKey = std::tuple<u32, u32, u32, u32, u32, u32, u32, u32, u32, u32>;
+struct SpareImage { VkImage image; VkDeviceMemory memory; u64 size; };
+std::mutex spare_mutex;
+std::multimap<SpareKey, SpareImage> spare_images;
+std::list<std::multimap<SpareKey, SpareImage>::iterator> spare_order; // oldest first
+u64 spare_bytes = 0;
+const u64 SpareBudget = std::getenv("OOT_SPARE_IMAGE_MB") ? std::strtoull(std::getenv("OOT_SPARE_IMAGE_MB"), nullptr, 10) << 20 : 192ull << 20;
+SpareKey SpareKeyOf(const VkImageCreateInfo& ii) {
+    return {(u32)ii.imageType, (u32)ii.format, ii.extent.width, ii.extent.height, ii.extent.depth, ii.mipLevels, ii.arrayLayers,
+            (u32)ii.samples, (u32)ii.usage, (u32)ii.flags};
+}
+bool TakeSpareImage(const VkImageCreateInfo& ii, Texture& t) {
+    static const bool off = std::getenv("OOT_NO_SPARE_IMAGES") != nullptr;
+    if (off) return false;
+    std::lock_guard lock{spare_mutex};
+    auto it = spare_images.find(SpareKeyOf(ii));
+    if (it == spare_images.end()) return false;
+    t.image = it->second.image; t.memory = it->second.memory; t.allocation_size = it->second.size; t.memory_offset = 0;
+    spare_bytes -= it->second.size;
+    spare_order.remove(it);
+    spare_images.erase(it);
+    return true;
+}
+void DestroySpare(const SpareImage& s) {
+    vkDestroyImage(Vk().device, s.image, nullptr);
+    vkFreeMemory(Vk().device, s.memory, nullptr);
+}
+void DropSpareImages() { // (low on memory)
+    std::lock_guard lock{spare_mutex};
+    for (auto& [k, s] : spare_images) DestroySpare(s);
+    spare_images.clear(); spare_order.clear(); spare_bytes = 0;
+}
+// (the image is no longer used by the GPU) true: kept.
+bool KeepSpareImage(const Texture& t) {
+    static const bool off = std::getenv("OOT_NO_SPARE_IMAGES") != nullptr;
+    if (off || !t.image || !t.memory || t.block || t.allocation_size > SpareBudget / 2) return false;
+    if (!(t.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))) return false;
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ii.imageType = t.target == Target::T3D ? VK_IMAGE_TYPE_3D : (t.target == Target::T1D || t.target == Target::T1DArray) ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
+    ii.format = t.info.vk; ii.extent = {t.width, t.height, t.target == Target::T3D ? t.depth : 1};
+    ii.mipLevels = t.levels; ii.arrayLayers = t.target == Target::T3D ? 1 : t.layers; ii.samples = (VkSampleCountFlagBits)t.samples; ii.usage = t.usage;
+    ii.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT; // (as CreateImage)
+    if ((t.target == Target::Cube || t.target == Target::CubeArray) && t.layers % 6 == 0) ii.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    if (t.target == Target::T3D) ii.flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
+    if (t.info.block_w > 1 && !t.decoded_astc) ii.flags |= VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
+    std::lock_guard lock{spare_mutex};
+    auto it = spare_images.emplace(SpareKeyOf(ii), SpareImage{t.image, t.memory, t.allocation_size});
+    spare_order.push_back(it);
+    spare_bytes += t.allocation_size;
+    while (spare_bytes > SpareBudget && !spare_order.empty()) {
+        auto old = spare_order.front(); spare_order.pop_front();
+        spare_bytes -= old->second.size; DestroySpare(old->second); spare_images.erase(old);
+    }
+    return true;
+}
+
 void CreateImage(Texture& t) {
     auto& vk = Vk();
     VkFormatProperties fp;
@@ -405,6 +465,7 @@ void CreateImage(Texture& t) {
     if (trace) { static std::mutex m; static std::map<std::tuple<u32,u32,u32,u32,u32,u32>, u64> made; static u64 n = 0; std::lock_guard l{m};
         ++made[{t.width, t.height, t.format, t.levels, t.layers, (u32)!!(ii.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))}];
         if (++n % 500 == 0) { for (auto& [k, c] : made) if (c > 4) RT_LOG("images made: %ux%u fmt %u levels %u layers %u attachment %u: %llu", std::get<0>(k), std::get<1>(k), std::get<2>(k), std::get<3>(k), std::get<4>(k), std::get<5>(k), (unsigned long long)c); made.clear(); RT_LOG("(500 images made)"); } }
+    if (TakeSpareImage(ii, t)) { image_live_bytes += t.allocation_size; if (t.decoded_astc) image_astc_bytes += t.allocation_size; NoteLive(t, 1); return; }
     VK_CHECK(vkCreateImage(vk.device, &ii, nullptr, &t.image));
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(vk.device, t.image, &req);
@@ -428,6 +489,7 @@ void CreateImage(Texture& t) {
         // submitting the command buffer being recorded crashed the driver. Released images free
         // after the current batch; until then this allocation falls back to other memory.)
         TrimImageCache(0);
+        DropSpareImages();
         allocated=vkAllocateMemory(vk.device,&ai,nullptr,&t.memory);
         if(allocated!=VK_SUCCESS){ai.memoryTypeIndex=FindMemoryType(req.memoryTypeBits,0);allocated=vkAllocateMemory(vk.device,&ai,nullptr,&t.memory);
             if(allocated==VK_SUCCESS)RT_LOG("texture placed in non-device-local memory");}
@@ -513,6 +575,7 @@ void DestroyLater(Texture* t) {
         for (auto& [key, view] : t->views) vkDestroyImageView(vk.device, view, nullptr);
         if (t->block || t->memory) NoteLive(*t,-1);
         if (t->block) {SubFree(*t);image_live_bytes-=t->allocation_size;if(t->decoded_astc)image_astc_bytes-=t->allocation_size;} // (before the image goes: it reads its size)
+        if (t->image && !t->block && t->memory && KeepSpareImage(*t)) { image_live_bytes-=t->allocation_size;if(t->decoded_astc)image_astc_bytes-=t->allocation_size; delete t; return; }
         if (t->image) vkDestroyImage(vk.device, t->image, nullptr);
         if (t->memory) {vkFreeMemory(vk.device, t->memory, nullptr);image_live_bytes-=t->allocation_size;if(t->decoded_astc)image_astc_bytes-=t->allocation_size;}
         delete t;
