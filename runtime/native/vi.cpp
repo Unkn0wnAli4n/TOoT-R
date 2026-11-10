@@ -50,7 +50,9 @@ NATIVE("_ZN2nn2vi21QueryDisplayHdrStatusEPbPNS0_15HdrOutputFormatEPtPKNS0_7Displ
     *Ptr<u16>(c, 2) = 0;
     Ret(c, 0);
 }
-NATIVE("_ZN2nn2vi24QueryDisplayVrrSupportedEPbPKNS0_7DisplayE") { *Ptr<u8>(c, 0) = 0; Ret(c, 0); }
+// (the engine's frame rate controller keeps a rate above 60 only with this: present.cpp's real-time step)
+namespace nvn { bool AboveSixty(); }
+NATIVE("_ZN2nn2vi24QueryDisplayVrrSupportedEPbPKNS0_7DisplayE") { *Ptr<u8>(c, 0) = nvn::AboveSixty() ? 1 : 0; Ret(c, 0); }
 NATIVE("_ZN2nn2vi25QueryDisplayHdrPaperWhiteEPtPKNS0_7DisplayE") { *Ptr<u16>(c, 0) = 203; Ret(c, 0); }
 NATIVE("_ZN2nn2vi30QueryDisplayCurrentRefreshRateEPNS0_11RefreshRateEPbPKNS0_7DisplayE") {
     *Ptr<u32>(c, 0) = 60; // RefreshRate: Hz
