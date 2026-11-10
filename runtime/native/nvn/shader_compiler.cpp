@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include "shader_compiler.h"
 #include "oot_ir_passes.h"
+#include "shader_recompiler/ir_opt/passes.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/backend/nvn_storage_descriptor.h"
 #include "shader_recompiler/environment.h"
@@ -208,6 +209,8 @@ Result Compile(const Request& request) {
         passes::GuardFragmentOutputs(program, float_targets);
     }
     passes::ScaleFogIntegration(program, passes::FogScale());
+    if (program.stage == Stage::Task && passes::MeshNoCull() && passes::MeshletCullingOff(program))
+        Shader::Optimization::DeadCodeEliminationPass(program);
     Shader::Profile profile{};
     profile.supported_spirv = 0x00010400; profile.unified_descriptor_binding = true;
     profile.min_ssbo_alignment = request.storage_alignment;
