@@ -17,7 +17,12 @@ function Say($msg) { Write-Host "[TOoT:R] $msg" -ForegroundColor Cyan }
 
 if (-not [Environment]::Is64BitOperatingSystem) { Say "a 64-bit Windows is required"; exit 1 }
 
+# (lines the graphical installer reads: which part of the installation begins)
+function Step($key) { Write-Host "@step $key" }
+$env:PYTHONUNBUFFERED = "1"
+
 # ---- MSYS2 ---------------------------------------------------------------------------------------
+Step "msys"
 $bash = Join-Path $Msys "usr\bin\bash.exe"
 if (-not (Test-Path $bash)) {
     Say "installing MSYS2 (build environment) into $Msys"
@@ -41,6 +46,7 @@ function Msys($cmd) {
     & $bash -lc $cmd
     if ($LASTEXITCODE -ne 0) { throw "MSYS2 command failed: $cmd" }
 }
+Step "packages"
 Say "updating MSYS2 and installing the build tools (this takes a while the first time)"
 & $bash -lc "pacman -Syu --noconfirm" | Out-Host   # (may update the core and stop; run twice)
 & $bash -lc "pacman -Syu --noconfirm" | Out-Host
@@ -49,6 +55,7 @@ $packages = "clang lld cmake ninja python pkgconf sdl3 opus ffmpeg vulkan-loader
 Msys ("pacman -S --needed --noconfirm " + ($packages -join " "))
 
 # ---- source ---------------------------------------------------------------------------------------
+Step "source"
 $source = $PSScriptRoot
 $temp = $null
 if (-not (Test-Path (Join-Path $source "tools\build_game.py"))) {
@@ -93,6 +100,7 @@ if ($LASTEXITCODE -ne 0) { Say "the build failed; see the messages above"; exit 
 if ($temp) { Remove-Item -Recurse -Force $temp -ErrorAction SilentlyContinue }
 
 # ---- shortcuts ------------------------------------------------------------------------------------
+Step "shortcuts"
 $data = $Dir
 $runner = Join-Path $data "tootr.cmd"
 @"

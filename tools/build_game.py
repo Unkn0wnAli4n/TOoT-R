@@ -31,6 +31,11 @@ def log(msg):
     print(f"[build] {msg}", flush=True)
 
 
+def step(key):
+    """A line the graphical installers read (installer/gui.py, installer/windows/setup.cpp): which part begins."""
+    print(f"@step {key}", flush=True)
+
+
 def fail(msg):
     print(f"[build] error: {msg}", file=sys.stderr, flush=True)
     sys.exit(1)
@@ -95,7 +100,7 @@ def game_key():
     h = hashlib.sha256()
     files = []
     for pattern in ["recompiler/*.cpp", "recompiler/CMakeLists.txt", "third_party/dynarmic/**/*",
-                    f"data/{VERSION}/*.overrides", "tools/module_info.py", "tools/setjmp_targets.py",
+                    f"data/{VERSION}/*.overrides", f"data/{VERSION}/*.entries", "tools/module_info.py", "tools/setjmp_targets.py",
                     "tools/oot_patches.py", "runtime/ops.h", "cmake/GameCode.cmake"]:
         files += [p for p in glob.glob(os.path.join(ROOT, pattern), recursive=True) if os.path.isfile(p)]
     for p in sorted(files):
@@ -161,6 +166,9 @@ def generate(tools, data, work):
         cmd = [os.path.join(tools, "recomp" + EXE), os.path.join(meta, name + ".img"), base,
                os.path.join(meta, name + ".functions.txt"), out, name,
                "--overrides", os.path.join(meta, name + ".overrides"), "--files", count, "--text-size", text_size]
+        entries = os.path.join(ROOT, "data", VERSION, name + ".entries")  # (extra block starts: the hook sites of tools/oot_patches.py)
+        if os.path.exists(entries):
+            cmd += ["--entries", entries]
         setjmp = os.path.join(meta, name + ".setjmp")
         if os.path.getsize(setjmp):
             cmd += ["--setjmp", setjmp]
@@ -181,10 +189,12 @@ def build_game_code(tools, data, work, jobs):
         return cached
     log("generating and compiling the game code (the long step: 15-60 minutes)")
     start = time.time()
+    step("translate")
     gen = generate(tools, data, work)
     build = os.path.join(work, "game-build")
     shutil.rmtree(build, ignore_errors=True)
     cmake_configure(ROOT, build, [f"-DGEN_DIR={gen}", "-DOOT_GAME_ONLY=ON"])
+    step("compile")
     run(["cmake", "--build", build, "--target", "game_code", "-j", str(jobs)])
     for old in glob.glob(os.path.join(work, "game_code-*.a")):
         os.remove(old)
@@ -197,8 +207,10 @@ def build_game_code(tools, data, work, jobs):
 
 def build_runtime(game_lib, work, prefix, jobs, debug):
     build = os.path.join(work, "runtime-build")
+    # (NVIDIA DLSS is built in only with NVIDIA's SDK, which is never part of this project: OOT_NGX_SDK=<its folder>)
+    ngx = os.environ.get("OOT_NGX_SDK", "")
     cmake_configure(ROOT, build, [f"-DOOT_GAME_LIB={game_lib}", f"-DCMAKE_INSTALL_PREFIX={prefix}",
-                                  f"-DOOT_DEBUG_INFO={'ON' if debug else 'OFF'}"])
+                                  f"-DOOT_DEBUG_INFO={'ON' if debug else 'OFF'}", f"-DOOT_NGX_SDK={ngx}"])
     run(["cmake", "--build", build, "-j", str(jobs)])
     run(["cmake", "--install", build] + ([] if debug else ["--strip"]))
     if not debug:  # (the installed copy is the one that runs; objects stay for incremental builds)
@@ -228,9 +240,12 @@ def main():
     for tool in ("cmake", "ninja", "clang++"):
         if not shutil.which(tool):
             fail(f"{tool} is not installed")
+    step("tools")
     tools = build_tools(work, jobs)
+    step("check")
     extract(a.nup and os.path.abspath(a.nup), tools, data)
     game_lib = build_game_code(tools, data, work, jobs)
+    step("runtime")
     build_runtime(game_lib, work, prefix, jobs, a.debug)
     log("done: " + os.path.join(prefix, "tootr" + EXE))
 

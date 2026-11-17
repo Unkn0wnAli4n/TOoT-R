@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """TOoT:R launcher, installer back end and auto-updater (Linux and Windows/MSYS2).
 
-    launcher.py install [--nup PATH] [--dir DIR] [--source DIR]
+    launcher.py install [--nup PATH] [--dir DIR] [--source DIR] [--toolchain ARCHIVE]
                                                        first install (asks for the game file and where
                                                        to install; the default place when none is given)
     launcher.py run [game args...]                     update if GitHub has a newer version, then play
@@ -13,6 +13,7 @@ launcher finds the one it was installed into, OOT_RECOMP_HOME overrides):
     source/     this project's source (replaced on update)
     app/        the built executable
     build/      build cache (offline tools, the compiled game code archive, runtime build)
+    toolchain/  the build environment the installer brought (Linux, optional: else the system's tools)
     config.json game path, installed commit
     save/, shader_cache/, pipeline_cache.bin, graphics.ini   created by the game
 The game's own files never leave the user's machine and are never uploaded anywhere.
@@ -160,7 +161,16 @@ def replace_dir(new, dest):
 
 def copy_source(src, dest):
     say(f"copying the source from {src}")
-    ignore = shutil.ignore_patterns(".git", ".dev", "build", "build-*", "work", "__pycache__", "*.log")
+    patterns = shutil.ignore_patterns(".git", ".dev", "dist", "build", "build-*", "work", "__pycache__", "*.log")
+
+    def ignore(folder, names):  # (and anything that is not a file or a folder: pipes, sockets, devices)
+        skipped = set(patterns(folder, names))
+        for name in names:
+            path = os.path.join(folder, name)
+            if not (os.path.isfile(path) or os.path.isdir(path)):
+                skipped.add(name)
+        return skipped
+
     tmp = dest + ".new"
     shutil.rmtree(tmp, ignore_errors=True)
     shutil.copytree(src, tmp, ignore=ignore)
@@ -224,13 +234,194 @@ def pick_install_dir():
     return default
 
 
+# ---- the build environment the installer brings (Linux) -----------------------------------------------
+# <install folder>/toolchain is a small Linux file system with the compilers, CMake, Ninja, Python and the libraries the
+# game links (tools/package/toolchain.sh makes it; the installer's AppImage carries it). The build runs inside it, in a
+# sandbox of its own (bubblewrap, which it brings too), so nothing is installed on the PC and no password is asked for:
+# what a Steam Deck needs, whose system is read-only. The libraries the game needs at run time are then copied beside
+# the executable (app/lib). Without that folder the system's own tools are used, as before.
+TOOLCHAIN_GLIBC = (2, 41)
+LIBC_FAMILY = ("libc.so", "libm.so", "libdl.so", "libpthread.so", "librt.so", "libresolv.so", "libutil.so")
+SKIP_LIBS = ("linux-vdso", "ld-linux", "libc.so", "libm.so", "libdl.so", "libpthread.so", "librt.so", "libresolv.so",
+             "libutil.so", "libvulkan.so", "libGL", "libEGL", "libgbm", "libdrm", "libstdc++.so", "libgcc_s.so")
+
+
+def toolchain():
+    path = os.path.join(ROOT, "toolchain")
+    return path if not WINDOWS and os.path.exists(os.path.join(path, "usr", "bin", "clang++")) else None
+
+
+def sandbox(tool, command, extra_binds=()):
+    """command as it runs inside the build environment at `tool`: the install folder is the same folder there."""
+    lib = os.path.join(tool, "usr", "lib")
+    cmd = [os.path.join(lib, "ld-linux-x86-64.so.2"), "--library-path", lib, os.path.join(tool, "usr", "bin", "bwrap"),
+           "--bind", tool, "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--bind", ROOT, ROOT]
+    for path in extra_binds:
+        cmd += ["--ro-bind", path, path]
+    cmd += ["--setenv", "PATH", "/usr/bin", "--setenv", "HOME", "/tmp", "--setenv", "LANG", "C.UTF-8", "--unsetenv", "LD_LIBRARY_PATH",
+            "--unsetenv", "PYTHONHOME", "--unsetenv", "PYTHONPATH", "--chdir", ROOT, "--die-with-parent"]
+    return cmd + list(command)
+
+
+def sandbox_works(tool):
+    try:
+        return subprocess.run(sandbox(tool, ["/usr/bin/true"]), capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def host_glibc():
+    """The system's C library version. Asked of the system's own programs: this Python may run on the installer's."""
+    import re
+    for cmd in (["getconf", "GNU_LIBC_VERSION"], ["ldd", "--version"]):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout.splitlines()[0]
+            m = re.search(r"(\d+)\.(\d+)\s*$", out)
+            if m:
+                return (int(m.group(1)), int(m.group(2)))
+        except (OSError, subprocess.SubprocessError, IndexError):
+            pass
+    return (0, 0)  # (unknown: the game then brings its own, which runs everywhere)
+
+
+def unpack_toolchain(archive):
+    """The installer's build environment into <install folder>/toolchain, with its progress said as it goes."""
+    dest = os.path.join(ROOT, "toolchain")
+    stamp = os.path.join(dest, ".archive")
+    mark = f"{os.path.getsize(archive)}"
+    try:
+        if open(stamp).read() == mark and toolchain():
+            say("the build tools are already unpacked")
+            return dest
+    except OSError:
+        pass
+    step("unpack")
+    if os.path.isdir(dest):  # (the sandbox makes folders of its own in there; an older one goes whole)
+        subprocess.run(["chmod", "-R", "u+rwX", dest], check=False)
+        shutil.rmtree(dest, ignore_errors=True)
+    os.makedirs(dest, exist_ok=True)
+    total = os.path.getsize(archive)
+    with open(archive, "rb") as raw, tarfile.open(fileobj=raw, mode="r|xz") as t:
+        shown = -1
+        for member in t:
+            if member.name.startswith("/") or ".." in member.name.split("/") or member.isdev():
+                continue
+            try:
+                t.extract(member, dest, filter="tar")
+            except TypeError:
+                t.extract(member, dest)
+            percent = int(raw.tell() * 100 / max(1, total))
+            if percent != shown:
+                shown = percent
+                progress(percent, member.name)
+    with open(stamp, "w") as f:
+        f.write(mark)
+    return dest
+
+
+def step(key):
+    """A line the graphical installers read: which part of the installation begins."""
+    print(f"@step {key}", flush=True)
+
+
+def progress(percent, what=""):
+    print(f"@progress {percent} {what}", flush=True)
+
+
+def bundle_libraries(tool):
+    """The libraries the executable loads that came from the build environment, beside it (app/lib), found before the system's."""
+    exe = os.path.join(APP, "tootr")
+    lib_dir = os.path.join(APP, "lib")
+    shutil.rmtree(lib_dir, ignore_errors=True)
+    os.makedirs(lib_dir, exist_ok=True)
+    listed = subprocess.run(sandbox(tool, ["ldd", exe]), capture_output=True, text=True).stdout
+    # A system whose C library is older than the build environment's cannot load the executable by itself: it then
+    # starts through the environment's own loader and C library, copied beside it too (cmd_run).
+    own_libc = host_glibc() < TOOLCHAIN_GLIBC or os.environ.get("TOOTR_OWN_LIBC") == "1"
+    copied = 0
+    late = []
+    for line in listed.splitlines():
+        parts = line.split()
+        if "=>" not in parts or len(parts) < 3 or not parts[2].startswith("/"):
+            continue
+        name, inside = os.path.basename(parts[0]), parts[2]
+        if inside.startswith(lib_dir) or name.startswith(("ld-linux", "linux-vdso")):
+            continue
+        source = os.path.realpath(os.path.join(tool, inside.lstrip("/")))
+        if not source.startswith(tool) or not os.path.isfile(source):
+            continue
+        if name.startswith(("libstdc++.so", "libgcc_s.so")):
+            late.append((name, source))
+        if own_libc and name.startswith(LIBC_FAMILY):
+            shutil.copyfile(source, os.path.join(lib_dir, name)); copied += 1
+            continue
+        if name.startswith(SKIP_LIBS):
+            continue
+        shutil.copyfile(source, os.path.join(lib_dir, name)); copied += 1
+    subprocess.run(sandbox(tool, ["patchelf", "--force-rpath", "--set-rpath", "$ORIGIN/lib", exe]), check=False)
+    # The C++ runtime is the system's when it is new enough (its graphics drivers need at least their own), else the
+    # build environment's.
+    cfg = load_config(); cfg["own_libc"] = own_libc; save_config(cfg)
+    if own_libc:
+        loader = os.path.join(lib_dir, "ld-linux-x86-64.so.2")
+        shutil.copyfile(os.path.realpath(os.path.join(tool, "usr", "lib", "ld-linux-x86-64.so.2")), loader)
+        os.chmod(loader, 0o755)
+        for name, source in late:
+            shutil.copyfile(source, os.path.join(lib_dir, name)); copied += 1
+        ok = subprocess.run([loader, "--library-path", lib_dir, "--list", exe], capture_output=True, text=True)
+        missing = [l.strip() for l in (ok.stdout + ok.stderr).splitlines() if "not found" in l]
+        say(f"{copied} libraries placed beside the game, with their own C library (this system's is older than the build tools')"
+            + (f"; still missing: {'; '.join(missing[:6])}" if missing else ""))
+        return not missing
+    check = subprocess.run(["ldd", exe], capture_output=True, text=True)
+    if "not found" in check.stdout + check.stderr:
+        for name, source in late:
+            shutil.copyfile(source, os.path.join(lib_dir, name)); copied += 1
+        check = subprocess.run(["ldd", exe], capture_output=True, text=True)
+    missing = [l.strip() for l in (check.stdout + check.stderr).splitlines() if "not found" in l]
+    say(f"{copied} libraries placed beside the game" + (f"; still missing on this system: {'; '.join(missing[:6])}" if missing else ""))
+    return not missing
+
+
 # ---- build -------------------------------------------------------------------------------------
-def build(source, nup):
-    cmd = [sys.executable, os.path.join(source, "tools", "build_game.py"),
-           "--data", ROOT, "--prefix", APP, "--work", os.path.join(ROOT, "build")]
+def fetch_dlss(source):
+    """NVIDIA's DLSS SDK, downloaded from NVIDIA's own repository onto this PC (tools/ngx_sdk.py: a pinned release, every
+    file checked against its SHA-256). It is never part of this project or of anything this installer ships: NVIDIA's files
+    are under NVIDIA's licence, which the user accepted in the installer (the "--dlss" option says so). The headers and
+    the library go to <install>/build/ngx-sdk for the build; DLSS's runtime libraries to <install>/ngx, where the game
+    looks for them. Returns the SDK folder, or None when the download failed (the build then leaves DLSS out)."""
+    sdk = os.path.join(ROOT, "build", "ngx-sdk")
+    step("dlss")
+    say("NVIDIA DLSS: downloading NVIDIA's DLSS SDK from github.com/NVIDIA/DLSS (NVIDIA's licence applies to it)")
+    cmd = [sys.executable, "-I", os.path.join(source, "tools", "ngx_sdk.py"), "--accept-nvidia-license",
+           "--platform", "windows" if WINDOWS else "linux", "--runtime-dir", os.path.join(ROOT, "ngx"), sdk]
+    try:
+        ok = subprocess.run(cmd).returncode == 0
+    except OSError:
+        ok = False
+    if not ok:
+        say("NVIDIA DLSS: the download did not finish: the game is built without DLSS (AMD FSR 3.1 still works). Install again to retry.")
+        return None
+    return sdk
+
+
+def build(source, nup, dlss=False):
+    args = [os.path.join(source, "tools", "build_game.py"), "--data", ROOT, "--prefix", APP, "--work", os.path.join(ROOT, "build")]
+    sdk = fetch_dlss(source) if dlss else None
+    os.environ["OOT_NGX_SDK"] = sdk or ""  # (tools/build_game.py passes it to CMake)
     if nup:
-        cmd += ["--nup", nup]
-    return subprocess.run(cmd).returncode == 0
+        args += ["--nup", nup]
+    tool = toolchain()
+    if tool and not sandbox_works(tool):
+        say("the build tools' sandbox cannot start on this system (unprivileged user namespaces are off): using the system's tools")
+        tool = None
+    if tool:
+        binds = [nup] if nup and os.path.exists(nup) and not os.path.abspath(nup).startswith(ROOT + os.sep) else []
+        if subprocess.run(sandbox(tool, ["python3"] + args, binds)).returncode != 0:
+            return False
+        step("libraries")
+        return bundle_libraries(tool)
+    return subprocess.run([sys.executable] + args).returncode == 0
 
 
 def write_shortcuts(source):
@@ -240,15 +431,21 @@ def write_shortcuts(source):
     os.makedirs(bin_dir, exist_ok=True)
     launcher = os.path.join(bin_dir, "tootr")
     with open(launcher, "w") as f:
+        tool = os.path.join(ROOT, "toolchain", "usr")
         f.write("#!/bin/sh\n# tootr: checks for updates, then starts the game.\n"
-                f'OOT_RECOMP_HOME="{ROOT}" exec python3 "{os.path.join(source, "installer", "launcher.py")}" run "$@"\n')
+                f'export OOT_RECOMP_HOME="{ROOT}"\n'
+                f'launcher="{os.path.join(source, "installer", "launcher.py")}"\n'
+                'if command -v python3 >/dev/null 2>&1; then exec python3 "$launcher" run "$@"; fi\n'
+                "# (no Python on this system: the one of the build tools the installer brought)\n"
+                f'PYTHONHOME="{tool}" exec "{tool}/lib/ld-linux-x86-64.so.2" --library-path "{tool}/lib" "{tool}/bin/python3" "$launcher" run "$@"\n')
     os.chmod(launcher, 0o755)
     apps = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share"), "applications")
     os.makedirs(apps, exist_ok=True)
     with open(os.path.join(apps, "tootr.desktop"), "w") as f:
+        icon = os.path.join(source, "installer", "tootr.png")
         f.write("[Desktop Entry]\nType=Application\nName=TOoT:R\n"
                 "Comment=Native PC port built from your own copy of the game\n"
-                f"Exec={launcher}\nTerminal=false\nCategories=Game;\n")
+                f"Exec={launcher}\nIcon={icon}\nTerminal=false\nCategories=Game;\n")
     say(f"installed the launcher: {launcher} (and an application menu entry)")
 
 
@@ -256,6 +453,8 @@ def cmd_install(args):
     nup = None
     src = None
     target = None
+    tool_archive = None
+    dlss = None  # (None: as the installation was made before)
     i = 0
     while i < len(args):
         if args[i] == "--nup":
@@ -264,6 +463,12 @@ def cmd_install(args):
             src = args[i + 1]; i += 2
         elif args[i] == "--dir":
             target = args[i + 1]; i += 2
+        elif args[i] == "--toolchain":
+            tool_archive = args[i + 1]; i += 2
+        elif args[i] == "--dlss":  # (NVIDIA DLSS: its SDK is downloaded from NVIDIA; the user accepted NVIDIA's licence)
+            dlss = True; i += 1
+        elif args[i] == "--no-dlss":
+            dlss = False; i += 1
         else:
             say("unknown option " + args[i]); sys.exit(2)
     if not nup:
@@ -291,12 +496,18 @@ def cmd_install(args):
             cfg["commit"] = commit_of_tree(src) or latest_commit(slug)
         except Exception:
             pass
+    if tool_archive and os.path.isfile(tool_archive):
+        unpack_toolchain(tool_archive)
     say("building (the first build compiles the whole game: this can take 15-60 minutes)")
-    if not build(SOURCE, nup):
+    if dlss is not None:
+        cfg["dlss"] = bool(dlss); save_config(cfg)
+    if not build(SOURCE, nup, bool(cfg.get("dlss"))):
         say("the build failed; see the messages above")
         sys.exit(1)
     save_config(cfg)
+    step("shortcuts")
     write_shortcuts(SOURCE)
+    step("done")
     say("installed into " + ROOT + ". Start the game with: " + ("the Start menu or desktop shortcut" if WINDOWS else "tootr"))
 
 
@@ -331,7 +542,7 @@ def update(force=False):
     except Exception as e:
         say(f"download failed ({e}); starting the installed version")
         return False
-    if build(SOURCE, cfg.get("nup")):
+    if build(SOURCE, cfg.get("nup"), bool(cfg.get("dlss"))):  # (DLSS as the installation chose it)
         shutil.rmtree(SOURCE + ".old", ignore_errors=True)
         cfg["commit"] = sha
         cfg["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -361,6 +572,9 @@ def cmd_run(args):
     env.setdefault("OOT_RECOMP_DATA", ROOT)
     if WINDOWS:
         return subprocess.run([exe] + args, env=env).returncode
+    loader = os.path.join(APP, "lib", "ld-linux-x86-64.so.2")
+    if cfg.get("own_libc") and os.path.exists(loader):  # (built against a newer C library than this system's: bundle_libraries)
+        os.execve(loader, [loader, "--library-path", os.path.join(APP, "lib"), exe] + args, env)
     os.execve(exe, [exe] + args, env)
 
 
