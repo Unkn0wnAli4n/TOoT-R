@@ -7,6 +7,40 @@ console's SDK and NVN graphics API are reimplemented on SDL3, Vulkan and FFmpeg.
 **This repository contains no game code or assets.** The installer builds the port from your own
 legally obtained dump of the game, on your machine.
 
+## What it can do
+
+- **Upscalers.** One *Upscaler* setting chooses what makes the picture: the game's own neural
+  network, **NVIDIA DLSS** (DLAA at the Native quality step, with a choice of DLSS model),
+  **AMD FSR 3.1** on any GPU, **AMD FSR 4** (experimental; it uses AMD's FSR 4 library for Vulkan
+  when your PC has one), or none, with or without FXAA. Quality steps from Native to Ultra
+  Performance, or a render resolution of your choice (540p to 1440p), and a sharpness control.
+- **Frame generation.** 2x and more, with NVIDIA DLSS Frame Generation where it runs and AMD
+  FSR 3.1's everywhere else. It never makes more frames than your display shows, and the FPS counter
+  shows the rate you see.
+- **High frame rates.** The game runs above 60 frames per second at the right speed: caps from 15
+  to 240, or uncapped. VSync on, off or adaptive (for variable refresh rate displays).
+- **Displays.** Windowed or fullscreen; the game's 16:9 picture, or one drawn for 4:3, 16:10, 21:9,
+  32:9 or your display's own shape, with the HUD at the screen's edges or kept in the middle. **HDR** output
+  (experimental) with peak brightness, paper white and highlight controls.
+- **Detail settings.** Presets from Low to Ultra and the original look; shadow quality, foliage
+  shadows, texture filtering, texture detail and more, each explained in the settings window.
+- **Controls.** Any controller with rumble and **gyro aiming**; keyboard and mouse with a direct
+  mouse camera and the **mouse as a pointer in the game's menus**. Every control can be rebound.
+- **Game options.** Field of view, camera speed, text speed, skipping the opening.
+- **Cheats and hacks.** Infinite health, rupees and magic; game speed.
+- **Game files.** Compressed `.nup` packages are read as well as uncompressed ones.
+
+NVIDIA DLSS is not part of this project and is not distributed with it. When you tick the DLSS
+option, the installer downloads NVIDIA's DLSS SDK from NVIDIA's own repository onto your PC, under
+NVIDIA's licence, which you accept there. Without it everything else works the same. DLSS is
+offered by the Linux installer for now; on Windows it is not built in yet.
+
+## Steam Deck: work in progress
+
+The Steam Deck build starts and plays, but it is **not finished**: the frame rate is not yet stable
+in the heavier areas, and long sessions can still stutter or stop. Expect problems, and please
+report what you find. PC (Linux and Windows) is the supported way to play for now.
+
 ## Requirements
 
 - An x86-64 PC with a Vulkan 1.3 GPU and driver supporting `VK_EXT_external_memory_host`
@@ -15,8 +49,8 @@ legally obtained dump of the game, on your machine.
 - Your dump of the game as a single **`.nup`** file containing update **v131072**
   (title ID `0400486024DEC000`). The installer checks the extracted code against known hashes and
   stops if the version does not match.
-- About 3 GB of free space while building, ~1 GB afterwards (plus the game file, which stays where
-  it is).
+- About 10 GB of free space while building (Windows: 16 GB, with MSYS2), ~3 GB afterwards (plus the
+  game file, which stays where it is).
 
 The first build compiles the whole game and takes roughly 15–60 minutes depending on the CPU.
 
@@ -25,26 +59,49 @@ The first build compiles the whole game and takes roughly 15–60 minutes depend
 Download the installer for your system from the
 [latest release](https://github.com/Unkn0wnAli4n/TOoT-R/releases/latest):
 
-- **Linux:** `TOoT-R-Installer-x86_64.AppImage`. Make it executable (`chmod +x`, or Properties →
-  Permissions) and open it.
+Join Discord for support:
+[discord](https://discord.gg/6j7FJ282np)
+
+- **Linux (and Steam Deck, work in progress):** `TOoT-R-Installer-x86_64.AppImage`. Make it executable (`chmod +x`, or
+  Properties → Permissions) and open it.
 - **Windows:** `TOoT-R-Installer.exe`.
 
-The installer asks for your game file and the folder to install into (leave it empty for the default:
-`~/.local/share/tootr` on Linux, `%LOCALAPPDATA%\tootr` on Windows), installs the build tools
-(Linux: your package manager, pacman, apt, dnf or zypper, after asking for your password; Windows:
-MSYS2), builds the game there, and adds a `tootr` command and an application menu entry (Linux) or
-Start menu and desktop shortcuts (Windows). The game, its saves and settings all live in the chosen
-folder. Distributions without SDL3 packages need SDL3 installed first.
+The installer finds or asks for your game file and the folder to install into (default:
+`~/.local/share/tootr` on Linux, `%LOCALAPPDATA%\tootr` on Windows), then shows each step of the
+installation with its progress, the file being compiled and the time left. When it is done it adds a
+`tootr` command and an application menu entry (Linux) or Start menu and desktop shortcuts (Windows).
+The game, its saves and settings all live in the chosen folder.
+
+**Linux needs nothing installed.** The AppImage carries its own build environment (compilers, CMake,
+Ninja, Python and the libraries the game uses), unpacks it into the install folder and builds inside
+it in a sandbox: no packages and no password, so it also installs on systems whose own files are
+read-only (SteamOS, Bazzite and other immutable distributions). The libraries the game needs are
+placed beside it. Only where a system allows no unprivileged sandboxes does the installer fall back
+to the distribution's packages (pacman, apt, dnf or zypper, after asking for your password). On
+Windows the build tools are MSYS2, set up automatically.
+
+**Steam Deck (work in progress, see above):** run the AppImage in Desktop Mode. Afterwards open
+Steam, choose *Games → Add a Non-Steam Game* and tick TOoT:R, and it appears in Gaming Mode. A first
+start on a Deck picks the Steam Deck graphics preset.
 
 From a clone of this repository the same installation runs in a terminal: `./install.sh` (Linux,
 `--nup FILE`, `--dir FOLDER`, `--no-deps`) or `install.cmd` (Windows).
 
 ## Playing
 
-Start **TOoT:R** from the menu, or run `tootr`. Controls: any SDL
-gamepad, or the keyboard (WASD move, arrows D-pad, J/K/U/I = A/B/X/Y, Q/E = L/R, Shift/Space =
-ZL/ZR, Enter = +, Backspace = −). **Insert** shows or hides the graphics settings window (mouse,
-keyboard or gamepad).
+Start **TOoT:R** from the menu, or run `tootr`. (Starting `app/tootr` in the install folder by hand
+works too.)
+
+**F1** or **Insert** shows or hides the settings window (**Select + Start** together on a
+controller): graphics, game, cheats, hacks, controller, and keyboard and mouse, each on its own tab. Every control
+can be rebound there: click a binding, then press the new key, mouse button or controller button.
+
+- **Controller:** any SDL gamepad, with rumble and gyro aiming. Nintendo or Xbox button layout,
+  dead zone, camera inversion.
+- **Keyboard and mouse:** WASD move, the mouse turns the camera (Escape frees the mouse, a click
+  takes it back), left click attack (Y), right click target (ZL), E = A, Shift = B, Space = X,
+  F = ZR, Q/R = L/R, Enter = +, M = −, 1-4 the D-pad, Caps Lock walks. **F11** or Alt+Enter
+  switches fullscreen.
 
 Data (saves, settings, shader caches) lives in the install folder.
 
@@ -72,19 +129,11 @@ tools/dev.sh build-run  # (re)build, then run
 
 ## Status
 
-The game boots, renders, and is playable with a controller. Performance and some rendering details
-are still in progress. The Windows port is new; please report issues.
-
-## Credits
-
-Built on [dynarmic](https://github.com/merryhime/dynarmic) (A64 decoder), the
-[Eden](https://git.eden-emu.dev/eden-emu/eden)/yuzu shader recompiler, [sirit](https://github.com/ReinUsesLisp/sirit),
-[Hookshot](https://github.com/NotRexed/Hookshot) (audio),
-[zbic](https://github.com/kinnay/zbic)/[Atmosphère](https://github.com/Atmosphere-NX/Atmosphere) (ZBIC
-decompression), AMD [FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) and
-[Dear ImGui](https://github.com/ocornut/imgui).
+The game is playable from start on PC with a controller or keyboard and mouse. Some rendering
+details are still in progress, the Windows port is less tested than Linux, and the Steam Deck is a
+work in progress. Please report issues.
 
 ## License
 
-GPL-3.0-or-later (see `LICENSE`). Third-party code under `third_party/` keeps its own license; see
-the PROVENANCE/LICENSE files there.
+GPL-3.0-or-later (see `LICENSE`). Third-party code under `third_party/` keeps its own license and
+notices; see the PROVENANCE/LICENSE files there.
