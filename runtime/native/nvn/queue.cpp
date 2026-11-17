@@ -4,6 +4,7 @@
 // the work submitted before it has completed, which the queue guarantees by finishing submissions
 // before returning from nvnQueueFlush/Finish and FenceSync.
 
+#include <cstring>
 #include <atomic>
 #ifdef __linux__
 #include <sys/syscall.h>
@@ -199,12 +200,18 @@ NATIVE("nvnWindowGetPresentInterval") { Ret(c, *reinterpret_cast<u32*>(c->x[0] +
 NATIVE("nvnWindowSetPresentInterval") { *reinterpret_cast<u32*>(c->x[0] + 0x20) = (u32)c->x[1] - 1; static u32 last = ~0u; if ((u32)c->x[1] != last) { last = (u32)c->x[1]; RT_LOG("window present interval %u", last); } }
 NATIVE("nvnWindowGetAcquireTimeout") { Ret(c, *reinterpret_cast<u64*>(c->x[0] + 0x28)); }
 NATIVE("nvnWindowSetAcquireTimeout") { *reinterpret_cast<u64*>(c->x[0] + 0x28) = c->x[1]; }
-NATIVE("nvnWindowSetCrop") {}
+// The part of the window's texture that is the picture: {x, y, width, height}. The handheld profile draws a 1920x1080
+// picture into the corner of its 2560x1440 textures and crops to it; shown whole, the picture filled three quarters of
+// the window (Steam Deck, 2026-11-16). The presenter shows the crop (present.cpp).
+NATIVE("nvnWindowSetCrop") {
+    static s32 last[4]{};
+    const s32 crop[4]{(s32)c->x[1], (s32)c->x[2], (s32)c->x[3], (s32)c->x[4]};
+    if (std::memcmp(crop, last, sizeof crop)) { std::memcpy(last, crop, sizeof crop); RT_LOG("window crop: %d,%d %dx%d", crop[0], crop[1], crop[2], crop[3]); }
+    nvn::SetWindowCrop(crop[0], crop[1], crop[2], crop[3]);
+}
 NATIVE("nvnWindowGetCrop") {
     s32* out = Ptr<s32>(c, 1);
-    out[0] = out[1] = 0;
-    out[2] = 1920;
-    out[3] = 1080;
+    nvn::GetWindowCrop(out);
 }
 NATIVE("nvnWindowSetHdrContentMetadata") {}
 NATIVE("nvnWindowSetHdrDisplayMetadata") {}

@@ -14,8 +14,18 @@
    free registered buffer (host memory: the pool's guest memory is not used). The video service itself (nn::gsv) is
    not emulated: nn::codec::video::Initialize does nothing. */
 #include <stdlib.h>
+#include <time.h>
 #include <string.h>
 
+/* (from Longshot ae7b1165) The decoder's input limit. The console's decoder takes only so much compressed data at a time: a
+   submission it has no room for fails with RESULT_INPUT_FULL (the game keeps the data and submits again later), and its
+   submission-ready event is clear until there is room. Here every submission was taken, so the movie player put a whole
+   movie in at once, and the thread that does it is also the one that takes the pictures: while it was busy submitting
+   (seconds, in step with the movie's length) it took a picture only every ~105 ms and the catch-up dropped the rest: a
+   movie started late and showed ~10 pictures a second at first. Now a submission is refused while INPUT_LIMIT wait (not
+   decoded, or decoded and not taken). The stream's last submission is always taken. HOS_VIDEO_INPUT_LIMIT=<n>, 0: none */
+#define RESULT_INPUT_FULL 0x1c266f   /* (module 111, description 3603) */
+#define INPUT_LIMIT 16
 #define RESULT_NO_OUTPUT 0x2a1ca   /* (a failure: "no picture yet"; the library polls again) */
 #define POOL_MAGIC 0x4c4f4f50u     /* 'POOL' */
 #define DEC_MAGIC 0x43454456u      /* 'VDEC' */
@@ -60,11 +70,28 @@ typedef struct {
     int eos;                         /* the last submission is in and decoded: an empty queue is the end */
     Pending *phead, *ptail;          /* submissions not decoded yet, oldest first */
     int64_t submits, acquires;
+    int npending;                    /* submissions not decoded yet (the list's length): the input limit's count */
+    int64_t refused;                 /* submissions refused while the decoder was full */
+    uint64_t ready;                  /* its submission-ready event (0: not asked for); ready_clear: clear now, the decoder full */
+    int ready_clear;
     int clock_set;                   /* (hookshot) the movie's clock: the picture at clock_pts was due at clock_ns */
     int64_t clock_ns, clock_pts;
     pthread_mutex_t lock;
 } Dec;
 
+static int input_limit(void) {
+    static int n = -1;
+    if (n < 0) { const char *e = getenv("HOS_VIDEO_INPUT_LIMIT"); n = e && *e ? atoi(e) : INPUT_LIMIT; if (n < 0) n = 0; }
+    return n;
+}
+static int input_full(int pending, int queued, int limit) { return limit > 0 && pending + queued >= limit; }
+/* the decoder's submission-ready event follows the rule: clear while it is full, signalled once there is room. Holding d->lock */
+static void input_room(Dec *d) {
+    if (!d->ready) return;
+    const int full = input_full(d->npending, d->qn, input_limit());
+    if (full && !d->ready_clear) { d->ready_clear = 1; hos_system_event_clear(d->ready); }
+    else if (!full && d->ready_clear) { d->ready_clear = 0; hos_system_event_signal(d->ready); }
+}
 static void *host_of(uint64_t obj, uint32_t magic) {
     if (!obj || G32(obj + 8) != magic) return NULL;
     return (void *)(uintptr_t)G64(obj);
@@ -107,6 +134,19 @@ HLE(_ZN2nn5codec26InitializeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTypeEPv
     o->count = (int)ARG(4) > 0 ? (int)ARG(4) : 1;
     o->rgba = (uint8_t *)calloc((size_t)o->count, (size_t)o->w * o->h * 4);
     o->nv12 = (uint8_t *)calloc((size_t)o->count, (size_t)o->w * o->h * 3 / 2);
+    /* (from Longshot 67451f4e) video black, not zeros. A buffer the game takes before the decoder's first picture is shown as
+       it is (dec_acquire: "nothing decoded, the buffer again", up to ~100 ms into a movie's start), and NV12 zeros are
+       bright green (luma 0 with no chroma): one green frame where a movie opens. Luma 16, chroma 128 is black; the RGBA
+       opaque black */
+    if (o->nv12) {
+        for (int i = 0; i < o->count; i++) {
+            uint8_t *img = o->nv12 + (size_t)i * o->w * o->h * 3 / 2;
+            memset(img, 0x10, (size_t)o->w * o->h);
+            memset(img + (size_t)o->w * o->h, 0x80, (size_t)o->w * o->h / 2);
+        }
+    }
+    if (o->rgba)
+        for (size_t k = 3; k < (size_t)o->count * o->w * o->h * 4; k += 4) o->rgba[k] = 0xff;
     o->mem = ARG(1), o->mem_size = ARG(2);
     if (video_log())
         hos_log("video: image pool %#llx: %dx%d format %d, %d images, memory %#llx+%#llx", (unsigned long long)ARG(0),
@@ -210,10 +250,13 @@ static void pending_free(Dec *d) {
         free(n);
     }
     d->ptail = NULL;
+    d->npending = 0;
 }
+static void ready_event_give_back(uint64_t event);
 static void dec_finalize(Ctx *c) {
     Dec *d = (Dec *)host_of(ARG(0), DEC_MAGIC);
     if (!d) return;
+    ready_event_give_back(d->ready);
     pending_free(d);
     for (int i = 0; i < d->qn; i++) picture_free(&d->queue[(d->qhead + i) % MAX_QUEUE]);
     if (d->sws) sws_freeContext(d->sws);
@@ -286,6 +329,7 @@ static void decode_next(Dec *d) {
         Pending *n = d->phead;
         d->phead = n->next;
         if (!d->phead) d->ptail = NULL;
+        if (d->npending > 0) d->npending--;
         if (d->mf) {   /* (hookshot) */
             if (n->pkt) {
                 d->eos = 0;
@@ -320,6 +364,7 @@ static void pending_push(Dec *d, AVPacket *pkt) {
     if (d->ptail) d->ptail->next = n;
     else d->phead = n;
     d->ptail = n;
+    d->npending++;
 }
 /* SubmitXDecoderInputBuffer(u64* id, decoder, data, size, TimeSpan pts, bool last): kept, decoded when a picture is
    acquired (the library submits a whole movie at once: its pictures decoded then would not fit any queue) */
@@ -329,6 +374,15 @@ static void dec_submit(Ctx *c) {
     if (ARG(0)) G64(ARG(0)) = (uint64_t)__atomic_add_fetch(&submissions, 1, __ATOMIC_RELAXED);
     if (!d || (!d->ctx && !d->mf)) { RET(0); return; }
     pthread_mutex_lock(&d->lock);
+    /* (no room now: counted, the ready event cleared, nothing taken; never the stream's last submission. It returns at once,
+       so the game's thread goes on to its Acquire, which makes the room) */
+    if (!(ARG(5) & 1) && input_full(d->npending, d->qn, input_limit())) {
+        d->refused++;
+        input_room(d);
+        pthread_mutex_unlock(&d->lock);
+        RET(RESULT_INPUT_FULL);
+        return;
+    }
     if (ARG(2) && ARG(3)) {
         AVPacket *pkt = av_packet_alloc();
         if (pkt && av_new_packet(pkt, (int)ARG(3)) == 0) {
@@ -344,6 +398,7 @@ static void dec_submit(Ctx *c) {
     if (video_log() && (d->submits <= 8 || (ARG(5) & 1)))
         hos_log("video: submit %lld (%llu bytes, pts %lld%s)", (long long)d->submits, (unsigned long long)ARG(3),
                 (long long)ARG(4), (ARG(5) & 1) ? ", last" : "");
+    input_room(d);
     pthread_mutex_unlock(&d->lock);
     RET(0);
 }
@@ -359,6 +414,10 @@ static void dec_flush(Ctx *c) {
         d->eos = 0;
         d->clock_set = 0;
         for (int i = 0; i < MAX_SLOTS; i++) d->slot_last[i] = 0;
+        if (d->refused && video_log()) hos_log("video: %lld submissions were put off while %d waited", (long long)d->refused, input_limit());
+        d->refused = 0;
+        d->submits = 0;  /* (tootr: the next stream starts as the first did) */
+        input_room(d);   /* (emptied: there is room again) */
         pthread_mutex_unlock(&d->lock);
     }
     RET(0);
@@ -383,7 +442,13 @@ static void dec_acquire(Ctx *c) {
        by another thread's submission; then a free buffer as it was, so the caller is never refused) */
     pthread_mutex_lock(&d->lock);
     decode_pending(d);
-    for (int tries = 0; !d->qn && !d->eos && tries < 50; tries++) {
+    /* (tootr) not before the stream's first submission: the game takes its first buffers before it submits anything, and
+       each of those waited the whole ~100 ms for a picture that could not come: a movie started ~0.3 s late */
+    /* (100 ms by the clock: 50 sleeps of 2 ms take 250 ms where a sleep is 4-5 ms - Longshot cc04531b) */
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int tries = 0; !d->qn && !d->eos && d->submits > 0 && tries < 50; tries++) {
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+        if ((now.tv_sec - t0.tv_sec) * 1000000000LL + (now.tv_nsec - t0.tv_nsec) > 100000000LL) break;
         pthread_mutex_unlock(&d->lock);
         hos_sleep_ns(2000000);
         pthread_mutex_lock(&d->lock);
@@ -403,6 +468,8 @@ static void dec_acquire(Ctx *c) {
         if (d->eos) d->slot_last[slot] = 1;
         if (video_log()) hos_log("video: acquire %lld: nothing decoded%s, buffer %d again", (long long)d->acquires,
                                  d->eos ? " (the end)" : "", slot);
+        else if (d->acquires == 1 && !d->eos) hos_log("video: the first buffer went out before the first picture was decoded (shown black)");
+        input_room(d);   /* (the pending ones were decoded on) */
         pthread_mutex_unlock(&d->lock);
         if (ARG(0)) G32(ARG(0)) = (uint32_t)slot;
         RET(0);
@@ -480,6 +547,7 @@ static void dec_acquire(Ctx *c) {
     }
     picture_free(p);
     d->qhead = (d->qhead + 1) % MAX_QUEUE, d->qn--;
+    input_room(d);   /* (a picture taken, the skipped ones gone: the game may submit again) */
     pthread_mutex_unlock(&d->lock);
     if (ARG(0)) G32(ARG(0)) = (uint32_t)slot;
     RET(0);
@@ -505,12 +573,55 @@ static void dec_properties(Ctx *c) {
     if (ARG(5)) *(uint8_t *)GP(ARG(5)) = d && i < MAX_SLOTS ? (uint8_t)d->slot_last[i] : 0;
     RET(0);
 }
-static uint64_t ready_event(Ctx *c) {
-    static uint64_t event;
+/* GetXDecoderSubmissionReadyEvent(decoder): the decoder's own event, signalled while it has room (input_room). It was one
+   event for all, signalled for ever. The events are never freed, so a decoder that ends gives its event back, signalled,
+   for the next one: a game still holding it sees "ready", as before */
+static pthread_mutex_t ready_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t ready_spare[8];
+static int nready_spare;
+static void ready_event_give_back(uint64_t event) {
+    if (!event) return;
+    hos_system_event_signal(event);
+    pthread_mutex_lock(&ready_lock);
+    if (nready_spare < (int)(sizeof ready_spare / sizeof ready_spare[0])) ready_spare[nready_spare++] = event;
+    pthread_mutex_unlock(&ready_lock);
+}
+static uint64_t ready_event_new(Ctx *c) {
+    pthread_mutex_lock(&ready_lock);
+    uint64_t event = nready_spare ? ready_spare[--nready_spare] : 0;
+    pthread_mutex_unlock(&ready_lock);
     if (!event) {
-        static uint8_t storage[0x40] __attribute__((aligned(16))); event = (uint64_t)(uintptr_t)storage; /* (zeroed, never freed) */
+        void *storage = NULL;
+#ifdef _WIN32
+        storage = _aligned_malloc(0x40, 16); if (!storage) return 0;   /* (zeroed, never freed) */
+#else
+        if (posix_memalign(&storage, 16, 0x40)) return 0;   /* (zeroed, never freed) */
+#endif
+        memset(storage, 0, 0x40);
+        event = (uint64_t)(uintptr_t)storage;
         hos_system_event_init(event, 0);
-        hos_system_event_signal(event);
+    }
+    hos_system_event_signal(event);
+    return event;
+}
+static uint64_t ready_event(Ctx *c) {
+    Dec *d = (Dec *)host_of(ARG(0), DEC_MAGIC);
+    if (!d) {   /* (a decoder this file does not know: an event that is always ready, as before) */
+        static uint64_t event;
+        if (!event) event = ready_event_new(c);
+        return event;
+    }
+    pthread_mutex_lock(&d->lock);
+    uint64_t event = d->ready;
+    pthread_mutex_unlock(&d->lock);
+    if (!event) {   /* (made without the decoder's lock: making one calls into the SDK) */
+        event = ready_event_new(c);
+        pthread_mutex_lock(&d->lock);
+        if (!d->ready) { d->ready = event; d->ready_clear = 0; input_room(d); event = 0; }
+        const uint64_t have = d->ready;
+        pthread_mutex_unlock(&d->lock);
+        if (event) ready_event_give_back(event);   /* (another thread was first) */
+        event = have;
     }
     return event;
 }

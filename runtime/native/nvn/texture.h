@@ -72,7 +72,7 @@ void EnsureImage(Texture& t);
 void EnsureUploaded(Texture& t);
 void AdoptCachedImage(Texture& t);
 void ReportImageCache(); // (diagnostics, every 300 frames)
-void TrimImageCache(u64 keep_bytes); // releases cached GPU-written images beyond keep_bytes
+void TrimImageCache(u64 keep_bytes, bool small_too = true); // releases cached GPU-written images beyond keep_bytes
 void RetireTexture(Texture* t); // takes ownership; destruction waits for pending GPU work
 struct TextureCopy;
 std::vector<u8> ReadTexels(Texture& t);

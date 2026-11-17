@@ -15,7 +15,11 @@ void ConvertDepthMode(EmitContext& ctx) {
     const Id position{ctx.OpLoad(ctx.F32[4], ctx.output_position)};
     const Id z{ctx.OpCompositeExtract(type, position, 2u)};
     const Id w{ctx.OpCompositeExtract(type, position, 3u)};
-    const Id screen_depth{ctx.OpFMul(type, ctx.OpFAdd(type, z, w), ctx.Constant(type, 0.5f))};
+    // (exact, each on its own: see the mesh epilogue's ConvertDepth)
+    const Id sum{ctx.OpFAdd(type, z, w)};
+    ctx.Decorate(sum, spv::Decoration::NoContraction);
+    const Id screen_depth{ctx.OpFMul(type, sum, ctx.Constant(type, 0.5f))};
+    ctx.Decorate(screen_depth, spv::Decoration::NoContraction);
     const Id vector{ctx.OpCompositeInsert(ctx.F32[4], screen_depth, position, 2u)};
     ctx.OpStore(ctx.output_position, vector);
 }

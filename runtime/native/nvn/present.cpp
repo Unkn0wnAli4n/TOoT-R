@@ -1,3 +1,4 @@
+#include <filesystem>
 #ifdef __linux__
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -7,6 +8,7 @@
 #include "overlay.h"
 #include <cstring>
 #include "../graphics_settings.h"
+#include "../input_settings.h"
 extern "C" volatile int oot_fixed_resolution, oot_dynres_runs;
 extern "C" volatile unsigned oot_fixed_scale_bits;
 extern "C" volatile unsigned long long oot_dynres_context;
@@ -26,10 +28,15 @@ extern "C" volatile unsigned long long oot_dynres_context;
 #include "present.h"
 #include "commands.h"
 #include "texture.h"
+#include <condition_variable>
+#include <thread>
 #include "batch.h"
+#include "output.h"
+#include "longshot_upscale.h"
 #include "pipeline_list.h"
 
 std::atomic<int> profile_present_tid{0}; // (profiler.cpp: OOT_PROFILE_WALL=present)
+namespace cheats { void Tick(); } // (cheats.cpp)
 namespace nvn {
 namespace {
 
@@ -49,6 +56,7 @@ struct Swapchain {
 
 Swapchain sc;
 int built_vsync = -1; // (the Graphics screen's VSync the swapchain was built with)
+int built_output = -1; // (and what output.cpp asked of it: HDR)
 
 // OOT_PRESENT_DUMP=<dir>: every 300th presented image is written to <dir>/frame-<n>.ppm (and the next one
 // after <dir>/snap appears).
@@ -116,8 +124,10 @@ void Build() {
     info.surface = vk.surface;
     info.minImageCount = std::max(3u, caps.minImageCount);
     if (caps.maxImageCount) info.minImageCount = std::min(info.minImageCount, caps.maxImageCount);
-    info.imageFormat = sc.format;
-    info.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    const output::Surface surface = output::Choose(sc.format); // (an HDR surface where the HDR row asks and the system offers)
+    built_output = output::Signature();
+    info.imageFormat = surface.format;
+    info.imageColorSpace = surface.space;
     info.imageExtent = sc.extent;
     info.imageArrayLayers = 1;
     info.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -136,6 +146,11 @@ void Build() {
         built_vsync = gfx::Current().vsync;
         for (VkPresentModeKHR m : modes) if (m == VK_PRESENT_MODE_MAILBOX_KHR) info.presentMode = m;
         if (!vsync) for (VkPresentModeKHR m : modes) if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) info.presentMode = m;
+        // (Adaptive: every frame shown whole, each as soon as it is ready - FIFO; a late one right away where the
+        // system has that mode. With the cap under the refresh rate the queue never fills, so nothing waits.)
+        if (gfx::Current().vsync == 2) { info.presentMode = VK_PRESENT_MODE_FIFO_KHR; for (VkPresentModeKHR m : modes) if (m == VK_PRESENT_MODE_FIFO_RELAXED_KHR) info.presentMode = m; }
+        if (const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(Vk().window)); mode && mode->refresh_rate > 1) gfx::display_refresh.store(mode->refresh_rate);
+        static int said = -1; if (said != (int)info.presentMode) { said = (int)info.presentMode; RT_LOG("present mode %d (0 immediate, 1 mailbox, 2 fifo, 3 fifo relaxed), display %.1f Hz", said, gfx::display_refresh.load()); }
     }
     info.clipped = VK_TRUE;
     info.oldSwapchain = sc.swapchain;
@@ -212,7 +227,15 @@ void NoteFrameForLoading() { // (the game's thread, once a frame)
 }
 int EffectiveFrameCap() {
     static const bool uncapped = std::getenv("OOT_UNCAPPED") != nullptr;
-    return uncapped || loading.load(std::memory_order_relaxed) ? 0 : gfx::Current().frame_cap;
+    if (uncapped || loading.load(std::memory_order_relaxed)) return 0;
+    int cap = gfx::Current().frame_cap;
+    // (VSync at Adaptive: a variable refresh rate display follows the game only below its own top rate - past it the
+    // display falls back to waiting for it, with the delay of plain vsync. Frames are held 3% under it.)
+    if (gfx::Current().vsync == 2) if (const double hz = gfx::display_refresh.load(std::memory_order_relaxed); hz > 30) {
+        const int under = (int)(hz * 0.97);
+        if (!cap || cap > under) cap = under;
+    }
+    return cap;
 }
 // The game may run above 60 frames per second: its engine takes such rates only with a variable refresh rate display.
 bool AboveSixty() {
@@ -243,7 +266,8 @@ void RealtimeStep() {
     // (the engine takes any rate: it steps by 60 / rate, so 90 or 120 give steps of 2/3 and 1/2 of a 60 Hz frame)
     const int cap = EffectiveFrameCap();
     const int max_fps = cap ? cap : 1000;
-    double ratio = std::clamp(sum / count * 60.0 + carry, 60.0 / max_fps, 4.0);
+    // (the Hacks tab's Game Speed: the step the engine takes for the time that passed, scaled)
+    double ratio = std::clamp((sum / count * 60.0 + carry) * gfx::Current().game_speed / 100.0, 60.0 / max_fps, 4.0);
     const int fps = std::clamp((int)(60.0 / ratio + 0.5), 15, max_fps);
     carry = std::clamp(ratio - 60.0 / fps, -0.5, 0.5);
     // OOT_SPEED_TRACE=1: the game's speed, from the step the engine took (its global, 60 / the rate it accepted) against the clock.
@@ -265,6 +289,37 @@ void RealtimeStep() {
     if (steps++ % 3000 == 0) RT_LOG("real-time step: ratio %.3f, game frame rate %d", ratio, fps);
 }
 }
+// Window events that are the player's input: the mouse for the camera and its bound buttons, and the window's own keys
+// (Escape lets the mouse go, F11 or Alt+Enter switch fullscreen).
+static void InputEvent(const SDL_Event& e) {
+    switch (e.type) {
+    case SDL_EVENT_MOUSE_MOTION:
+        if (input::captured.load(std::memory_order_relaxed)) input::MouseMoved(e.motion.xrel, e.motion.yrel);
+        else { const float d = SDL_GetWindowPixelDensity(Vk().window); input::PointerAt(e.motion.x * d, e.motion.y * d, !nvn::overlay::Shown()); } // (the game's menus: a pointer)
+        break;
+    case SDL_EVENT_WINDOW_MOUSE_LEAVE: input::PointerAt(0, 0, false); break;
+    case SDL_EVENT_MOUSE_WHEEL:
+        if (!input::captured.load() && input::MenuPointerLive() && !nvn::overlay::Shown()) input::PointerWheel(e.wheel.y);
+        else input::MouseWheel(e.wheel.y);
+        break;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        if (input::captured.load()) input::MouseButton(e.button.button, true);
+        else if (nvn::overlay::Shown()) {}
+        else if (input::MenuPointerLive()) { const float d = SDL_GetWindowPixelDensity(Vk().window); input::PointerAt(e.button.x * d, e.button.y * d, true); input::PointerPress(e.button.button); }
+        else input::release_asked = false;
+        break;
+    case SDL_EVENT_MOUSE_BUTTON_UP: input::MouseButton(e.button.button, false); break;
+    case SDL_EVENT_KEY_DOWN:
+        if (e.key.repeat) break;
+        if (e.key.scancode == SDL_SCANCODE_ESCAPE && input::captured.load()) input::release_asked = true;
+        if (e.key.scancode == SDL_SCANCODE_F11 || (e.key.scancode == SDL_SCANCODE_RETURN && (e.key.mod & SDL_KMOD_ALT))) {
+            gfx::Settings g = gfx::Current(); g.display_mode = g.display_mode ? 0 : 1; gfx::Set(g);
+        }
+        break;
+    default: break;
+    }
+}
+
 void PresentPacing() {
     // (game thread time per frame: its own work since the last call, and the waits in here)
     static auto left = std::chrono::steady_clock::now(); static double work_ms = 0, wait_ms = 0; static u32 calls = 0;
@@ -310,6 +365,7 @@ void PresentPacing() {
         } else next = std::chrono::steady_clock::now();
     }
     RealtimeStep();
+    cheats::Tick();
     {   // Frame intervals (smoothness): median, 99th percentile, worst, and how many missed a 60 Hz refresh.
         static auto last = std::chrono::steady_clock::now();
         static std::vector<float> intervals; intervals.reserve(600);
@@ -326,7 +382,7 @@ void PresentPacing() {
     }
     {   // Render scale: the engine's fixed-resolution path at the chosen scale (after its dynamic path ran
         // a few frames, which fills fields the 3D reads); 0 keeps the game's own dynamic resolution.
-        const int scale = gfx::Current().render_scale;
+        const int scale = gfx::EffectiveRenderScale(); // (the Render Resolution row's, or the Upscaler Quality's with DLSS / FSR)
         const float v = scale / 100.0f; unsigned bits; std::memcpy(&bits, &v, 4);
         if (scale) oot_fixed_scale_bits = bits;
         oot_fixed_resolution = scale > 0 && oot_dynres_runs >= 30;
@@ -345,7 +401,7 @@ void PresentPacing() {
         if (applied != gfx::Generation()) {
             applied = gfx::Generation();
             const auto& g = gfx::Current();
-            static const int sizes[][2] = {{0, 0}, {1280, 720}, {1600, 900}, {1920, 1080}, {2560, 1440}, {3840, 2160}};
+            static const int sizes[][2] = {{0, 0}, {1280, 720}, {1600, 900}, {1920, 1080}, {2560, 1440}, {3840, 2160}, {1280, 800}, {1920, 1200}, {2560, 1600}, {3440, 1440}};
             SDL_SetWindowFullscreen(Vk().window, g.display_mode == 1);
             // (sizes are real pixels; SDL takes window coordinates, which a scaled desktop divides)
             const float density = std::max(0.25f, SDL_GetWindowPixelDensity(Vk().window));
@@ -355,7 +411,24 @@ void PresentPacing() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT) { SavePipelineCacheBlocking(); plist::Save(true); std::_Exit(0); }
+        InputEvent(e);
         nvn::overlay::Event(e);
+    }
+    // The mouse is the game's (hidden, its motion the camera's) while the window has the focus, the settings window is
+    // closed, a mouse camera is chosen and Escape has not let it go; a click in the window takes it again.
+    {
+        static const bool hidden = std::getenv("OOT_WINDOW_HIDDEN") != nullptr;
+        const bool focused = (SDL_GetWindowFlags(Vk().window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+        // (and no menu of the game's has the pointer: over those the mouse points and clicks, engine_hooks.cpp)
+        const bool menu = input::Current().mouse_menus && input::MenuPointerLive();
+        const bool want = !hidden && focused && input::Current().mouse_camera != 0 && !nvn::overlay::Shown() && !input::release_asked.load() && !menu;
+        if (want != input::captured.load()) {
+            if (SDL_SetWindowRelativeMouseMode(Vk().window, want) || !want) {
+                input::captured = want;
+                if (!want) for (int b = 1; b <= 5; ++b) input::MouseButton(b, false);
+                float dx, dy; input::TakeMotion(dx, dy); // (nothing from before counts)
+            }
+        }
     }
 }
 // One frame of the pre-game progress screen (prewarm.cpp), on the thread that polls events: the window cleared and the
@@ -368,7 +441,7 @@ bool PresentProgress(const overlay::Progress& progress) {
     {
         int pw = 0, ph = 0; SDL_GetWindowSizeInPixels(vk.window, &pw, &ph);
         const bool resized = pw > 0 && ph > 0 && ((u32)pw != sc.extent.width || (u32)ph != sc.extent.height);
-        if (built_vsync != gfx::Current().vsync || resized) { std::lock_guard lock{vk.queue_mutex}; std::lock_guard copy{vk.copy_mutex}; vkDeviceWaitIdle(vk.device); Build(); }
+        if (built_vsync != gfx::Current().vsync || built_output != output::Signature() || resized) { std::lock_guard lock{vk.queue_mutex}; std::lock_guard copy{vk.copy_mutex}; vkDeviceWaitIdle(vk.device); Build(); }
     }
     u32 image_index;
     VkResult r = vkAcquireNextImageKHR(vk.device, sc.swapchain, 100'000'000, sc.acquired, VK_NULL_HANDLE, &image_index);
@@ -380,7 +453,9 @@ bool PresentProgress(const overlay::Progress& progress) {
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(sc.cmd, &bi);
-    const VkImage dst = sc.images[image_index];
+    // (composed into the swapchain's image, or into output.cpp's on its way to an HDR one)
+    const VkImage swap_image = sc.images[image_index];
+    const VkImage dst = output::Intermediate() ? output::Target(sc.extent, sc.format) : swap_image;
     VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -406,7 +481,9 @@ bool PresentProgress(const overlay::Progress& progress) {
         vkCmdCopyImageToBuffer(sc.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dump.buffer, 1, &copy);
         last = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     }
+    if (dst != swap_image) { output::ToSwapchain(sc.cmd, last, swap_image, sc.extent); last = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; }
     VkImageMemoryBarrier to_present = to_dst;
+    to_present.image = swap_image;
     to_present.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT; to_present.dstAccessMask = 0;
     to_present.oldLayout = last; to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     vkCmdPipelineBarrier(sc.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_present);
@@ -428,6 +505,108 @@ bool PresentProgress(const overlay::Progress& progress) {
 }
 
 // In the presenting queue's order: after the frame's rendering was recorded.
+std::atomic<s32> window_crop[4]{};
+void SetWindowCrop(s32 x, s32 y, s32 w, s32 h) { window_crop[0] = x; window_crop[1] = y; window_crop[2] = w; window_crop[3] = h; }
+void GetWindowCrop(s32* out) {
+    for (int i = 0; i < 4; ++i) out[i] = window_crop[i].load(std::memory_order_relaxed);
+    if (out[2] <= 0 || out[3] <= 0) { out[0] = out[1] = 0; out[2] = 1920; out[3] = 1080; } // (never set: as answered before)
+}
+namespace {
+// ---- frame generation's presenting thread (output.h fg) ----------------------------------------------------------------
+// With Frame Generation on, the thread that finishes the game's frames (PresentWindowTexture) composes each one, has
+// the frames between it and the one before made (output::fg::Generate: NVIDIA DLSS Frame Generation or AMD FSR 3.1's,
+// the vendored engines) and posts the set here. This thread shows the made frames one after another, evenly spaced over
+// the game's frame time, and the game's own frame last - so the game's thread never waits for the display, at the price
+// of one frame's time of delay. The swapchain and fg's pictures are this thread's while a set is shown (swap_mutex): the
+// other thread takes it before it records the next set. OOT_FRAME_GEN=<n> forces the multiplier.
+std::mutex swap_mutex;
+struct FgPresenter {
+    std::mutex m; std::condition_variable cv;
+    int slot = -1, made = 0; double interval = 1.0 / 30; std::chrono::steady_clock::time_point posted_at; bool pending = false;
+    std::atomic<bool> rebuild_wanted{false};
+    std::once_flag started;
+    std::atomic<u64> shown{0};
+    std::atomic<float> shown_fps{0};
+} fgp;
+bool FgWanted() {
+    static const char* forced = std::getenv("OOT_FRAME_GEN");
+    return forced ? std::atoi(forced) > 1 : gfx::Current().frame_gen > 1;
+}
+void FgLoop() {
+    rt::SetThreadName("frame-gen");
+    auto& vk = Vk();
+    constexpr int Steps = output::fg::MostMade + 1;
+    VkCommandPool pool; VkCommandBuffer cmds[Steps]; VkFence fences[Steps]; VkSemaphore acquired[Steps]; int used = 0;
+    {
+        VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; pi.queueFamilyIndex = vk.queue_family;
+        VK_CHECK(vkCreateCommandPool(vk.device, &pi, nullptr, &pool));
+        VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO}; ai.commandPool = pool; ai.commandBufferCount = Steps; VK_CHECK(vkAllocateCommandBuffers(vk.device, &ai, cmds));
+        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        for (int i = 0; i < Steps; ++i) { VK_CHECK(vkCreateFence(vk.device, &fi, nullptr, &fences[i])); VK_CHECK(vkCreateSemaphore(vk.device, &si, nullptr, &acquired[i])); }
+    }
+    u64 cycles = 0, shown_before = 0, made_total = 0; auto report_at = std::chrono::steady_clock::now(), rate_at = report_at; u64 rate_before = 0; int said = -1;
+    for (;;) {
+        int slot, made; double interval; std::chrono::steady_clock::time_point at;
+        { std::unique_lock lock{fgp.m}; fgp.cv.wait(lock, [] { return fgp.pending; }); fgp.pending = false; slot = fgp.slot; made = fgp.made; interval = fgp.interval; at = fgp.posted_at; }
+        std::lock_guard swap{swap_mutex};
+        if (used) { VK_CHECK(vkWaitForFences(vk.device, (u32)used, fences, VK_TRUE, UINT64_MAX)); VK_CHECK(vkResetFences(vk.device, (u32)used, fences)); used = 0; }
+        if (!sc.swapchain || fgp.rebuild_wanted.load()) continue;
+        if (made != said) { said = made; if (made) RT_LOG("frame generation: %d made for each of the game's frames by %s (%.0f fps of the game's)", made, ls::FrameMaker(), 1.0 / interval); }
+        const int steps = made + 1;
+        bool failed = false;
+        for (int i = 0; i < steps && !failed; ++i) {
+            // (a newer set is waiting: the rest of this one is too late to show. Its own frame is shown in place of the
+            // made ones left, so the game's frames always reach the display)
+            bool overtaken; { std::lock_guard lock{fgp.m}; overtaken = fgp.pending; }
+            if (overtaken && i < made) i = made;
+            const VkCommandBuffer cmd = cmds[i];
+            VK_CHECK(vkResetCommandBuffer(cmd, 0));
+            VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            u32 image_index = 0;
+            const VkResult got = vkAcquireNextImageKHR(vk.device, sc.swapchain, 100'000'000, acquired[i], VK_NULL_HANDLE, &image_index);
+            if (got == VK_ERROR_OUT_OF_DATE_KHR) { fgp.rebuild_wanted = true; break; }
+            if (got != VK_SUCCESS && got != VK_SUBOPTIMAL_KHR) break; // (a hidden window: nothing shown)
+            VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
+            if (i < made) output::fg::ShowMade(cmd, i, sc.images[image_index], sc.extent);
+            else output::fg::ShowSlot(cmd, slot, sc.images[image_index], sc.extent);
+            VkImageMemoryBarrier to_present{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            to_present.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; to_present.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            to_present.srcQueueFamilyIndex = to_present.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; to_present.image = sc.images[image_index]; to_present.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_present);
+            VK_CHECK(vkEndCommandBuffer(cmd));
+            const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+            VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO}; submit.waitSemaphoreCount = 1; submit.pWaitSemaphores = &acquired[i]; submit.pWaitDstStageMask = &wait_stage;
+            submit.commandBufferCount = 1; submit.pCommandBuffers = &cmd; submit.signalSemaphoreCount = 1; submit.pSignalSemaphores = &sc.rendered[image_index];
+            { std::lock_guard queue{vk.queue_mutex}; VK_CHECK(vkQueueSubmit(vk.queue, 1, &submit, fences[i])); }
+            used = i + 1;
+            // (its time: the set's pictures a frame time apart in all, the first at once)
+            if (i > 0) std::this_thread::sleep_until(at + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(interval * i / steps)));
+            VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR}; present.waitSemaphoreCount = 1; present.pWaitSemaphores = &sc.rendered[image_index];
+            present.swapchainCount = 1; present.pSwapchains = &sc.swapchain; present.pImageIndices = &image_index;
+            VkResult shown;
+            { std::lock_guard queue{vk.queue_mutex}; shown = vkQueuePresentKHR(vk.queue, &present); }
+            if (shown == VK_ERROR_OUT_OF_DATE_KHR || shown == VK_SUBOPTIMAL_KHR) fgp.rebuild_wanted = true;
+            else if (shown != VK_SUCCESS) failed = true;
+            fgp.shown.fetch_add(1, std::memory_order_relaxed);
+        }
+        made_total += made;
+        const auto now = std::chrono::steady_clock::now();
+        if (const double secs = std::chrono::duration<double>(now - rate_at).count(); secs >= 0.5) { // (the counter's rate)
+            const u64 total = fgp.shown.load(); fgp.shown_fps = made_total ? (float)((total - rate_before) / secs) : 0.0f; rate_before = total; rate_at = now; made_total = 0; }
+        if (++cycles % 300 == 0) {
+            const double secs = std::chrono::duration<double>(now - report_at).count(); report_at = now;
+            const u64 total = fgp.shown.load(); RT_LOG("frame generation: %.1f pictures a second shown from %.1f of the game's", (total - shown_before) / secs, 300 / secs); shown_before = total;
+        }
+    }
+}
+void FgPost(int slot, int made, double interval) {
+    std::call_once(fgp.started, [] { std::thread(FgLoop).detach(); });
+    { std::lock_guard lock{fgp.m}; fgp.slot = slot; fgp.made = made; fgp.interval = interval; fgp.posted_at = std::chrono::steady_clock::now(); fgp.pending = true; }
+    fgp.cv.notify_one();
+}
+} // namespace
+
+float ShownFps() { return fgp.shown_fps.load(std::memory_order_relaxed); }
 void PresentWindowTexture(u64 window, s32 index) {
     rt::CoreRelease release; // waits on the swapchain
     if (nvn::TimelineOn()) RT_LOG("T %.2f present", nvn::TimelineMs());
@@ -441,7 +620,11 @@ void PresentWindowTexture(u64 window, s32 index) {
     nvn::last_present_ns = nvn::GuestTimestampNs();
     if (CurrentFrameSkipped()) { nvn::Submit(); NextFrame(); return; } // (frame skip: nothing rendered, nothing shown)
     auto& vk = Vk();
+    // (the swapchain is the frame generation thread's while one of its cycles runs: taken here to build it again, and
+    // for the whole of this function when this thread shows the frame itself)
+    std::unique_lock<std::mutex> swap_lock{swap_mutex, std::defer_lock};
     if (!sc.swapchain) { // (a failed replacement: build again)
+        swap_lock.lock();
         std::lock_guard lock{vk.queue_mutex}; std::lock_guard copy{vk.copy_mutex}; vkDeviceWaitIdle(vk.device); Build();
     }
     if (!sc.swapchain) { nvn::Submit(); return; }
@@ -452,14 +635,36 @@ void PresentWindowTexture(u64 window, s32 index) {
     {   // Rebuild for a new VSync choice or window size (Wayland reports no out-of-date swapchain on resize).
         int pw = 0, ph = 0; SDL_GetWindowSizeInPixels(vk.window, &pw, &ph);
         const bool resized = pw > 0 && ph > 0 && ((u32)pw != sc.extent.width || (u32)ph != sc.extent.height);
-        if (built_vsync != gfx::Current().vsync || resized) { std::lock_guard lock{vk.queue_mutex}; std::lock_guard copy{vk.copy_mutex}; vkDeviceWaitIdle(vk.device); Build(); }
+        if (built_vsync != gfx::Current().vsync || built_output != output::Signature() || resized || fgp.rebuild_wanted.load()) {
+            if (!swap_lock.owns_lock()) swap_lock.lock();
+            fgp.rebuild_wanted = false;
+            std::lock_guard lock{vk.queue_mutex}; std::lock_guard copy{vk.copy_mutex}; vkDeviceWaitIdle(vk.device); Build(); }
     }
     if (!sc.swapchain) return; // (the rebuild failed: again at the next present)
+    // Frame generation: this frame goes into the next image of its ring and to its thread, not to the swapchain.
+    static VkExtent2D fg_extent{}; static bool fg_ok = false; static u32 fg_next = 0; static bool fg_have_before = false; static u64 fg_sequence = 0;
+    bool fg = FgWanted();
+    if (fg && (fg_extent.width != sc.extent.width || fg_extent.height != sc.extent.height)) {
+        if (!swap_lock.owns_lock()) swap_lock.lock(); // (the set being shown ends first: its pictures are made again)
+        std::lock_guard lock{vk.queue_mutex}; std::lock_guard copy{vk.copy_mutex}; vkDeviceWaitIdle(vk.device);
+        fg_ok = output::fg::Size(sc.extent, sc.format); fg_extent = sc.extent; fg_have_before = false;
+    }
+    fg = fg && fg_ok;
+    // With frame generation this thread never waits for the one that shows the frames: it records the next set while
+    // the last is still on its way to the display, and that thread drops what a newer set overtakes (FgLoop). Waiting
+    // here tied the game to the display: where the made frames came faster than the display took them (2x of 90 fps on
+    // a 144 Hz screen) the game was held to half the display's rate - "halved, then doubled". Without frame generation
+    // the swapchain is this thread's: a set still being shown ends first.
+    if (!fg) {
+        if (!swap_lock.owns_lock()) swap_lock.lock();
+        fg_have_before = false; std::lock_guard lock{fgp.m}; fgp.pending = false; fgp.shown_fps = 0.0f; // (nothing posted before is shown after this frame)
+    } else if (swap_lock.owns_lock()) swap_lock.unlock();
+    const int fg_slot = fg ? (int)(fg_next++ % output::fg::Slots) : -1;
     { const double _ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_pt).count(); if(_ms>30)RT_LOG("present step previous blit fence: %.1f ms",_ms); _pt=std::chrono::steady_clock::now(); }
-    u32 image_index;
+    u32 image_index = 0;
     // A hidden or occluded window may not return images for a long time: never block the game
     // (and never hold the queue lock) on that; this frame is simply not shown.
-    VkResult r = vkAcquireNextImageKHR(vk.device, sc.swapchain, 100'000'000, sc.acquired, VK_NULL_HANDLE, &image_index);
+    VkResult r = fg ? VK_SUCCESS : vkAcquireNextImageKHR(vk.device, sc.swapchain, 100'000'000, sc.acquired, VK_NULL_HANDLE, &image_index);
     { const double _ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_pt).count(); if(_ms>30)RT_LOG("present step acquire: %.1f ms",_ms); _pt=std::chrono::steady_clock::now(); }
     if (r == VK_TIMEOUT || r == VK_NOT_READY) return;
     std::lock_guard lock{vk.queue_mutex};
@@ -479,7 +684,9 @@ void PresentWindowTexture(u64 window, s32 index) {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(sc.cmd, &bi));
     if(vk.checkpoint)vk.checkpoint(sc.cmd,reinterpret_cast<void*>(3));
-    const VkImage dst = sc.images[image_index];
+    // (composed into the swapchain's image, or into output.cpp's on its way to an HDR one)
+    const VkImage swap_image = fg ? VK_NULL_HANDLE : sc.images[image_index];
+    const VkImage dst = fg ? output::fg::Compose() : output::Intermediate() ? output::Target(sc.extent, sc.format) : swap_image;
     VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     to_dst.srcAccessMask = 0;
     to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -489,7 +696,10 @@ void PresentWindowTexture(u64 window, s32 index) {
     to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdPipelineBarrier(sc.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                          nullptr, 1, &to_dst);
-    const VkExtent2D src_extent{sc.frame->width,sc.frame->height};
+    // (the game's crop when it starts at the texture's corner and lies inside it: the handheld profile's 1920x1080)
+    VkExtent2D src_extent{sc.frame->width,sc.frame->height};
+    { const s32 cw = window_crop[2].load(std::memory_order_relaxed), ch = window_crop[3].load(std::memory_order_relaxed);
+      if (!window_crop[0].load(std::memory_order_relaxed) && !window_crop[1].load(std::memory_order_relaxed) && cw >= 16 && ch >= 16 && (u32)cw <= src_extent.width && (u32)ch <= src_extent.height) src_extent = {(u32)cw, (u32)ch}; }
     const VkImage src = sc.frame->image;
     if (src) {
         VkImageBlit blit{};
@@ -498,9 +708,12 @@ void PresentWindowTexture(u64 window, s32 index) {
         blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         // Fit the picture into the window at its own aspect ratio (black bars elsewhere).
         s32 w = (s32)sc.extent.width, h = (s32)sc.extent.height;
-        if ((u64)w * src_extent.height > (u64)h * src_extent.width) w = (s32)((u64)h * src_extent.width / src_extent.height);
+        if (gfx::Current().aspect == 1) {} // (the Aspect Ratio row at Stretched: the whole window)
+        else if ((u64)w * src_extent.height > (u64)h * src_extent.width) w = (s32)((u64)h * src_extent.width / src_extent.height);
         else h = (s32)((u64)w * src_extent.height / src_extent.width);
+        gfx::window_focused.store((SDL_GetWindowFlags(Vk().window) & SDL_WINDOW_INPUT_FOCUS) != 0, std::memory_order_relaxed);
         const s32 x0 = ((s32)sc.extent.width - w) / 2, y0 = ((s32)sc.extent.height - h) / 2;
+        input::picture_rect[0] = x0; input::picture_rect[1] = y0; input::picture_rect[2] = w; input::picture_rect[3] = h;
         blit.dstOffsets[0] = {x0, y0, 0};
         blit.dstOffsets[1] = {x0 + w, y0 + h, 1};
         if (WindowOriginLowerLeft()) std::swap(blit.dstOffsets[0].y, blit.dstOffsets[1].y); // row 0 is the bottom
@@ -525,7 +738,19 @@ void PresentWindowTexture(u64 window, s32 index) {
     // (also on request: a file named "snap" in the directory takes the next image and is removed)
     // (every 300th image only with OOT_PRESENT_DUMP_EVERY=1: writing one takes ~0.5 s, a hitch)
     static const bool every = std::getenv("OOT_PRESENT_DUMP_EVERY") != nullptr;
-    const bool dumping = dump.dir && ((every && (sc.frames + 1) % 300 == 0) || std::remove((std::string(dump.dir) + "/snap").c_str()) == 0);
+    // OOT_PRESENT_WATCH=x0,y0,x1,y1[,limit] (diagnostic, in 1920x1080 coordinates): every presented image is read back and
+    // its pure-white pixels in that box counted and logged; images with more than `limit` are also written (16 at most).
+    // For one-frame flashes, which a snapshot now and then does not catch.
+    struct Watch { bool on = false; int box[4]{}; int limit = 1 << 30; int after = 0; };
+    static const Watch watch = [] { Watch w; if (const char* e = std::getenv("OOT_PRESENT_WATCH")) w.on = std::sscanf(e, "%d,%d,%d,%d,%d,%d", &w.box[0], &w.box[1], &w.box[2], &w.box[3], &w.limit, &w.after) >= 4; return w; }();
+    const bool snap = dump.dir && ((every && (sc.frames + 1) % 300 == 0) || std::remove((std::string(dump.dir) + "/snap").c_str()) == 0);
+    // OOT_PRESENT_SPIKES=<cells>[,<after frame>[,<level>]] (diagnostic): one-frame faults of any kind. Every presented image
+    // is read back and reduced to a 160x90 grid; a frame is a spike where a cell differs by more than `level` (default 48
+    // of 255) from BOTH its neighbours in time while those two agree (within level/3). Spikes of at least `cells` cells
+    // are logged with their box, and written with the frame before (16 at most).
+    struct Spikes { bool on = false; int cells = 6, after = 0, level = 48; };
+    static const Spikes spikes = [] { Spikes w; if (const char* e = std::getenv("OOT_PRESENT_SPIKES")) w.on = std::sscanf(e, "%d,%d,%d", &w.cells, &w.after, &w.level) >= 1; return w; }();
+    const bool dumping = snap || watch.on || spikes.on;
     VkImageLayout last = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     if (dumping) {
         EnsureDumpBuffer((VkDeviceSize)sc.extent.width * sc.extent.height * 4);
@@ -542,31 +767,46 @@ void PresentWindowTexture(u64 window, s32 index) {
         vkCmdCopyImageToBuffer(sc.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dump.buffer, 1, &copy);
         last = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     }
-    VkImageMemoryBarrier to_present = to_dst;
-    to_present.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
-    to_present.dstAccessMask = 0;
-    to_present.oldLayout = last;
-    to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    vkCmdPipelineBarrier(sc.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0,
-                         nullptr, 1, &to_present);
+    if (!fg && dst != swap_image) { output::ToSwapchain(sc.cmd, last, swap_image, sc.extent); last = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; }
+    int fg_made = 0; double fg_interval = 1.0 / 30;
+    if (fg) { // the frame into fg's ring, and the frames between it and the one before
+        static auto before = std::chrono::steady_clock::now(); static double interval = 1.0 / 30;
+        const auto now = std::chrono::steady_clock::now(); const double dt = std::chrono::duration<double>(now - before).count(); before = now;
+        const bool gap = !(dt > 0.002 && dt < 0.25); // (a load's hitch: nothing to blend across)
+        if (!gap) interval += (dt - interval) * 0.25;
+        fg_interval = interval;
+        output::fg::Stored(sc.cmd, fg_slot, last);
+        const int n = output::fg::Multiplier(1.0 / interval);
+        fg_made = output::fg::Generate(sc.cmd, fg_slot, n - 1, fg_have_before && !gap, ++fg_sequence);
+        fg_have_before = true;
+    } else {
+        VkImageMemoryBarrier to_present = to_dst;
+        to_present.image = swap_image;
+        to_present.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+        to_present.dstAccessMask = 0;
+        to_present.oldLayout = last;
+        to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        vkCmdPipelineBarrier(sc.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_present);
+    }
     VK_CHECK(vkEndCommandBuffer(sc.cmd));
     const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submit.waitSemaphoreCount = 1;
+    submit.waitSemaphoreCount = fg ? 0 : 1;
     submit.pWaitSemaphores = &sc.acquired;
     submit.pWaitDstStageMask = &wait_stage;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &sc.cmd;
-    submit.signalSemaphoreCount = 1;
-    submit.pSignalSemaphores = &sc.rendered[image_index];
+    submit.signalSemaphoreCount = fg ? 0 : 1;
+    submit.pSignalSemaphores = fg ? nullptr : &sc.rendered[image_index];
     VK_CHECK(vkQueueSubmit(vk.queue, 1, &submit, sc.fence));
+    if (fg) FgPost(fg_slot, fg_made, fg_interval); // (shown by its thread, in the queue's order after this frame's recording)
     VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     present.waitSemaphoreCount = 1;
     present.pWaitSemaphores = &sc.rendered[image_index];
     present.swapchainCount = 1;
     present.pSwapchains = &sc.swapchain;
     present.pImageIndices = &image_index;
-    r = vkQueuePresentKHR(vk.queue, &present);
+    r = fg ? VK_SUCCESS : vkQueuePresentKHR(vk.queue, &present);
     { const double _ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_pt).count(); if(_ms>30)RT_LOG("present step submit+present: %.1f ms",_ms); _pt=std::chrono::steady_clock::now(); }
 
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || (r == VK_SUCCESS && acquired_suboptimal)) {
@@ -590,7 +830,77 @@ void PresentWindowTexture(u64 window, s32 index) {
     }
     if (dumping) {
         vkWaitForFences(vk.device, 1, &sc.fence, VK_TRUE, UINT64_MAX);
-        WriteDump(sc.frames);
+        bool write = snap;
+        if (watch.on) {
+            const double sx = sc.extent.width / 1920.0, sy = sc.extent.height / 1080.0; u32 white = 0;
+            const u32 x0 = (u32)(watch.box[0] * sx), x1 = std::min<u32>(sc.extent.width, (u32)(watch.box[2] * sx)), y0 = (u32)(watch.box[1] * sy), y1 = std::min<u32>(sc.extent.height, (u32)(watch.box[3] * sy));
+            for (u32 y = y0; y < y1; ++y) { const u8* row = dump.mapped + ((size_t)y * sc.extent.width + x0) * 4;
+                for (u32 x = x0; x < x1; ++x, row += 4) white += row[0] >= 250 && row[1] >= 250 && row[2] >= 250; }
+            static u32 written = 0;
+            RT_LOG("watch frame %llu: %u white", (unsigned long long)sc.frames, white);
+            if ((int)white > watch.limit && (int)sc.frames > watch.after && dump.dir && written < 16) { ++written; write = true; }
+        }
+        if (spikes.on) {
+            constexpr u32 GW = 160, GH = 90;
+            static std::vector<u8> grid[2]; static std::vector<u8> cur, kept; static u32 written = 0; // grid[0] oldest; kept: the middle frame (BGRA)
+            static u32 kw = 0, kh = 0;
+            // (one copy out of the mapped memory, which is slow to read in pieces)
+            const u32 W = sc.extent.width, H = sc.extent.height; cur.resize((size_t)W * H * 4); std::memcpy(cur.data(), dump.mapped, cur.size());
+            std::vector<u8> now(GW * GH * 3);
+            for (u32 gy = 0; gy < GH; ++gy) for (u32 gx = 0; gx < GW; ++gx) {
+                u32 sum[3]{}; u32 n = 0;
+                const u32 x0 = gx * W / GW, x1 = (gx + 1) * W / GW, y0 = gy * H / GH, y1 = (gy + 1) * H / GH;
+                for (u32 y = y0; y < y1; y += 3) { const u8* row = cur.data() + ((size_t)y * W + x0) * 4;
+                    for (u32 x = x0; x < x1; x += 3, row += 12) { sum[0] += row[0]; sum[1] += row[1]; sum[2] += row[2]; ++n; } }
+                for (int k = 0; k < 3; ++k) now[(gy * GW + gx) * 3 + k] = (u8)(n ? sum[k] / n : 0);
+            }
+            {static const bool luma = std::getenv("OOT_PRESENT_LUMA") != nullptr; // (diagnostic: mean brightness of every frame: centre and the corners)
+             if (luma) { u64 all = 0, centre = 0, corner = 0; u32 nc = 0, nk = 0;
+                for (u32 gy = 0; gy < GH; ++gy) for (u32 gx = 0; gx < GW; ++gx) { const u8* c = &now[(gy * GW + gx) * 3]; const u32 v = c[0] + c[1] + c[2]; all += v;
+                    if (gx > GW / 3 && gx < 2 * GW / 3 && gy > GH / 3 && gy < 2 * GH / 3) { centre += v; ++nc; }
+                    if ((gx < GW / 8 || gx > 7 * GW / 8) && (gy < GH / 8 || gy > 7 * GH / 8)) { corner += v; ++nk; } }
+                RT_LOG("luma %llu: %.2f centre %.2f corners %.2f", (unsigned long long)sc.frames, all / (3.0 * GW * GH), centre / (3.0 * nc), corner / (3.0 * nk)); }}
+            {static const struct BoxLog { bool on = false; int x0, y0, x1, y1; } bl = [] { BoxLog b; if (const char* e = std::getenv("OOT_PRESENT_BOXLOG")) b.on = std::sscanf(e, "%d,%d,%d,%d", &b.x0, &b.y0, &b.x1, &b.y1) == 4; return b; }();
+             // (OOT_PRESENT_BOXLOG=x0,y0,x1,y1 in 1920x1080 coordinates: mean colour and bright-pixel count of that box in every frame)
+             if (bl.on) { u64 sum = 0, n = 0, bright = 0, dark = 0;
+                for (u32 y = bl.y0 * H / 1080; y < (u32)bl.y1 * H / 1080 && y < H; ++y) for (u32 x = bl.x0 * W / 1920; x < (u32)bl.x1 * W / 1920 && x < W; ++x) {
+                    const u8* c = cur.data() + ((size_t)y * W + x) * 4; const u32 v = c[0] + c[1] + c[2]; sum += v; ++n; bright += v > 600; dark += v < 60; }
+                RT_LOG("box %llu: mean %.1f bright %llu dark %llu", (unsigned long long)sc.frames, n ? sum / (3.0 * n) : 0.0, (unsigned long long)bright, (unsigned long long)dark); }}
+            if (!grid[1].empty() && !grid[0].empty()) { // (the middle frame, grid[1], against grid[0] and `now`)
+                u32 count = 0, bx0 = GW, by0 = GH, bx1 = 0, by1 = 0;
+                // (OOT_PRESENT_SPIKE_BOX=x0,y0,x1,y1 in 1920x1080 coordinates: only cells inside count, e.g. a menu over a movie)
+                static const struct Box { int x0 = 0, y0 = 0, x1 = 1920, y1 = 1080; } box = [] { Box b; if (const char* e = std::getenv("OOT_PRESENT_SPIKE_BOX")) std::sscanf(e, "%d,%d,%d,%d", &b.x0, &b.y0, &b.x1, &b.y1); return b; }();
+                for (u32 i = 0; i < GW * GH; ++i) { int far = 0, near = 0;
+                    {const int cx = (int)(i % GW) * 12, cy = (int)(i / GW) * 12; if (cx < box.x0 || cx >= box.x1 || cy < box.y0 || cy >= box.y1) continue;}
+                    for (int k = 0; k < 3; ++k) { const int a = grid[0][i * 3 + k], m = grid[1][i * 3 + k], b = now[i * 3 + k];
+                        far = std::max(far, std::min(std::abs(m - a), std::abs(m - b))); near = std::max(near, std::abs(a - b)); }
+                    if (far > spikes.level && near < spikes.level / 3) { ++count; const u32 x = i % GW, y = i / GW; bx0 = std::min(bx0, x); bx1 = std::max(bx1, x); by0 = std::min(by0, y); by1 = std::max(by1, y); } }
+                // (counted while <dump dir>/spikes-on exists, looked for every 30 frames: the tool makes it once the save is loaded)
+                static bool armed = false; if (sc.frames % 30 == 0) armed = dump.dir && std::filesystem::exists(std::string(dump.dir) + "/spikes-on");
+                if ((int)count >= spikes.cells && (int)sc.frames > spikes.after && armed) {
+                    RT_LOG("spike frame %llu: %u cells, box %u,%u-%u,%u (1920x1080)", (unsigned long long)sc.frames - 1, count, bx0 * 12, by0 * 12, (bx1 + 1) * 12, (by1 + 1) * 12);
+                    if (dump.dir && written < 16 && kept.size() == (size_t)kw * kh * 4) { ++written;
+                        const std::string path = std::string(dump.dir) + "/spike-" + std::to_string(sc.frames - 1) + ".ppm";
+                        if (FILE* f = std::fopen(path.c_str(), "wb")) { std::fprintf(f, "P6\n%u %u\n255\n", kw, kh);
+                            std::vector<u8> row(kw * 3);
+                            for (u32 y = 0; y < kh; ++y) { const u8* in = kept.data() + (size_t)y * kw * 4; for (u32 x = 0; x < kw; ++x) { row[x * 3] = in[x * 4 + 2]; row[x * 3 + 1] = in[x * 4 + 1]; row[x * 3 + 2] = in[x * 4]; } std::fwrite(row.data(), 1, row.size(), f); }
+                            std::fclose(f); } }
+                }
+            }
+            {static const struct Range { bool on = false; int a = 0, b = 0, x0 = 0, y0 = 0, x1 = 1920, y1 = 1080; } rg = [] { Range r; if (const char* e = std::getenv("OOT_PRESENT_RANGE")) r.on = std::sscanf(e, "%d,%d,%d,%d,%d,%d", &r.a, &r.b, &r.x0, &r.y0, &r.x1, &r.y1) >= 2; return r; }();
+             // (OOT_PRESENT_RANGE=first,last[,x0,y0,x1,y1] (box in 1920x1080 coordinates): every frame of that range written as range-<frame>.ppm)
+             // (first = 0: the `last` frames after <dump dir>/range-on appears)
+             static int left = 0; if (rg.on && rg.a == 0 && dump.dir) { if (left > 0) --left; else if (std::filesystem::exists(std::string(dump.dir) + "/range-on")) { std::filesystem::remove(std::string(dump.dir) + "/range-on"); left = rg.b; } }
+             if (rg.on && dump.dir && (rg.a == 0 ? left > 0 : ((int)sc.frames >= rg.a && (int)sc.frames <= rg.b))) {
+                const u32 px0 = rg.x0 * W / 1920, px1 = std::min<u32>(W, rg.x1 * W / 1920), py0 = rg.y0 * H / 1080, py1 = std::min<u32>(H, rg.y1 * H / 1080);
+                const std::string path = std::string(dump.dir) + "/range-" + std::to_string(sc.frames) + ".ppm";
+                if (FILE* f = std::fopen(path.c_str(), "wb")) { std::fprintf(f, "P6\n%u %u\n255\n", px1 - px0, py1 - py0); std::vector<u8> row((px1 - px0) * 3);
+                    for (u32 y = py0; y < py1; ++y) { const u8* in = cur.data() + ((size_t)y * W + px0) * 4; for (u32 x = 0; x < px1 - px0; ++x) { row[x * 3] = in[x * 4 + 2]; row[x * 3 + 1] = in[x * 4 + 1]; row[x * 3 + 2] = in[x * 4]; } std::fwrite(row.data(), 1, row.size(), f); }
+                    std::fclose(f); } }}
+            kw = W; kh = H; kept.swap(cur); // (the frame just read becomes the middle one)
+            grid[0] = std::move(grid[1]); grid[1] = std::move(now);
+        }
+        if (write) WriteDump(sc.frames);
     }
     if (sc.frames % 300 == 0) ReportDrawStats((*reinterpret_cast<std::vector<u64>**>(window + 0x78))->at(index));
     if (sc.frames % 300 == 0) {

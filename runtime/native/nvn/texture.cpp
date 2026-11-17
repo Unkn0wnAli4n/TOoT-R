@@ -1,3 +1,4 @@
+#include <shared_mutex>
 #include "../graphics_settings.h"
 // NVN textures: the object keeps the texture builder bytes (so builder getters serve as texture
 // getters) and the host texture pointer at +TextureBuilderSize.
@@ -21,6 +22,7 @@
 #include <atomic>
 #include <cstdlib>
 #include "texture.h"
+#include "longshot_upscale.h"
 #include "batch.h"
 
 using namespace rt;
@@ -29,6 +31,25 @@ using namespace nvn;
 namespace nvn {
 namespace {
 std::atomic<u64> image_live_bytes{0},image_cached_bytes{0};
+// Video memory as the system sees it (VK_EXT_memory_budget: other programs' share is taken off the budget): tight from
+// 85% of the budget of the card's own largest heap, asked at most four times a second. Without the extension: never.
+// OOT_VRAM_TIGHT_PERCENT=<n> (85).
+bool VideoMemoryTight(u64* used_out=nullptr,u64* budget_out=nullptr){
+    static std::atomic<u64> used{0},budget{0};static std::atomic<s64> asked_ms{-1000};
+    auto& vk=Vk();if(!vk.memory_budget)return false;
+    const s64 now=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if(now-asked_ms.load(std::memory_order_relaxed)>250){asked_ms.store(now,std::memory_order_relaxed);
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT b{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 mp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};mp.pNext=&b;
+        vkGetPhysicalDeviceMemoryProperties2(vk.physical,&mp);
+        u32 heap=0;u64 size=0;for(u32 h=0;h<mp.memoryProperties.memoryHeapCount;++h)if((mp.memoryProperties.memoryHeaps[h].flags&VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)&&mp.memoryProperties.memoryHeaps[h].size>size){size=mp.memoryProperties.memoryHeaps[h].size;heap=h;}
+        used.store(b.heapUsage[heap],std::memory_order_relaxed);budget.store(b.heapBudget[heap],std::memory_order_relaxed);}
+    static const u64 percent=std::getenv("OOT_VRAM_TIGHT_PERCENT")?std::strtoull(std::getenv("OOT_VRAM_TIGHT_PERCENT"),nullptr,10):85;
+    const u64 u=used.load(std::memory_order_relaxed),b=budget.load(std::memory_order_relaxed);
+    if(used_out)*used_out=u;if(budget_out)*budget_out=b;
+    return b&&u>b/100*percent;
+}
+std::atomic<bool> memory_pressure{false}; // (an image allocation failed: textures loaded from now on are compressed as Low does)
 // (OOT_IMAGE_TRACE: live images by kind)
 std::mutex live_kinds_mutex; std::map<std::tuple<u32,u32,u32,bool,bool>,std::pair<s64,s64>> live_kinds;
 void NoteLive(const Texture& t,s64 sign){ static const bool on=std::getenv("OOT_IMAGE_TRACE")!=nullptr; if(!on)return;
@@ -255,9 +276,13 @@ VkImageAspectFlags AspectOf(const Texture& t) {
     return a ? a : VK_IMAGE_ASPECT_COLOR_BIT;
 }
 
+// (threads resolving draws at once, batch.h: their view lookups and additions, and an image changing hands between
+// two texture objects over the same memory, StealLiveImage)
+std::shared_mutex worker_views;
 namespace {
 VkImageView MakeView(Texture& t, TextureView view, bool attachment) {
-    EnsureImage(t);
+    if (!resolve_worker) EnsureImage(t);
+    else if (!t.image) { RESOLVE_BAIL(); return VK_NULL_HANDLE; }
     if(!attachment){
         bool custom=false;for(auto component:view.swizzle)custom|=component!=0;
         if(!custom)std::memcpy(view.swizzle,t.swizzle,sizeof view.swizzle);
@@ -267,6 +292,15 @@ VkImageView MakeView(Texture& t, TextureView view, bool attachment) {
         view.present = true; view.levels_count = 1; view.target = (u32)Target::T2DArray + 1;
         // Attachment views must use identity component mapping.
         view.swizzle[0] = 0; view.swizzle[1] = 1; view.swizzle[2] = 2; view.swizzle[3] = 3;
+    }
+    // (threads resolving draws at once share the textures: they look up, and add, under a lock of their own; the
+    // executor alone, as before, needs none)
+    std::unique_lock<std::shared_mutex> adding{worker_views, std::defer_lock};
+    if (resolve_worker) {
+        { std::shared_lock looking{worker_views};
+          for (const auto& [key, cached] : t.views) if (!std::memcmp(&key, &view, sizeof view)) return cached; }
+        adding.lock();
+        if (!t.image) { RESOLVE_BAIL(); return VK_NULL_HANDLE; } // (another thread's draw took the image meanwhile: the executor sorts it out)
     }
     for (const auto& [key, cached] : t.views)
         if (!std::memcmp(&key, &view, sizeof view)) return cached;
@@ -362,8 +396,12 @@ u64 SpareBudget() {
         if (const char* e = std::getenv("OOT_SPARE_IMAGE_MB")) return std::strtoull(e, nullptr, 10) << 20;
         auto& vk = Vk(); u64 local = 0;
         for (u32 h = 0; h < vk.memory_properties.memoryHeapCount; ++h) if (vk.memory_properties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) local = std::max<u64>(local, vk.memory_properties.memoryHeaps[h].size);
-        const bool small = vk.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU || local < (6ull << 30);
-        return small ? 128ull << 20 : 384ull << 20; }();
+        // (384 MiB dropped ~7 render targets a frame in Castle Town, made again by the driver: 1.5 GiB on a 12 GB card
+        // took the turn from 41 to 45 fps and its p99 frame from 40 to 33 ms)
+        if (vk.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU || local < (6ull << 30)) return 256ull << 20;
+        return local >= (10ull << 30) ? 1536ull << 20 : 768ull << 20; }();
+    // (short of video memory: spares are for speed only)
+    if (VideoMemoryTight() && !std::getenv("OOT_SPARE_IMAGE_MB")) return std::min<u64>(budget, 192ull << 20);
     return budget;
 }
 std::atomic<u64> stat_spare_hits{0}, stat_images_created{0}, stat_targets_created{0}, stat_spare_kept{0}, stat_spare_dropped{0}, stat_spare_refused{0};
@@ -504,7 +542,21 @@ bool KeepSpareImage(const Texture& t) {
     return true;
 }
 
+
+// Before a new image when video memory is tight (at most twice a second): what is kept only for speed goes now -
+// spare render targets, most of the cache of finalized images - so the allocation does not fail first (a failed one
+// cost 80-100 ms in the driver, the 100 ms frames in Castle Town with High Quality textures on a 12 GB card).
+void RelieveVideoMemory() {
+    static std::atomic<s64> last_ms{0};
+    if (!VideoMemoryTight()) return;
+    const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    s64 before = last_ms.load(std::memory_order_relaxed);
+    if (now - before < 500 || !last_ms.compare_exchange_strong(before, now)) return;
+    TrimImageCache(256ull << 20, false); DropSpareImages();
+    static u32 told = 0; if (told++ < 6) { u64 used = 0, budget = 0; VideoMemoryTight(&used, &budget); RT_LOG("video memory tight (%llu of %llu MiB): spare and cached images released", (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20)); }
+}
 void CreateImage(Texture& t) {
+    RelieveVideoMemory();
     auto& vk = Vk();
     VkFormatProperties fp;
     vkGetPhysicalDeviceFormatProperties(vk.physical, t.info.vk, &fp);
@@ -517,7 +569,15 @@ void CreateImage(Texture& t) {
         // blocks of 6x6 texels or more from 2 MiB as RGBA8, finer ones (UI, characters) only from
         // 64 MiB. OOT_ASTC_RGBA8=1: all as RGBA8.)
         // (the Graphics screen's Texture Memory: Low re-encodes from 256 KiB, Quality keeps RGBA8)
-        const bool rgba8=std::getenv("OOT_ASTC_RGBA8")||std::getenv("OOT_CPU_ASTC")||gfx::Current().texture_memory==2;
+        // (High Quality only while the card has room: in Castle Town everything as RGBA8 was 8.2 GiB of images on a
+        // 12 GB card; allocations failed, cached images were dropped and uploaded again, frames of 100-200 ms. Past
+        // 45% of the card's own memory in live images, newly loaded textures follow Original's rule.
+        // OOT_ASTC_RGBA8=1 has no such limit.)
+        static const u64 quality_budget=[&]{u64 local=0;for(u32 h=0;h<vk.memory_properties.memoryHeapCount;++h)if(vk.memory_properties.memoryHeaps[h].flags&VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)local=std::max<u64>(local,vk.memory_properties.memoryHeaps[h].size);
+            return local/100*45;}();
+        const bool quality_room=image_live_bytes.load(std::memory_order_relaxed)<quality_budget&&!VideoMemoryTight();
+        if(gfx::Current().texture_memory==2&&!quality_room){static bool told=false;if(!told){told=true;RT_LOG("textures: High Quality reached its video memory budget (%llu MiB of images): further large textures are kept compressed",(unsigned long long)(quality_budget>>20));}}
+        const bool rgba8=std::getenv("OOT_ASTC_RGBA8")||(gfx::Current().texture_memory==2&&quality_room&&!memory_pressure.load(std::memory_order_relaxed));
         // (also on GPUs sharing system memory, such as the Steam Deck's, or with under 6 GB of their own, as
         // Hookshot does since 4378a24: the threshold of Low unless the user chose Quality)
         static const bool small_memory=[&]{
@@ -526,7 +586,10 @@ void CreateImage(Texture& t) {
             const bool small=p.deviceType==VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU||local<(6ull<<30);
             if(small)RT_LOG("textures: shared or small video memory: ASTC textures from 256 KiB kept as BC3");
             return small;}();
-        const bool low=gfx::Current().texture_memory==1||small_memory;
+        // (and once the card is short of memory, whatever the setting: past the budget above, or after an allocation
+        // failed, newly loaded textures are compressed as Low does)
+        const bool pressed=!quality_room||memory_pressure.load(std::memory_order_relaxed);
+        const bool low=gfx::Current().texture_memory==1||small_memory||pressed;
         if(!rgba8&&t.target!=Target::T3D&&t.samples==1&&t.width<=2048&&t.height<=2048){
             u64 px=0;for(u32 l=0;l<t.levels;++l)px+=(u64)std::max(1u,t.width>>l)*std::max(1u,t.height>>l);
             const u64 min_bytes=low?(256ull<<10):t.info.block_w*t.info.block_h>=36?(2ull<<20):(64ull<<20);
@@ -572,9 +635,9 @@ void CreateImage(Texture& t) {
     if (trace) { static std::mutex m; static std::map<std::tuple<u32,u32,u32,u32,u32,u32>, u64> made; static u64 n = 0; std::lock_guard l{m};
         ++made[{t.width, t.height, t.format, t.levels, t.layers, (u32)!!(ii.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))}];
         if (++n % 500 == 0) { for (auto& [k, c] : made) if (c > 4) RT_LOG("images made: %ux%u fmt %u levels %u layers %u attachment %u: %llu", std::get<0>(k), std::get<1>(k), std::get<2>(k), std::get<3>(k), std::get<4>(k), std::get<5>(k), (unsigned long long)c); made.clear(); RT_LOG("(500 images made)"); } }
-    if (TakeSpareImage(ii, t)) { ++stat_spare_hits; image_live_bytes += t.allocation_size; if (t.decoded_astc) image_astc_bytes += t.allocation_size; NoteLive(t, 1); return; }
+    if (TakeSpareImage(ii, t)) { ++frame_spares_taken; ++stat_spare_hits; image_live_bytes += t.allocation_size; if (t.decoded_astc) image_astc_bytes += t.allocation_size; NoteLive(t, 1); return; }
     KindStat(SpareKeyOf(ii), 0);
-    ++stat_images_created; if (ii.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) ++stat_targets_created;
+    ++frame_images_made; ++stat_images_created; if (ii.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) ++stat_targets_created;
     VK_CHECK(vkCreateImage(vk.device, &ii, nullptr, &t.image));
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(vk.device, t.image, &req);
@@ -600,14 +663,18 @@ void CreateImage(Texture& t) {
     if(allocated!=VK_SUCCESS){
         // Out of device memory: release every cached image (destroyed after the GPU is done with
         // them), then retry; as a last resort use any memory type the image allows (slower).
+        memory_pressure.store(true,std::memory_order_relaxed);
         RT_LOG("texture allocation failed (%llu MiB requested; live %llu MiB, cached %llu MiB): releasing cached images",
             (unsigned long long)(req.size>>20),(unsigned long long)(image_live_bytes.load()>>20),(unsigned long long)(image_cached_bytes.load()>>20));
         // (No Flush here: CreateImage runs inside Immediate recordings (Transition -> EnsureImage), and
         // submitting the command buffer being recorded crashed the driver. Released images free
         // after the current batch; until then this allocation falls back to other memory.)
-        TrimImageCache(0);
+        // (the small images the GPU drew once go last: evicted, terrain tiles' maps and HUD labels came back from guest
+        // memory as some other texture - the wrong ground texture and stray HUD pieces after a while in Castle Town)
+        TrimImageCache(0,false);
         DropSpareImages();
         allocated=vkAllocateMemory(vk.device,&ai,nullptr,&t.memory);
+        if(allocated!=VK_SUCCESS){TrimImageCache(0);allocated=vkAllocateMemory(vk.device,&ai,nullptr,&t.memory);}
         if(allocated!=VK_SUCCESS){ai.memoryTypeIndex=FindMemoryType(req.memoryTypeBits,0);allocated=vkAllocateMemory(vk.device,&ai,nullptr,&t.memory);
             if(allocated==VK_SUCCESS)RT_LOG("texture placed in non-device-local memory");}
     }
@@ -625,7 +692,8 @@ void EnsureImage(Texture& t) {
     // A finalized texture still used by recorded work keeps its image until that batch. One no shared owner
     // holds any more (a stale reference to an object on its way out, destroyed with its image) is not
     // retired again.
-    std::shared_ptr<Texture> self=t.weak_from_this().lock();
+    // (only a finalized texture needs its owner: taking it at every use was two atomic operations per bound texture)
+    std::shared_ptr<Texture> self;if(t.owner_finalized)self=t.weak_from_this().lock();
     if(t.owner_finalized&&!self){
         static std::atomic<u32> told{0};
         if(told++<5)RT_LOG("texture %#llx used after its last owner released it",(unsigned long long)t.object);
@@ -686,6 +754,7 @@ struct CachedImage {
 std::map<ImageKey,CachedImage> image_cache;
 
 void DestroyLater(Texture* t) {
+    ls::TextureGone(t); // (the vendored upscalers' view of it)
     ForgetImageHolder(t); // (on its way out: no other object takes its image now)
     AfterFlush([t] {
         std::vector<VkImageView> views;
@@ -887,6 +956,8 @@ bool StealLiveImage(Texture& t) {
     if (it == holders.end()) return false;
     Texture& h = *it->second;
     if (&h == &t || !h.image || h.depth_stencil_mode != t.depth_stencil_mode || std::memcmp(h.swizzle, t.swizzle, sizeof t.swizzle)) return false;
+    std::unique_lock<std::shared_mutex> moving{worker_views, std::defer_lock};
+    if (resolve_worker) moving.lock();
     t.image = h.image; t.memory = h.memory; t.block = h.block; t.memory_offset = h.memory_offset; t.allocation_size = h.allocation_size;
     t.view = h.view; t.views = std::move(h.views);
     t.layout = h.layout; t.usage = h.usage; t.gpu_written = h.gpu_written; t.uploaded = h.uploaded; t.upload_frame = h.upload_frame;
@@ -905,10 +976,12 @@ Texture::~Texture() {
     auto it = holders.find(KeyOf(*this));
     if (it != holders.end() && it->second == this) holders.erase(it);
 }
-void TrimImageCache(u64 keep_bytes) {
+void TrimImageCache(u64 keep_bytes, bool small_too) {
     std::lock_guard lock{cache_mutex};
-    while (!cache_order.empty() && image_cached_bytes > keep_bytes) EvictOldest(false);
-    while (!small_order.empty() && image_cached_bytes > keep_bytes) EvictOldest(true);
+    // (small_too false: the small images the GPU drew once - HUD labels, terrain tiles' maps - stay: nothing draws them
+    // again, and evicted they come back from guest memory as noise)
+    while (!cache_order.empty() && image_cached_bytes - (small_too ? 0 : small_cached_bytes) > keep_bytes) EvictOldest(false);
+    while (small_too && !small_order.empty() && image_cached_bytes > keep_bytes) EvictOldest(true);
 }
 } // namespace nvn
 namespace nvn {
@@ -919,6 +992,10 @@ void ReportImageCache() {
            (unsigned long long)images_released.exchange(0), (unsigned long long)image_cache_evicted.exchange(0),
            image_cache.size(), image_cached_bytes / 1048576.0, image_live_bytes / 1048576.0, image_astc_bytes / 1048576.0);
     AgeSpareImages();
+    {u64 used=0,budget=0;const bool tight=VideoMemoryTight(&used,&budget);
+     // (short of video memory: what is only kept for speed goes before an allocation fails and the picture stalls)
+     if(tight){DropSpareImages();static u32 told=0;if(told++<8)RT_LOG("video memory tight: %llu of %llu MiB the system allows in use; spare render targets released",(unsigned long long)(used>>20),(unsigned long long)(budget>>20));}
+     if(budget)RT_LOG("video memory: %llu MiB in use of %llu MiB allowed",(unsigned long long)(used>>20),(unsigned long long)(budget>>20));}
     RT_LOG("render target memory: %.1f per frame from spares, %.0f MiB spare", stat_memory_reused.exchange(0) / 300.0, spare_memory_bytes / 1048576.0);
     RT_LOG("images per frame: %.1f created (%.1f render targets), %.1f from spares; spares: %.1f kept, %.1f dropped over the budget, %.1f not kept; %.0f MiB spare",
            stat_images_created.exchange(0) / 300.0, stat_targets_created.exchange(0) / 300.0, stat_spare_hits.exchange(0) / 300.0,

@@ -103,14 +103,23 @@ void ConvertDepth(EmitContext& ctx, Id vertex) {
                                                                ctx.OpIAdd(ctx.U32[1], first,
                                                                           ctx.Const(offset)))));
     };
-    const Id z{ctx.OpFMul(ctx.F32[1], ctx.OpFAdd(ctx.F32[1], read(z_line), read(w_line)),
-                          ctx.Const(0.5f))};
+    // (exact, each on its own: a depth pre-pass and the pass shading with depth EQUAL are different programs, and a
+    // driver that folded these into the program's own arithmetic rounded them differently in each)
+    const Id sum{ctx.OpFAdd(ctx.F32[1], read(z_line), read(w_line))};
+    ctx.Decorate(sum, spv::Decoration::NoContraction);
+    const Id z{ctx.OpFMul(ctx.F32[1], sum, ctx.Const(0.5f))};
+    ctx.Decorate(z, spv::Decoration::NoContraction);
     ctx.OpStore(ctx.OpAccessChain(ctx.output_f32, ctx.output_position, vertex, ctx.Const(2U)), z);
 }
 
 void TaskEpilogue(EmitContext& ctx) {
     Barrier(ctx);
-    const Id count{ctx.OpLoad(ctx.U32[1], PayloadWord(ctx, ctx.Const(1U)))};
+    // (from Longshot) At most one mesh workgroup a task thread: each thread keeps or culls one meshlet. A payload word a task
+    // left unwritten is anything: tens of thousands of mesh workgroups for a draw held the GPU for seconds (a device lost).
+    // OOT_TASK_NO_CAP=1: the word as it is.
+    static const bool no_cap{std::getenv("OOT_TASK_NO_CAP") != nullptr};
+    const Id loaded{ctx.OpLoad(ctx.U32[1], PayloadWord(ctx, ctx.Const(1U)))};
+    const Id count{no_cap || !ctx.mesh_threads ? loaded : ctx.OpUMin(ctx.U32[1], loaded, ctx.Const(ctx.mesh_threads))};
     const Id one{ctx.Const(1U)};
     // Marker for OpEmitMeshTasksEXT count, 1, 1, payload (PatchMeshInstructions).
     ctx.OpStore(count, one);
@@ -136,6 +145,14 @@ void MeshEpilogue(EmitContext& ctx) {
     for (u32 first = 0; first < mesh.max_vertices; first += threads) {
         const Id vertex{ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first))};
         const auto copy = [&] {
+            for (const auto& d : ctx.mesh_vertex_defaults) { // ((0,0,0,1) where the program writes nothing)
+                for (u32 c = 0; c < 4; ++c) {
+                    if (d.missing & (1U << c)) {
+                        ctx.OpStore(ctx.OpAccessChain(ctx.output_f32, d.variable, vertex, ctx.Const(c)),
+                                    ctx.Const(c == 3 ? 1.0f : 0.0f));
+                    }
+                }
+            }
             CopyLines(ctx, vertex, 0, vertex_lines, ctx.mesh_vertex_targets);
             if (convert_depth) {
                 ConvertDepth(ctx, vertex);
@@ -157,7 +174,10 @@ void MeshEpilogue(EmitContext& ctx) {
             std::array<Id, 3> indices;
             for (u32 element = 0; element < 3; ++element) {
                 const Id address{ctx.OpIAdd(ctx.U32[1], byte, ctx.Const(element))};
-                indices[element] = ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map, address));
+                // (from Longshot) within the vertices: an index byte the program left unwritten is anything, and an
+                // index past the vertex count is undefined (stray triangles across the screen, or a device fault)
+                indices[element] = Clamped(ctx, ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map, address)),
+                                           mesh.max_vertices);
             }
             const Id output_indices{ctx.TypePointer(spv::StorageClass::Output, ctx.U32[3])};
             ctx.OpStore(ctx.OpAccessChain(output_indices, ctx.mesh_primitive_indices, primitive),
@@ -208,6 +228,12 @@ void EmitIsbeWriteMapU32(EmitContext& ctx, const IR::Value& address, Id value) {
 }
 
 void EmitMeshPrologue(EmitContext& ctx) {
+    if (ctx.stage == Stage::Task && !std::getenv("OOT_TASK_NO_CAP")) {
+        // (from Longshot) The count starts at nothing: task payload memory holds whatever the last task left, and a task
+        // that keeps no meshlet never writes it. The barrier: every thread has done this before any goes on to write it.
+        ctx.OpStore(PayloadWord(ctx, ctx.Const(1U)), ctx.u32_zero_value);
+        Barrier(ctx);
+    }
     if (ctx.stage != Stage::Mesh) {
         return;
     }

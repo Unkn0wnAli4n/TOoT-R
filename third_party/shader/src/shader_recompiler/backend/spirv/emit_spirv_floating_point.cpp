@@ -1,3 +1,4 @@
+#include <cstdlib>
 // SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
@@ -11,7 +12,9 @@ namespace Shader::Backend::SPIRV {
 namespace {
 Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
     const auto flags{inst->Flags<IR::FpControl>()};
-    if (flags.no_contraction) {
+    // (TOoT:R) OOT_NO_CONTRACTION=1 (experiment): no float operation is fused with another, whatever the guest asked
+    static const bool never = std::getenv("OOT_NO_CONTRACTION") != nullptr;
+    if (flags.no_contraction || never) {
         ctx.Decorate(op, spv::Decoration::NoContraction);
     }
     return op;
@@ -76,6 +79,15 @@ Id EmitFPFma16(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
 }
 
 Id EmitFPFma32(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
+    // (TOoT:R) OOT_FMA_SPLIT=1 (experiment): a multiply and an add, each exact, in place of the fused operation
+    static const bool split = std::getenv("OOT_FMA_SPLIT") != nullptr;
+    if (split) {
+        const Id product{ctx.OpFMul(ctx.F32[1], a, b)};
+        ctx.Decorate(product, spv::Decoration::NoContraction);
+        const Id sum{ctx.OpFAdd(ctx.F32[1], product, c)};
+        ctx.Decorate(sum, spv::Decoration::NoContraction);
+        return sum;
+    }
     return Decorate(ctx, inst, ctx.OpFma(ctx.F32[1], a, b, c));
 }
 

@@ -24,6 +24,7 @@ struct KThread : KObject {
     u64 affinity = 0;            // allowed cores (0: the ideal core only)
     Cpu* cpu = nullptr;
     std::thread host;
+    int host_tid = 0;            // the host thread's kernel id once it runs (its nice follows the priority)
     bool exited = false;
     bool cancel_wait = false;
     u64 cancels = 0, cancelled_by = 0, cancel_lr = 0; std::chrono::steady_clock::time_point cancel_time{}; // (hang report)

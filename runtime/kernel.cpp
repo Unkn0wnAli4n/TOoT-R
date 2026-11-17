@@ -3,6 +3,12 @@
 // and per-thread condition variables. Service IPC is deliberately absent: SDK service APIs are
 // replaced at the nn:: level (see native/), so SendSyncRequest reaching here is a missing override.
 
+#ifdef __linux__
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+#include <cerrno>
 #include <cstdarg>
 #include <set>
 #include <pthread.h>
@@ -604,10 +610,38 @@ void BindThread(KThread* t) {
     EnterCore();
 }
 
+// The console runs the ready thread with the best priority and nothing else on its core; a PC's scheduler gives every
+// thread its share. So while an area loads, the game's loader, decompression and bank threads (which the game itself
+// put below its main thread, priority 44 as shipped) take time from the main and render threads, and frames come
+// late. A guest thread below the main thread's priority runs with a host nice value: the scheduler then lets the
+// frame's own threads go first and the background work takes what is left, as on the console. Never the other way:
+// raising a thread above the others needs privileges, and nothing here depends on it. OOT_THREAD_NICE=0: off;
+// =n: n nice steps per priority step, in tenths (default 10, at most nice 15).
+void ApplyThreadPriority(KThread* t) {
+#ifdef __linux__
+    static const int scale = std::getenv("OOT_THREAD_NICE") ? std::atoi(std::getenv("OOT_THREAD_NICE")) : 10;
+    if (scale <= 0 || !t || !t->host_tid) return;
+    const int nice = std::clamp((t->priority - 44) * scale / 10, 0, 15);
+    errno = 0;
+    const int now = getpriority(PRIO_PROCESS, (id_t)t->host_tid);
+    if (errno || now == nice) return;
+    // (going back up is refused without privileges on most systems: then the thread keeps what it has)
+    if (setpriority(PRIO_PROCESS, (id_t)t->host_tid, nice) == 0) {
+        static std::atomic<int> said{0};
+        if (said++ < 12) RT_LOG("thread %llu (entry %#llx): priority %d, host nice %d", (unsigned long long)t->id, (unsigned long long)t->entry, t->priority, nice);
+    }
+#else
+    (void)t;
+#endif
+}
+
 namespace {
 
 void RunThread(std::shared_ptr<KThread> t) {
     BindThread(t.get());
+#ifdef __linux__
+    { std::lock_guard lock{k_lock}; t->host_tid = (int)syscall(SYS_gettid); ApplyThreadPriority(t.get()); }
+#endif
     { // host name: guest thread id and entry (profiles and debuggers show it)
         char name[16]; std::snprintf(name, sizeof name, "g%u-%llx", t->id, (unsigned long long)(t->entry & 0xffffff));
         rt::SetThreadName(name);
@@ -1141,7 +1175,7 @@ void rt_svc(Cpu* c, u32 imm) {
     }
     case 0x0D: { // SetThreadPriority
         std::lock_guard lock{k_lock};
-        if (auto t = std::dynamic_pointer_cast<KThread>(GetObject((u32)c->x[0]))) t->priority = (s32)c->x[1];
+        if (auto t = std::dynamic_pointer_cast<KThread>(GetObject((u32)c->x[0]))) { t->priority = (s32)c->x[1]; ApplyThreadPriority(t.get()); }
         break;
     }
     // Cores: games index per-core scratch buffers by the current processor, so every thread

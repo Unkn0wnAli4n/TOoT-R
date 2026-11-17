@@ -3,8 +3,8 @@
 // to the window's size, Catmull-Rom or Lanczos 2, then a contrast-limited sharpen (no halos).
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D src;
-layout(binding = 1, rgba8) uniform writeonly image2D dst;
-layout(push_constant) uniform P { int mode; float sharp; } pc;
+layout(binding = 1) uniform writeonly image2D dst; // (no format: the window's RGBA8 and the game's own float targets, render.cpp's stand-in)
+layout(push_constant) uniform P { int mode; float sharp; int decode; } pc; // (decode 1: the result from sRGB encoding to linear values)
 const float PI = 3.14159265;
 float lanczos2(float x) {
     x = abs(x);
@@ -47,7 +47,12 @@ void main() {
         const vec3 n = textureLod(src, uv + vec2(0.0, -e.y), 0.0).rgb, s = textureLod(src, uv + vec2(0.0, e.y), 0.0).rgb;
         const vec3 w = textureLod(src, uv + vec2(-e.x, 0.0), 0.0).rgb, r = textureLod(src, uv + vec2(e.x, 0.0), 0.0).rgb;
         const vec3 lo = min(min(min(n, s), min(w, r)), c), hi = max(max(max(n, s), max(w, r)), c);
-        c = clamp(c + pc.sharp * (c - (n + s + w + r) * 0.25), lo, hi);
+        // (up to 100%: never past the neighbourhood's range, so no halos. Above it the limit is let out by the excess,
+        // a share of that range: the stronger setting for the soft picture of a temporal upscaler)
+        const vec3 slack = (hi - lo) * max(pc.sharp - 1.0, 0.0) * 0.5;
+        c = clamp(c + pc.sharp * 1.5 * (c - (n + s + w + r) * 0.25), lo - slack, hi + slack);
     }
+    if (pc.decode == 2) c = c * c; // (the game's scene as its upscaling network takes it: square roots of the linear values)
+    if (pc.decode == 1) c = mix(c / 12.92, pow((max(c, vec3(0.0)) + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));
     imageStore(dst, g, vec4(c, 1.0));
 }

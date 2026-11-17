@@ -231,6 +231,7 @@ Result Compile(const Request& request) {
     // programs launched no mesh workgroups. The host GPU supports subgroups there (checked in vk.cpp).
     profile.supported_subgroup_stages = 0x1FF;
     profile.support_typeless_image_loads = true;
+    if (std::getenv("OOT_SHUFFLE_BROADCAST") && (program.stage == Stage::Mesh || program.stage == Stage::Task)) profile.has_broken_spirv_subgroup_shuffle = true; // (experiment: lane reads through broadcasts)
     Shader::Backend::Bindings bindings{}; bindings.unified = request.binding_base;
     Result result; result.spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings);
     result.dependencies = std::move(env.dependencies);
@@ -283,7 +284,7 @@ Result Compile(const Request& request) {
 }
 uint32_t EvaluateHandle(const std::vector<uint32_t>& program, void* context,
     uint32_t (*read_cbuf)(void*, uint32_t, uint32_t),
-    uint32_t (*read_storage)(void*, uint32_t, uint32_t)) {
+    uint32_t (*read_storage)(void*, uint32_t, uint32_t), uint32_t) {
     const auto handle = Shader::EvaluateHandleProgram(program,
         [&](uint32_t bank, uint32_t offset) { return read_cbuf(context, bank, offset); },
         [&](uint32_t bank, uint32_t offset) { return read_storage(context, bank, offset); });

@@ -64,7 +64,7 @@ void AudioStubLog(const char* name) {
     std::lock_guard lock{m}; if (told.insert(name).second) RT_LOG("audio: %s is not modelled (answered 0)", name);
 }
 } // namespace
-static int master_volume_percent() { return gfx::Current().volume; } // (the settings window's Volume; used by output_frame)
+static int master_volume_percent() { return gfx::Current().mute_background && !gfx::window_focused.load(std::memory_order_relaxed) ? 0 : gfx::Current().volume; } // (the settings window's Volume; used by output_frame)
 
 #include "audio_hookshot.inc"
 #include "audio_stubs.inc"

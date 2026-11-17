@@ -31,7 +31,22 @@ find_package(Vulkan REQUIRED)
 find_package(fmt CONFIG REQUIRED)
 # Shader compiler (Eden/yuzu shader_recompiler with this project's NVN2/Ampere changes), vendored under third_party/shader with sirit, the SPIR-V headers
 # and Hookshot's minimal common/boost shims (see third_party/shader/PROVENANCE.md). GPL-3.0-or-later.
-set(SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/shader")
+# The default is Longshot's fork of that translator (third_party/shader-ls, GPL-3.0-or-later, see its PROVENANCE files)
+# with its own bridge (shader_compiler_ls.cpp): its mesh programs' depth matches their depth pre-pass (the white holes
+# in doors, Link's hat, vines) and it carries the task/mesh compute fallback for GPUs without mesh shaders.
+# -DOOT_TRANSLATOR=eden builds the earlier one.
+set(OOT_TRANSLATOR "longshot" CACHE STRING "Shader translator: longshot (third_party/shader-ls) or eden (third_party/shader)")
+if(OOT_TRANSLATOR STREQUAL "longshot")
+    set(SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/shader-ls")
+    set(SHADER_COMPAT "${SHADER_DIR}/compat/vk" "${SHADER_DIR}/compat/gpu")
+    set(SHADER_BRIDGE runtime/native/nvn/shader_compiler_ls.cpp)
+    set(SHADER_FLAGS "")
+else()
+    set(SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/shader")
+    set(SHADER_COMPAT "${SHADER_DIR}/compat")
+    set(SHADER_BRIDGE runtime/native/nvn/shader_compiler.cpp)
+    set(SHADER_FLAGS -include "${SHADER_DIR}/compat/fmt_enum_compat.h")
+endif()
 file(GLOB SIRIT_SOURCES "${SHADER_DIR}/sirit/src/*.cpp" "${SHADER_DIR}/sirit/src/instructions/*.cpp")
 add_library(sirit STATIC ${SIRIT_SOURCES})
 target_include_directories(sirit PUBLIC "${SHADER_DIR}/sirit/include" "${SHADER_DIR}/spirv-headers/include"
@@ -41,12 +56,12 @@ file(GLOB_RECURSE SHADER_RECOMPILER_SOURCES "${SHADER_DIR}/src/shader_recompiler
 list(FILTER SHADER_RECOMPILER_SOURCES EXCLUDE REGEX "/backend/(glsl|glasm)/")
 add_library(shader_recompiler STATIC ${SHADER_RECOMPILER_SOURCES}
     "${SHADER_DIR}/src/video_core/textures/astc.cpp")
-target_include_directories(shader_recompiler PUBLIC "${SHADER_DIR}/src" "${SHADER_DIR}/compat")
-target_compile_options(shader_recompiler PRIVATE -O2 ${OOT_G} -w -fno-strict-aliasing -fbracket-depth=1024
-    -include "${SHADER_DIR}/compat/fmt_enum_compat.h")
+target_include_directories(shader_recompiler PUBLIC "${SHADER_DIR}/src" ${SHADER_COMPAT})
+target_compile_options(shader_recompiler PRIVATE -O2 ${OOT_G} -w -fno-strict-aliasing -fbracket-depth=1024 ${SHADER_FLAGS})
 target_compile_definitions(shader_recompiler PUBLIC ARCHITECTURE_x86_64=1 NDEBUG)
 target_link_libraries(shader_recompiler PUBLIC sirit fmt::fmt)
-add_library(shader_bridge STATIC runtime/native/nvn/shader_compiler.cpp)
+add_library(shader_bridge STATIC ${SHADER_BRIDGE})
+target_include_directories(shader_bridge PRIVATE runtime/native/nvn)
 target_compile_options(shader_bridge PRIVATE -O1 ${OOT_G} -fno-strict-aliasing)
 target_link_libraries(shader_bridge PUBLIC shader_recompiler fmt::fmt pthread lz4 zstd)
 
@@ -60,8 +75,40 @@ target_link_libraries(imgui PUBLIC PkgConfig::SDL3 Vulkan::Vulkan)
 
 file(GLOB_RECURSE RUNTIME_SOURCES CONFIGURE_DEPENDS runtime/*.cpp)
 list(REMOVE_ITEM RUNTIME_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/runtime/native/nvn/shader_compiler.cpp")
+list(REMOVE_ITEM RUNTIME_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/runtime/native/nvn/shader_compiler_ls.cpp")
+# Longshot's temporal upscalers (NVIDIA DLSS, AMD FSR 3.1 and its frame interpolation), vendored unchanged under
+# third_party/longshot-upscale (GPL-3.0-or-later, see its PROVENANCE.md); compat/ stands in for the headers of
+# Longshot's renderer, and runtime/native/nvn/longshot_upscale.cpp defines what they declare.
+# NVIDIA's DLSS SDK is not part of this project (NVIDIA's licence): -DOOT_NGX_SDK=<folder with include/ and lib/>
+# builds DLSS in (tools/ngx_sdk.py fetches it); without it DLSS is left out.
+set(LS_UPSCALE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/longshot-upscale")
+set(OOT_NGX_SDK "" CACHE PATH "NVIDIA's DLSS SDK (include/, lib/): builds NVIDIA DLSS in")
+add_library(longshot_upscale STATIC ${LS_UPSCALE_DIR}/vk_temporal.cpp ${LS_UPSCALE_DIR}/vk_dlss.cpp ${LS_UPSCALE_DIR}/vk_fsr3.cpp
+            ${LS_UPSCALE_DIR}/vk_fsr3_inputs.cpp ${LS_UPSCALE_DIR}/vk_fsr3fi.cpp ${LS_UPSCALE_DIR}/vk_fsr4.cpp)
+# (AMD FSR 4: only AMD's MIT API headers are here, third_party/fidelityfx; AMD's library is loaded from the user's PC when it is there)
+target_include_directories(longshot_upscale PUBLIC ${LS_UPSCALE_DIR}/compat ${LS_UPSCALE_DIR})
+target_include_directories(longshot_upscale PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fidelityfx)
+target_compile_definitions(longshot_upscale PRIVATE LONGSHOT_FSR=1)
+target_compile_options(longshot_upscale PRIVATE -O2 ${OOT_G} -w -fdeclspec)
+target_link_libraries(longshot_upscale PUBLIC Vulkan::Vulkan)
+if(OOT_NGX_SDK AND EXISTS "${OOT_NGX_SDK}/include/nvsdk_ngx_vk.h")
+    target_compile_definitions(longshot_upscale PUBLIC LONGSHOT_NGX=1)
+    target_include_directories(longshot_upscale PRIVATE "${OOT_NGX_SDK}/include")
+    if(WIN32)
+        target_link_libraries(longshot_upscale PUBLIC "${OOT_NGX_SDK}/lib/nvsdk_ngx_s.lib")
+    else()
+        target_link_libraries(longshot_upscale PUBLIC "${OOT_NGX_SDK}/lib/libnvsdk_ngx.a" dl)
+    endif()
+    message(STATUS "NVIDIA DLSS: built in (SDK at ${OOT_NGX_SDK})")
+else()
+    message(STATUS "NVIDIA DLSS: not built in (no OOT_NGX_SDK)")
+endif()
 add_executable(tootr ${RUNTIME_SOURCES})
 target_include_directories(tootr PRIVATE runtime)
+target_link_libraries(tootr PRIVATE longshot_upscale)
+if(OOT_TRANSLATOR STREQUAL "longshot")
+    target_compile_definitions(tootr PRIVATE OOT_SHADER_LONGSHOT=1)
+endif()
 target_compile_options(tootr PRIVATE -O2 ${OOT_G} ${ARCH_FLAGS} -Wall -Wno-unused-function -fno-omit-frame-pointer)
 target_link_libraries(tootr PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,game_code>" PkgConfig::SDL3 PkgConfig::OPUS PkgConfig::FFMPEG Vulkan::Vulkan shader_bridge imgui pthread $<$<NOT:$<BOOL:${WIN32}>>:atomic>)
 # The renderer allocates many small objects per draw; jemalloc's thread caches make that much

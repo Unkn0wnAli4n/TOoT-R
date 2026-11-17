@@ -1,3 +1,9 @@
+#ifdef __linux__
+#include "native/graphics_settings.h"
+#include <unistd.h>
+#endif
+#include <cstdio>
+#include <cstdlib>
 // Entry point: loads and links the recompiled modules, then starts the SDK exactly as rtld does,
 // by calling nn::init::Start(main thread handle, argument region, init flag, module init, module
 // fini) on the main guest thread. nn::init::Start runs libc/os init, nninitStartup, the static
@@ -63,6 +69,16 @@ static void RaiseDriverShaderCaches() {
 namespace rt { void StartProfiler(); }
 using rt::StartProfiler;
 int main(int argc, char** argv) {
+#ifdef __linux__
+    // Steam's Game Mode sets RADV_FORCE_VRS_CONFIG_FILE (its Half Rate Shading switch) for everything it starts, and
+    // while that file exists RADV keys every graphics pipeline differently: neither this game's pipeline cache nor the
+    // driver's finds what an earlier start built, and all of it compiles again (Longshot measured 25-30 minutes on a
+    // Steam Deck, #900). Dropped before Vulkan loads; OOT_HALF_RATE_SHADING=1 keeps it.
+    if (const char* vrs = std::getenv("RADV_FORCE_VRS_CONFIG_FILE"); vrs && *vrs && !std::getenv("OOT_HALF_RATE_SHADING") && access(vrs, F_OK) == 0) {
+        std::fprintf(stderr, "[rt] RADV_FORCE_VRS_CONFIG_FILE dropped: with it the driver cannot use the pipelines built before\n");
+        unsetenv("RADV_FORCE_VRS_CONFIG_FILE");
+    }
+#endif
     RaiseDriverShaderCaches();
     StartProfiler(); // (OOT_PROFILE=1)
     std::string data_dir;

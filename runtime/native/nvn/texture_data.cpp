@@ -59,7 +59,7 @@ u64 Deposit(u64 value, u64 mask) {
 void ReadStorage(u64 address, void* output, u64 size) {
     auto* dst = static_cast<u8*>(output);
     while (size) {
-        const auto range = LookupAddress(address);
+        const auto range = LookupAddressCpu(address);
         const u64 count = std::min(size, range.pool ? range.available : 0x10000 - (address & 0xffff));
         if (range.pool) std::memcpy(dst, reinterpret_cast<const void*>(range.cpu_address), count);
         else std::memset(dst, 0, count); // uncommitted sparse tiles read as zero
@@ -69,7 +69,7 @@ void ReadStorage(u64 address, void* output, u64 size) {
 void WriteStorage(u64 address, const void* input, u64 size) {
     const auto* src = static_cast<const u8*>(input);
     while (size) {
-        const auto range = LookupAddress(address);
+        const auto range = LookupAddressCpu(address);
         if (!range.pool) Fatal("CPU texel write into uncommitted GPU storage %#llx", (unsigned long long)address);
         const u64 count = std::min(size, range.available);
         std::memcpy(reinterpret_cast<void*>(range.cpu_address), src, count);
@@ -185,7 +185,14 @@ void ParallelFor(u32 count, const std::function<void(u32)>& fn) {
 // textures on the CPU took tens of ms each, stalling the frame that first used them.
 struct AstcDecoder { VkDescriptorSetLayout set_layout = VK_NULL_HANDLE; VkPipelineLayout layout = VK_NULL_HANDLE; VkPipeline pipeline = VK_NULL_HANDLE; } astc_decoder;
 bool GpuAstc(const Texture& t) {
-    static const bool cpu = std::getenv("OOT_CPU_ASTC") != nullptr;
+    // On an integrated GPU the CPU decodes. A Steam Deck (RADV, Van Gogh) lost its GPU to a ring timeout the moment the
+    // first big ASTC textures were decoded in compute passes (2026-11-16: three runs of three; none with the CPU
+    // decoding), as Longshot found on the 2-CU graphics of AMD's desktop CPUs: a level's dispatches run for seconds
+    // there. OOT_CPU_ASTC=1 / =0 chooses.
+    static const bool cpu = [] { const char* e = std::getenv("OOT_CPU_ASTC");
+        const bool on = e ? std::atoi(e) != 0 || !*e : Vk().properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+        if (on) RT_LOG("textures: ASTC is decoded on the CPU");
+        return on; }();
     return !cpu && t.decoded_astc && t.target != Target::T3D && ((t.usage & VK_IMAGE_USAGE_STORAGE_BIT) || t.bc3);
 }
 // BC3 re-encoding (Texture::bc3; from Hookshot): each part is decoded into a 2048x2048 RGBA8
@@ -378,10 +385,80 @@ void UploadAstcOnGpu(Texture& t) {
     AfterFlush([views] { for (VkImageView v : views) vkDestroyImageView(Vk().device, v, nullptr); });
     t.uploaded = true;
 }
+// BC3 on the CPU, for the textures kept as BC3 (Texture::bc3) where the GPU does not decode ASTC (GpuAstc): an RGBA8
+// picture into 4x4 blocks, the alpha half with its eight-value ramp between the block's least and greatest alpha, the
+// colour half between the corners of the block's colour box, each texel taking the nearest ramp value. Not the best
+// endpoints an encoder can find, but exact for flat blocks, and it runs across the pool: 4 megapixels in a few ms.
+void EncodeBc3(const u8* rgba, u32 width, u32 height, u8* out) {
+    const u32 bw = (width + 3) / 4, bh = (height + 3) / 4;
+    ParallelFor(bh, [&](u32 by) {
+        for (u32 bx = 0; bx < bw; ++bx) {
+            u8 px[16][4];
+            for (u32 i = 0; i < 16; ++i) {
+                const u32 x = std::min(bx * 4 + i % 4, width - 1), y = std::min(by * 4 + i / 4, height - 1);
+                std::memcpy(px[i], rgba + ((u64)y * width + x) * 4, 4);
+            }
+            u8* block = out + ((u64)by * bw + bx) * 16;
+            u8 a0 = 0, a1 = 255, lo[3]{255, 255, 255}, hi[3]{0, 0, 0};
+            for (auto& p : px) { a0 = std::max(a0, p[3]); a1 = std::min(a1, p[3]); for (int c = 0; c < 3; ++c) { lo[c] = std::min(lo[c], p[c]); hi[c] = std::max(hi[c], p[c]); } }
+            u64 alpha_bits = 0;
+            if (a0 != a1) {
+                int ramp[8]; ramp[0] = a0; ramp[1] = a1;
+                for (int i = 2; i < 8; ++i) ramp[i] = ((8 - i) * a0 + (i - 1) * a1) / 7;
+                for (u32 i = 0; i < 16; ++i) {
+                    int best = 0, distance = 1 << 30;
+                    for (int k = 0; k < 8; ++k) { const int d = std::abs(ramp[k] - px[i][3]); if (d < distance) { distance = d; best = k; } }
+                    alpha_bits |= (u64)best << (3 * i);
+                }
+            }
+            block[0] = a0; block[1] = a1;
+            for (int i = 0; i < 6; ++i) block[2 + i] = (u8)(alpha_bits >> (8 * i));
+            const auto pack = [](const u8* c) { return (u16)((c[0] >> 3) << 11 | (c[1] >> 2) << 5 | c[2] >> 3); };
+            u16 c0 = pack(hi), c1 = pack(lo);
+            u32 colour_bits = 0;
+            if (c0 != c1) {
+                if (c0 < c1) std::swap(c0, c1);
+                int ends[2][3];
+                for (int e = 0; e < 2; ++e) { const u16 c = e ? c1 : c0; ends[e][0] = (c >> 11) * 255 / 31; ends[e][1] = (c >> 5 & 63) * 255 / 63; ends[e][2] = (c & 31) * 255 / 31; }
+                int ramp[4][3];
+                for (int c = 0; c < 3; ++c) { ramp[0][c] = ends[0][c]; ramp[1][c] = ends[1][c]; ramp[2][c] = (2 * ends[0][c] + ends[1][c]) / 3; ramp[3][c] = (ends[0][c] + 2 * ends[1][c]) / 3; }
+                for (u32 i = 0; i < 16; ++i) {
+                    int best = 0, distance = 1 << 30;
+                    for (int k = 0; k < 4; ++k) {
+                        int d = 0; for (int c = 0; c < 3; ++c) { const int v = ramp[k][c] - px[i][c]; d += v * v; }
+                        if (d < distance) { distance = d; best = k; }
+                    }
+                    colour_bits |= (u32)best << (2 * i);
+                }
+            }
+            block[8] = (u8)c0; block[9] = (u8)(c0 >> 8); block[10] = (u8)c1; block[11] = (u8)(c1 >> 8);
+            std::memcpy(block + 12, &colour_bits, 4);
+        }
+    });
+}
 void UploadTexels(Texture& t);
 std::atomic<u64> upload_ns_frame{0}, uploads_frame{0}, upload_staging_ns{0}, upload_swizzle_ns{0}, upload_decode_ns{0}; // (slow-frame diagnosis, render.cpp)
 extern std::atomic<u64> cpu_reuploads; // (memory.cpp reports)
+bool StealLiveImage(Texture& t); // (texture.cpp)
 void EnsureUploaded(Texture& t) {
+    if (resolve_worker) { // (its image is what a draw needs resolved; contents are brought when the draw is committed)
+        // (a finalized texture a descriptor still names keeps its image for this batch: the executor notes that when
+        // the draw is committed, EnsureImage)
+        if (t.owner_finalized) resolve_texture_unready = true;
+        // (two texture objects over the same memory share one image, whichever is used takes it: ~70 times a frame in
+        // Kokiri Forest)
+        if (!t.image && !StealLiveImage(t)) { RESOLVE_BAIL(); return; }
+        if (!t.gpu_written && !t.uploaded) resolve_texture_unready = true;
+        else if (!t.gpu_written && t.storage) {
+            if (!TextureWatchUsable()) resolve_texture_unready = true;
+            else if (const u32 now = TextureWriteSequence(); now != t.checked_sequence) {
+                if (TextureMemoryWritten(t.storage, t.storage_size, t.upload_sequence)) resolve_texture_unready = true;
+                else t.checked_sequence = now;
+            }
+        }
+        t.used_frame = CurrentFrameNumber();
+        return;
+    }
     EnsureImage(t);
     // Diagnostic: CPU-sourced textures uploaded again each frame (finds textures the game keeps
     // writing on the CPU after their first use).
@@ -392,7 +469,7 @@ void EnsureUploaded(Texture& t) {
     // (without page protection, small textures (menus' labels and icons) are hashed again every 16 frames)
     constexpr u64 HashedMax = 512u << 10;
     const auto hash_of = [](const Texture& tex, u64* out) {
-        const auto range = LookupAddress(tex.storage);
+        const auto range = LookupAddressCpu(tex.storage);
         if (!range.pool || range.available < tex.storage_size) return false;
         const u64* w = reinterpret_cast<const u64*>(range.cpu_address);
         u64 h = 0x9e3779b97f4a7c15ull ^ tex.storage_size;
@@ -400,7 +477,7 @@ void EnsureUploaded(Texture& t) {
         *out = h;
         return true;
     };
-    const bool by_content = !PageProtectionUsable();
+    const bool by_content = !TextureWatchUsable();
     if (by_content && t.uploaded && !t.gpu_written && t.storage && t.storage_size <= HashedMax && CurrentFrameNumber() >= t.hash_frame + 16) {
         t.hash_frame = CurrentFrameNumber();
         u64 h; if (hash_of(t, &h) && h != t.content_hash) { t.uploaded = false; ++cpu_reuploads; }
@@ -470,13 +547,16 @@ void UploadTexelsNow(Texture& t) {
         t.uploaded = true;
         return;
     }
+    if (BatchTraceOn()) { char note[160]; std::snprintf(note, sizeof note, "[upload %ux%ux%u f%u L%u l%u astc%d bc3%d vk%d]", t.width, t.height, t.depth, t.format, t.levels, t.layers, (int)t.decoded_astc, (int)t.bc3, (int)t.info.vk); BatchTraceNote(note); }
     if (GpuAstc(t)) { UploadAstcOnGpu(t); return; }
     std::vector<VkBufferImageCopy> copies;
     u64 linear_size = 0;
     for (u32 level = 0; level < t.levels; ++level) {
         const auto& m = t.mips[level];
         linear_size = (linear_size + 15) & ~15ULL;
-        const u64 bytes = t.decoded_astc ? (u64)m.width*m.height*m.depth*4 : t.decoded_rgb9e5 ? (u64)m.width*m.height*m.depth*8 : (u64)((m.width + t.info.block_w - 1) / t.info.block_w) *
+        // (a texture kept as BC3 is staged as its blocks, a quarter of its texels: the terrain's 90-layer arrays were
+        // 900 MiB of staging each as texels, and a Steam Deck's 8 GiB of GPU-mappable memory ran out at the first area)
+        const u64 bytes = t.decoded_astc && t.bc3 && m.depth == 1 ? (u64)((m.width + 3) / 4) * ((m.height + 3) / 4) * 16 : t.decoded_astc ? (u64)m.width*m.height*m.depth*4 : t.decoded_rgb9e5 ? (u64)m.width*m.height*m.depth*8 : (u64)((m.width + t.info.block_w - 1) / t.info.block_w) *
             ((m.height + t.info.block_h - 1) / t.info.block_h) * m.depth * t.info.bytes;
         for (u32 layer = 0; layer < t.layers; ++layer) {
             VkBufferImageCopy copy{}; copy.bufferOffset = linear_size;
@@ -499,7 +579,10 @@ void UploadTexelsNow(Texture& t) {
             ReadStorage(t.storage + m.offset + layer * t.layer_stride, storage.data(), storage.size());
             auto* dst = static_cast<u8*>(staging.mapped) + copies[index++].bufferOffset;
             auto* output = dst;
-            std::vector<u8> compressed;
+            std::vector<u8> compressed, picture; // (picture: the decoded texels of a texture kept as BC3, encoded below)
+            const bool encode = t.decoded_astc && t.bc3 && m.depth == 1;
+            if (encode) { picture.resize((u64)m.width * m.height * 4); output = picture.data(); }
+            u8* const staged = dst;
             if(t.decoded_astc||t.decoded_rgb9e5){compressed.resize((u64)width*height*m.depth*t.info.bytes);dst=compressed.data();}
             // Rows are copied in 16-byte runs: pitch-linear rows are contiguous, and a block-linear GOB
             // keeps each aligned 16-byte run of a row contiguous (only higher address bits move).
@@ -535,6 +618,7 @@ void UploadTexelsNow(Texture& t) {
                             output+(u64)r0*t.info.block_h*m.width*4);});}
             }
             upload_decode_ns+=(u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-_t_dc).count();
+            if(encode)EncodeBc3(picture.data(),m.width,m.height,staged);
             if(t.decoded_rgb9e5)DecodeRgb9e5(compressed.data(),compressed.size()/4,reinterpret_cast<u16*>(output));
         }
     }

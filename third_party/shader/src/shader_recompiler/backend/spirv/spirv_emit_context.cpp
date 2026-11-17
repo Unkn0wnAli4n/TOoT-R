@@ -1916,7 +1916,11 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     mesh_attribute_words = (std::max)(
         mesh_primitive_base + Common::DivCeil(mesh_info.max_primitives, 32U) * primitive_lines * 32,
         1U);
-    mesh_map_bytes = 4 + 3 * mesh_info.max_primitives;
+    // (from Longshot f9286c45) Whole blocks of 32 primitives, as the attributes: a mesh program writes the index bytes of
+    // every primitive block, lanes past max_primitives too. Sized to max_primitives, those writes were clamped onto the
+    // last byte, the last primitive's last corner: with 126 primitives (most of OoT's) a stray vertex, flashing triangles
+    // over foliage and ground.
+    mesh_map_bytes = 4 + 3 * Common::DivCeil(mesh_info.max_primitives, 32U) * 32;
     mesh_shared_u32 = TypePointer(spv::StorageClass::Workgroup, U32[1]);
     mesh_attributes = DefineVariable(*this, TypeArray(U32[1], Const(mesh_attribute_words)),
                                      std::nullopt, spv::StorageClass::Workgroup);
@@ -1979,6 +1983,8 @@ void EmitContext::DefineMesh(const IR::Program& program) {
             if (!Sirit::ValidId(output_position)) {
                 output_position = DefineVariable(*this, TypeArray(F32[4], vertex_count),
                                                  spv::BuiltIn::Position, spv::StorageClass::Output);
+                { static const bool invariant = [] { const char* e = std::getenv("OOT_POSITION_INVARIANT"); return !e || std::atoi(e) != 0; }();
+                  if (invariant) Decorate(output_position, spv::Decoration::Invariant); } // (as the vertex stage's, below)
             }
             return {output_position,
                     static_cast<u32>(attribute) - static_cast<u32>(IR::Attribute::PositionX), true};
@@ -1995,6 +2001,23 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     for (const u32 line : mesh_info.vertex_lines) {
         mesh_vertex_targets.push_back(target(line, false));
     }
+    // (from Longshot) A component of a generic output no line writes was undefined at the fragment stage (the console's: 0,
+    // and 1 for .w, as a vertex stage's defaults here): foliage and props drawn by mesh programs came out neon or white.
+    // OOT_MESH_NO_DEFAULTS=1: as before.
+    if (!std::getenv("OOT_MESH_NO_DEFAULTS")) {
+        std::array<u32, IR::NUM_GENERICS> written{};
+        for (const u32 line : mesh_info.vertex_lines) {
+            const IR::Attribute attribute{line};
+            if (IR::IsGeneric(attribute)) {
+                written[IR::GenericAttributeIndex(attribute)] |= 1U << IR::GenericAttributeElement(attribute);
+            }
+        }
+        for (u32 index = 0; index < IR::NUM_GENERICS; ++index) {
+            if (Sirit::ValidId(generics[0][index]) && written[index] != 0xF) {
+                mesh_vertex_defaults.push_back({generics[0][index], 0xFU & ~written[index]});
+            }
+        }
+    }
     for (const u32 line : mesh_info.primitive_lines) {
         mesh_primitive_targets.push_back(target(line, true));
     }
@@ -2009,6 +2032,12 @@ void EmitContext::DefineOutputs(const IR::Program& program) {
     if (runtime_info.convert_depth_mode || info.stores.AnyComponent(IR::Attribute::PositionX) ||
         stage == Stage::VertexB) {
         output_position = DefineOutput(*this, F32[4], invocations, spv::BuiltIn::Position);
+        // (TOoT:R, after Longshot's amd-fix / NX2navi's patch 0007) The game draws a depth pre-pass and then shades with a
+        // depth EQUAL test: both passes must compute the same position, which a compiler only promises with Invariant.
+        // Without it spots of the shading pass were rejected: Kokiri's doors and lines on its trees stayed white.
+        // OOT_POSITION_INVARIANT=0: as before.
+        static const bool invariant = [] { const char* e = std::getenv("OOT_POSITION_INVARIANT"); return !e || std::atoi(e) != 0; }();
+        if (invariant) Decorate(output_position, spv::Decoration::Invariant);
     }
     if (info.stores[IR::Attribute::PointSize] || runtime_info.fixed_state_point_size) {
         if (stage == Stage::Fragment) {

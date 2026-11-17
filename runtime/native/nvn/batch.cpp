@@ -1,3 +1,13 @@
+#ifndef _WIN32
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+#include <fcntl.h>
+#include <unistd.h>
+#include <dlfcn.h>
+#endif
+#include <cstring>
+#include <filesystem>
 #include <thread>
 #include <condition_variable>
 #include <mutex>
@@ -24,6 +34,9 @@ namespace {
 
 struct Batch {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
+    std::vector<VkCommandBuffer> earlier; // (SplitForHoist) ended parts and hoist buffers, in execution order before cmd
+    VkCommandBuffer hoist = VK_NULL_HANDLE; // the last of `earlier` while it still takes commands
+    bool hoist_live = false, hoist_pass_begun = false; // (HoistBuffer: nothing but one pass's draws since the split)
     VkFence fence = VK_NULL_HANDLE;
     std::vector<std::function<void()>> after;
     std::vector<VkDescriptorPool> pools; // all reset after a flush
@@ -46,6 +59,7 @@ struct Batch {
 // order, once they complete (RetireOne); the CPU records the next batch meanwhile.
 struct InFlight {
     VkCommandBuffer cmd = VK_NULL_HANDLE, uploads = VK_NULL_HANDLE;
+    std::vector<VkCommandBuffer> earlier;
     VkFence fence = VK_NULL_HANDLE;
     VkQueryPool timer = VK_NULL_HANDLE;
     u64 serial = 0; // (the timeline value signalled at its completion)
@@ -58,6 +72,32 @@ std::deque<InFlight> in_flight;
 struct Writeback { u64 serial; VkCommandBuffer cmd; std::vector<std::pair<u64, u64>> pages; };
 std::deque<Writeback> writebacks; // (submitted write-back copies, oldest first)
 // (batch lock held) Completed write-back copies: their pages become accessible again.
+// The batches' command buffers have a command pool of their own. A Vulkan command pool takes one thread at a time, for
+// recording into any of its buffers as much as for allocating and freeing them: the recorder thread records a pass's
+// draws while other threads retire finished batches and the presenting thread records its frame. So this pool is
+// touched only where the recorder is idle (no batch open, or its queue drained under the batch lock), and buffers of
+// finished batches wait in `dead_commands` until such a point (FreeDeadCommands) instead of being freed by whichever
+// thread retires them. (Sharing one pool went unnoticed on NVIDIA; Vulkan's validation layer reports it, and a driver
+// that keeps per-pool lists unlocked, as Mesa does, can lose command data to it.)
+VkCommandPool BatchPool() {
+    static VkCommandPool pool = [] {
+        auto& vk = Vk();
+        VkCommandPoolCreateInfo ci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        ci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; ci.queueFamilyIndex = vk.queue_family;
+        VkCommandPool made = VK_NULL_HANDLE; VK_CHECK(vkCreateCommandPool(vk.device, &ci, nullptr, &made));
+        return made;
+    }();
+    return pool;
+}
+std::mutex dead_commands_mutex;
+std::vector<VkCommandBuffer> dead_commands;
+void DeadCommand(VkCommandBuffer cmd) { if (cmd) { std::lock_guard lock{dead_commands_mutex}; dead_commands.push_back(cmd); } }
+void FreeDeadCommands() { // (batch lock held, the recorder idle)
+    std::vector<VkCommandBuffer> dead;
+    { std::lock_guard lock{dead_commands_mutex}; dead.swap(dead_commands); }
+    if (!dead.empty()) vkFreeCommandBuffers(Vk().device, BatchPool(), (u32)dead.size(), dead.data());
+}
+
 void ReapWritebacks() {
     if (writebacks.empty()) return;
     auto& vk = Vk();
@@ -66,7 +106,7 @@ void ReapWritebacks() {
     while (!writebacks.empty() && writebacks.front().serial <= done) {
         Writeback& w = writebacks.front();
         WritebackDone(w.pages, w.serial);
-        { std::lock_guard queue{vk.queue_mutex}; vkFreeCommandBuffers(vk.device, vk.command_pool, 1, &w.cmd); }
+        DeadCommand(w.cmd);
         writebacks.pop_front();
     }
 }
@@ -87,7 +127,13 @@ struct GpuProfile {
     std::vector<u64> keys;
     std::map<u64,std::pair<double,u64>> totals;
 } gpu_profile;
-bool GpuProfiling() { static const bool enabled=std::getenv("OOT_GPU_PROFILE")!=nullptr;return enabled; }
+// OOT_GPU_PROFILE=1: from the start. OOT_GPU_PROFILE_FILE=<path>: while that file exists (checked every 30 frames:
+// started in play, as a start in this mode no longer reaches the title).
+std::atomic<bool> gpu_profiling{std::getenv("OOT_GPU_PROFILE")!=nullptr};
+bool GpuProfiling() { return gpu_profiling.load(std::memory_order_relaxed); }
+}
+bool GpuProfilingNow() { return GpuProfiling(); }
+namespace {
 
 VkDescriptorPool MakePool() {
     auto& vk = Vk();
@@ -189,8 +235,139 @@ struct Unsynced {
 } unsynced;
 u64 stat_passes_unbarriered = 0;
 } // namespace
+// ---- the recorder thread (PassDraw's async draws) ----
+namespace {
+struct AsyncItem { AsyncDraw run; void* packet; VkCommandBuffer cmd; u64 serial; };
+struct AsyncQueueState {
+    AsyncItem items[AsyncDrawQueue];
+    alignas(64) std::atomic<u64> head{0};   // queued (written by the thread holding the batch lock)
+    alignas(64) std::atomic<u64> tail{0};   // recorded (written by the recorder thread)
+    alignas(64) std::atomic<bool> sleeping{false};
+    std::atomic<bool> kick{false};          // (a sleeping recorder is asked to record what waits, however little)
+    std::mutex mutex; std::condition_variable wake;
+    std::once_flag started;
+} async_queue;
+void CpuRelax() {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#else
+    std::this_thread::yield();
+#endif
+}
+// How the recorder waits for draws. With cores to spare it spins through the gaps between them (microseconds) and is
+// woken for the first draw after a sleep. On a CPU of 8 threads or fewer (a Steam Deck: 4 cores, and a power budget
+// the GPU shares) the spinning was half a hardware thread of nothing, 13 of the thread's 16 percent of the process's
+// samples: there it sleeps at once and is woken when a batch of draws waits or somebody needs them recorded.
+// OOT_RECORD_SPIN=<iterations>, OOT_RECORD_BATCH=<draws>.
+int RecorderSpin() {
+    static const int n = [] { const char* e = std::getenv("OOT_RECORD_SPIN"); return e ? std::atoi(e) : std::thread::hardware_concurrency() <= 8 ? 64 : 4000; }();
+    return n;
+}
+u64 RecorderBatch() {
+    static const u64 n = [] { const char* e = std::getenv("OOT_RECORD_BATCH"); return (u64)std::max(1, e ? std::atoi(e) : std::thread::hardware_concurrency() <= 8 ? 12 : 1); }();
+    return n;
+}
+void KickRecorder() {
+    auto& q = async_queue;
+    std::lock_guard lock{q.mutex}; q.kick.store(true, std::memory_order_seq_cst); q.wake.notify_one();
+}
+void RecorderLoop() {
+    rt::SetThreadName("nvn-record");
+    auto& q = async_queue;
+    for (;;) {
+        const u64 t = q.tail.load(std::memory_order_relaxed);
+        if (t == q.head.load(std::memory_order_acquire)) {
+            // (draws come in runs, microseconds apart: spin through the gaps, sleep when the run is over)
+            bool found = false;
+            for (int spin = 0; spin < RecorderSpin() && !found; ++spin) { CpuRelax(); found = t != q.head.load(std::memory_order_acquire); }
+            if (!found) {
+                std::unique_lock lock{q.mutex};
+                q.sleeping.store(true, std::memory_order_seq_cst);
+                q.wake.wait(lock, [&] { return q.kick.load(std::memory_order_seq_cst) || q.head.load(std::memory_order_seq_cst) - t >= RecorderBatch(); });
+                q.kick.store(false, std::memory_order_seq_cst);
+                q.sleeping.store(false, std::memory_order_seq_cst);
+            }
+            continue;
+        }
+        const AsyncItem& item = q.items[t % AsyncDrawQueue];
+        item.run(item.cmd, item.packet, item.serial);
+        // A driver may record straight into write-combined GPU memory (Mesa's RADV does: its command stream). Such
+        // stores sit in this core's write-combining buffers until something evicts them, and nothing in this loop
+        // did: the thread that submits the buffer, on another core, handed the GPU a command stream whose last
+        // lines were not there yet. Steam Deck: command-processor and index-fetch page faults and ring timeouts
+        // within seconds of the title in every run with this thread, none with its path run on the executor's
+        // thread (2026-11-17). The fence evicts them before the item counts as recorded.
+#if defined(__x86_64__) || defined(__i386__)
+        static const bool fence = std::getenv("OOT_RECORD_NO_FENCE") == nullptr;
+        if (fence) _mm_sfence();
+#endif
+        q.tail.store(t + 1, std::memory_order_release);
+    }
+}
+// (batch lock held) Every queued draw is in the command buffer when this returns.
+inline void DrainAsync() {
+    auto& q = async_queue;
+    const u64 h = q.head.load(std::memory_order_relaxed);
+    while (q.tail.load(std::memory_order_acquire) != h) {
+        if (q.sleeping.load(std::memory_order_seq_cst)) KickRecorder(); // (it may sleep on less than a batch)
+        CpuRelax();
+    }
+}
+void PushAsync(const AsyncItem& item) {
+    auto& q = async_queue;
+    // (OOT_ASYNC_INLINE=1: the recorder's path, on this thread; =0: the recorder thread. On a CPU of 8 threads or fewer -
+    // a Steam Deck - that is the default: there the executor stood a seventh of its time waiting for the recorder at
+    // the points that need its draws recorded (every mesh draw of the compute fallback is one), which cost what the
+    // thread saved: Castle Town 35.6 ms a frame of executor time inline against 37.2 with the thread, 2026-11-17.)
+    static const bool inline_mode = [] { const char* e = std::getenv("OOT_ASYNC_INLINE"); return e ? std::atoi(e) != 0 : std::thread::hardware_concurrency() <= 8; }();
+    if (inline_mode) { item.run(item.cmd, item.packet, item.serial); return; }
+    std::call_once(q.started, [] { std::thread(RecorderLoop).detach(); });
+    const u64 h = q.head.load(std::memory_order_relaxed);
+    while (h - q.tail.load(std::memory_order_acquire) >= AsyncDrawQueue) { if (q.sleeping.load(std::memory_order_seq_cst)) KickRecorder(); CpuRelax(); }
+    q.items[h % AsyncDrawQueue] = item;
+    q.head.store(h + 1, std::memory_order_seq_cst);
+    if (q.sleeping.load(std::memory_order_seq_cst) && h + 1 - q.tail.load(std::memory_order_acquire) >= RecorderBatch()) { std::lock_guard lock{q.mutex}; q.wake.notify_one(); }
+    // (OOT_ASYNC_SYNC=1, diagnosis: the recorder thread records, and this thread waits for it - the other thread
+    // without the concurrency)
+    static const bool sync = std::getenv("OOT_ASYNC_SYNC") != nullptr;
+    if (sync) while (q.tail.load(std::memory_order_acquire) != h + 1) { if (q.sleeping.load(std::memory_order_seq_cst)) KickRecorder(); CpuRelax(); }
+}
+} // namespace
+void WaitAsyncDraws() { std::lock_guard lock{BatchMutex()}; DrainAsync(); }
+bool AsyncDrawsEnabled() {
+    static const bool on = [] { const char* e = std::getenv("OOT_ASYNC_DRAWS"); if (e) return std::atoi(e) != 0;
+        return std::thread::hardware_concurrency() >= 4; }();
+    return on;
+}
+// OOT_BATCH_TRACE=<file> (diagnosis of a GPU that stops answering): a line for every batch when it is submitted, naming
+// what was recorded into it in order (i<key>: an item and its profile key, a compute program's or a shader's address, or
+// r<offset>: the caller's return address in the executable when it has none; p<key>: a render pass's first draw; l: light
+// work; h: a split for hoisted work), and a line when it has finished. The last batches submitted and not finished are
+// the ones the GPU was working on. Written with plain write(): the lines survive the game being killed.
+#ifndef _WIN32
+int batch_trace_fd = [] { const char* f = std::getenv("OOT_BATCH_TRACE"); return f ? open(f, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644) : -1; }();
+#else
+int batch_trace_fd = -1;
+#endif
+std::string batch_trace_items;
+void TraceItem(char kind, u64 key) {
+    if (batch_trace_fd < 0 || batch_trace_items.size() > 60000) return;
+    char t[32]; std::snprintf(t, sizeof t, " %c%llx", kind, (unsigned long long)key); batch_trace_items += t;
+}
+#ifndef _WIN32
+void TraceLine(const std::string& line) { if (batch_trace_fd >= 0) { [[maybe_unused]] auto n = write(batch_trace_fd, line.data(), line.size()); } }
+u64 TraceCaller(void* address) { Dl_info info{}; dladdr(reinterpret_cast<void*>(&BatchMutex), &info); return reinterpret_cast<u64>(address) - reinterpret_cast<u64>(info.dli_fbase); }
+#else
+void TraceLine(const std::string&) {}
+u64 TraceCaller(void*) { return 0; }
+#endif
+
+bool BatchTraceOn() { return batch_trace_fd >= 0; }
+void BatchTraceNote(const char* text) { if (batch_trace_fd >= 0 && batch_trace_items.size() < 60000) { std::lock_guard lock{BatchMutex()}; batch_trace_items += ' '; batch_trace_items += text; } }
+
 void EndPassLocked() {
     if (!batch.pass_open) return;
+    DrainAsync();
     static const bool trace = std::getenv("OOT_PASS_TRACE") != nullptr; // (what ends render passes: callers by offset)
     if (trace) {
         static std::map<std::string, u64> callers; static u64 n = 0;
@@ -217,7 +394,16 @@ void EndPassLocked() {
 bool RecordInPass(const std::function<void(VkCommandBuffer)>& record) {
     std::lock_guard lock{BatchMutex()};
     if (!batch.cmd || !batch.pass_open) return false;
+    DrainAsync();
     record(batch.cmd);
+    return true;
+}
+
+bool RecordInPassAsync(AsyncDraw run, void* packet) {
+    std::lock_guard lock{BatchMutex()};
+    if (!batch.cmd || !batch.pass_open) return false;
+    if (AsyncDrawsEnabled()) PushAsync({run, packet, batch.cmd, other_serial});
+    else run(batch.cmd, packet, other_serial);
     return true;
 }
 
@@ -244,9 +430,9 @@ void BeginWork() {
     EndPassLocked();
     if (!batch.cmd) {
         VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        ai.commandPool = vk.command_pool;
+        FreeDeadCommands(); // (no batch is open: nothing records)
+        ai.commandPool = BatchPool();
         ai.commandBufferCount = 1;
-        std::lock_guard queue{vk.queue_mutex}; // the command pool is shared with presentation
         VK_CHECK(vkAllocateCommandBuffers(vk.device, &ai, &batch.cmd));
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -282,6 +468,7 @@ void BeginWork() {
 }
 
 bool PassOpenWithKey(const std::vector<u64>& key) {
+    if (resolve_worker) return true; // (its draws go into one pass per key when they are committed)
     std::lock_guard lock{BatchMutex()};
     return batch.cmd && batch.pass_open && batch.pass_key == key && !GpuProfiling();
 }
@@ -289,7 +476,8 @@ bool PassOpenWithKey(const std::vector<u64>& key) {
 void NoteUnorderedWork() { std::lock_guard lock{BatchMutex()}; unsynced.unknown = true; }
 
 void PassDraw(const std::vector<u64>& key, const std::function<void(VkCommandBuffer)>& begin,
-              const std::function<void(VkCommandBuffer)>& draw, u64 profile_key, const PassAccess* access) {
+              const std::function<void(VkCommandBuffer)>& draw, u64 profile_key, const PassAccess* access,
+              AsyncDraw async, void* packet) {
     std::lock_guard lock{BatchMutex()};
     if (GpuProfiling()) { // per-item timing needs separate items
         Immediate([&](VkCommandBuffer cmd) {
@@ -320,13 +508,16 @@ void PassDraw(const std::vector<u64>& key, const std::function<void(VkCommandBuf
                 EndPassLocked(); ++record_serial; ++other_serial; ++stat_passes_unbarriered;
             } else { work_kind = 2; BeginWork(); }
         }
+        if (batch.hoist_live) { if (batch.hoist_pass_begun) batch.hoist_live = false; else batch.hoist_pass_begun = true; } // (the split's own pass, once)
+        if (batch_trace_fd >= 0) TraceItem('p', profile_key);
         begin(batch.cmd);
         ++stat_passes; passes_begun.fetch_add(1, std::memory_order_relaxed); // (present.cpp: a loading screen draws next to nothing)
         reopen_light = false;
         batch.pass_open = true;
         batch.pass_key = key;
     }
-    draw(batch.cmd);
+    if (async) PushAsync({async, packet, batch.cmd, other_serial});
+    else { DrainAsync(); draw(batch.cmd); }
     ++record_serial;
     static const bool tracking = std::getenv("OOT_PASS_HAZARDS") != nullptr;
     if (tracking) { if (access) unsynced.Add(*access); else unsynced.unknown = true; }
@@ -339,6 +530,7 @@ bool ImmediateUnordered(const std::function<void(VkCommandBuffer)>& record, u64 
     std::lock_guard lock{BatchMutex()};
     if (GpuProfiling() || !batch.cmd || batch.pass_open || serial != record_serial) return false;
     ++stat_items; ++stat_unordered;
+    batch.hoist_live = false;
     batch.light_only = false;
     unsynced.unknown = true;
     record(batch.cmd);
@@ -352,12 +544,46 @@ void ImmediateLight(const std::function<void(VkCommandBuffer)>& record) {
     ++stat_items;
     if (GpuProfiling() || !batch.cmd) { Immediate(record); return; }
     const bool light = batch.pass_open || batch.light_only;
+    batch.hoist_live = false;
+    if (batch_trace_fd >= 0) TraceItem('l', TraceCaller(__builtin_return_address(0)));
     EndPassLocked();
     unsynced.unknown = true;
     ++record_serial;
     ++other_serial;
     batch.light_only = light;
     record(batch.cmd);
+}
+
+VkCommandBuffer SplitForHoist() {
+    std::lock_guard lock{BatchMutex()};
+    auto& vk = Vk();
+    if (!batch.cmd || batch.pass_open || GpuProfiling()) return VK_NULL_HANDLE;
+    VkCommandBuffer made[2];
+    {
+        VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool = BatchPool(); ai.commandBufferCount = 2;
+        VK_CHECK(vkAllocateCommandBuffers(vk.device, &ai, made));
+    }
+    if (batch.hoist) VK_CHECK(vkEndCommandBuffer(batch.hoist));
+    VK_CHECK(vkEndCommandBuffer(batch.cmd));
+    batch.earlier.push_back(batch.cmd);
+    batch.earlier.push_back(made[0]);
+    batch.hoist = made[0]; batch.cmd = made[1];
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkBeginCommandBuffer(batch.hoist, &bi));
+    VK_CHECK(vkBeginCommandBuffer(batch.cmd, &bi));
+    ++record_serial; ++other_serial; // (a new command buffer: nothing a draw set on the old one is in effect)
+    if (batch_trace_fd >= 0) TraceItem('h', 0);
+    batch.hoist_live = true; batch.hoist_pass_begun = false;
+    return batch.hoist;
+}
+
+VkCommandBuffer HoistBuffer() {
+    std::lock_guard lock{BatchMutex()};
+    if (!batch.hoist_live || !batch.hoist || GpuProfiling()) return VK_NULL_HANDLE;
+    DrainAsync(); // (the recorder thread records the pass's draws into a buffer of the same command pool: one at a time)
+    return batch.hoist;
 }
 
 void Immediate(const std::function<void(VkCommandBuffer)>& record, u64 profile_key) {
@@ -382,6 +608,8 @@ void Immediate(const std::function<void(VkCommandBuffer)>& record, u64 profile_k
     }
     auto& vk = Vk();
     ++stat_items;
+    if (batch_trace_fd >= 0) { if (profile_key) TraceItem('i', profile_key); else TraceItem('r', TraceCaller(__builtin_return_address(0))); }
+    batch.hoist_live = false;
     BeginWork();
     {
     const bool profile=GpuProfiling()&&gpu_profile.keys.size()*2<GpuProfile::Capacity;
@@ -391,6 +619,8 @@ void Immediate(const std::function<void(VkCommandBuffer)>& record, u64 profile_k
             VK_CHECK(vkCreateQueryPool(vk.device,&qi,nullptr,&gpu_profile.pool));}
         vkCmdResetQueryPool(batch.cmd,gpu_profile.pool,query,2);
         vkCmdWriteTimestamp(batch.cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,gpu_profile.pool,query);
+        // (work without a shader: by its caller, as an offset in the executable below 2^32: addr2line -f -e tootr <offset>)
+        if(!profile_key){Dl_info di{};dladdr(reinterpret_cast<void*>(&BatchMutex),&di);profile_key=(u64)((char*)__builtin_return_address(0)-(char*)di.dli_fbase);}
         gpu_profile.keys.push_back(profile_key);
     }
     record(batch.cmd);
@@ -398,6 +628,12 @@ void Immediate(const std::function<void(VkCommandBuffer)>& record, u64 profile_k
     }
 }
 
+void PollGpuProfileSwitch() {
+    static const char* file=std::getenv("OOT_GPU_PROFILE_FILE");
+    if(!file)return;
+    const bool on=std::filesystem::exists(file);
+    if(on!=gpu_profiling.load()){Submit();gpu_profiling.store(on);RT_LOG("GPU profile %s",on?"on":"off");}
+}
 void ReportGpuProfile() {
     if(!GpuProfiling())return;
     std::vector<std::pair<double,u64>> top;
@@ -405,7 +641,7 @@ void ReportGpuProfile() {
     std::sort(top.rbegin(),top.rend());
     {double sum=0;u64 calls=0;for(const auto& [k,v]:gpu_profile.totals){sum+=v.first;calls+=v.second;}
      RT_LOG("GPU profile total: %.3f ms/frame in %llu items over %zu shaders",sum/300e6,(unsigned long long)calls/300,gpu_profile.totals.size());}
-    for(size_t i=0;i<std::min<size_t>(12,top.size());++i){const auto [ns,key]=top[i];
+    for(size_t i=0;i<std::min<size_t>(45,top.size());++i){const auto [ns,key]=top[i];
         RT_LOG("GPU profile shader %#llx: %.3f ms/frame, %llu calls",(unsigned long long)key,ns/300e6,(unsigned long long)gpu_profile.totals[key].second);}
     gpu_profile.totals.clear();
 }
@@ -436,7 +672,7 @@ bool RetireOne(bool wait) {
     // (the game's sync waits held the batch lock while the GPU worked: the executor, blocked behind it 23% of
     // its time in Kokiri, could not record the next frame meanwhile. OOT_LOCKED_GPU_WAITS=1: as before.)
     static const bool unlocked_waits = std::getenv("OOT_LOCKED_GPU_WAITS") == nullptr;
-    if (wait && unlocked_waits && BatchMutex().depth == 1 && vkGetFenceStatus(vk.device, in_flight.front().fence) != VK_SUCCESS) {
+    if (wait && unlocked_waits && !GpuProfiling() && BatchMutex().depth == 1 && vkGetFenceStatus(vk.device, in_flight.front().fence) != VK_SUCCESS) {
         const u64 serial = in_flight.front().serial;
         const VkSemaphore timeline = Timeline();
         BatchMutex().unlock();
@@ -498,12 +734,14 @@ bool RetireOne(bool wait) {
     }
     {
         std::lock_guard queue{vk.queue_mutex};
-        vkFreeCommandBuffers(vk.device, vk.command_pool, 1, &f.cmd);
-        if (f.uploads) vkFreeCommandBuffers(vk.device, vk.command_pool, 1, &f.uploads);
+        DeadCommand(f.cmd);
+        for (VkCommandBuffer part : f.earlier) DeadCommand(part);
+        DeadCommand(f.uploads);
     }
     UnwatchPages(f.watched);
     for (VkDescriptorPool pool : f.pools) { vkResetDescriptorPool(vk.device, pool, 0); spare_pools.push_back(pool); }
     auto actions = std::move(f.after);
+    if (batch_trace_fd >= 0) TraceLine("done " + std::to_string(in_flight.front().serial) + "\n");
     in_flight.pop_front();
     ++retired_serial; retired_serial_atomic.store(retired_serial, std::memory_order_release);
     for (auto& action : actions) action();
@@ -575,9 +813,8 @@ void Submit() {
     // Guest memory: CPU writes go to the pools' device copies before the batch, its GPU writes
     // come back to guest memory at its end.
     {
-        std::lock_guard queue{vk.queue_mutex}; // the command pool is shared with presentation
         VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        ai.commandPool = vk.command_pool; ai.commandBufferCount = 1;
+        ai.commandPool = BatchPool(); ai.commandBufferCount = 1; // (the pass has ended: the recorder's queue is drained)
         VK_CHECK(vkAllocateCommandBuffers(vk.device, &ai, &f.uploads));
         VK_CHECK(vkAllocateCommandBuffers(vk.device, &ai, &writeback_cmd));
     }
@@ -593,19 +830,25 @@ void Submit() {
     VK_CHECK(vkEndCommandBuffer(writeback_cmd));
     vkCmdWriteTimestamp(batch.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, batch.timer, 1);
     VK_CHECK(vkEndCommandBuffer(batch.cmd));
+    if (batch_trace_fd >= 0) { TraceLine("submit " + std::to_string(submitted_serial + 1) + ":" + batch_trace_items + "\n"); batch_trace_items.clear(); } // (before the submit: a driver that waits in it may never return)
+    if (batch.hoist) { VK_CHECK(vkEndCommandBuffer(batch.hoist)); batch.hoist = VK_NULL_HANDLE; }
+    batch.hoist_live = false;
     if (!spare_fences.empty()) { f.fence = spare_fences.back(); spare_fences.pop_back(); }
     else { VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VK_CHECK(vkCreateFence(vk.device, &fi, nullptr, &f.fence)); }
     {
         std::lock_guard queue{vk.queue_mutex};
-        const VkCommandBuffer buffers[2]{f.uploads, batch.cmd};
+        std::vector<VkCommandBuffer> buffers; // (uploads, the parts SplitForHoist ended and their hoist buffers, the last part)
+        if (any_uploads) buffers.push_back(f.uploads);
+        buffers.insert(buffers.end(), batch.earlier.begin(), batch.earlier.end());
+        buffers.push_back(batch.cmd);
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         f.serial = submitted_serial + 1;
         const VkSemaphore timeline = Timeline();
         VkTimelineSemaphoreSubmitInfo ti{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
         ti.signalSemaphoreValueCount = 1; ti.pSignalSemaphoreValues = &f.serial;
         si.pNext = &ti; si.signalSemaphoreCount = 1; si.pSignalSemaphores = &timeline;
-        si.commandBufferCount = any_uploads ? 2 : 1;
-        si.pCommandBuffers = any_uploads ? buffers : &batch.cmd;
+        si.commandBufferCount = (u32)buffers.size();
+        si.pCommandBuffers = buffers.data();
         {   // (time in vkQueueSubmit: on amdgpu it grows with the imported memory)
             const auto t0 = std::chrono::steady_clock::now();
             VK_CHECK(vkQueueSubmit(vk.queue, 1, &si, f.fence));
@@ -614,7 +857,7 @@ void Submit() {
             total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             if (++n % 500 == 0) { RT_LOG("vkQueueSubmit: %.2f ms each (last 500)", total / 500); total = 0; }
         }
-        if (!any_uploads) { vkFreeCommandBuffers(vk.device, vk.command_pool, 1, &f.uploads); f.uploads = VK_NULL_HANDLE; }
+        if (!any_uploads) { DeadCommand(f.uploads); f.uploads = VK_NULL_HANDLE; }
         if (!pending_pages.empty()) { // (the write-back copy: after the batch, which completes without it)
             const VkSemaphore wb = WritebackTimeline();
             // On its own queue (the main queue's next submissions, such as the fence the game waits on,
@@ -637,7 +880,7 @@ void Submit() {
             if (own) { std::lock_guard copy{vk.copy_mutex}; VK_CHECK(vkQueueSubmit(vk.copy_queue, 1, &wsi, VK_NULL_HANDLE)); }
             else VK_CHECK(vkQueueSubmit(vk.queue, 1, &wsi, VK_NULL_HANDLE));
         } else {
-            vkFreeCommandBuffers(vk.device, vk.command_pool, 1, &writeback_cmd);
+            DeadCommand(writeback_cmd);
         }
     }
     pools_lock.unlock();
@@ -646,6 +889,7 @@ void Submit() {
         writebacks.push_back({f.serial, writeback_cmd, std::move(pending_pages)});
     }
     f.cmd = batch.cmd; f.timer = batch.timer;
+    f.earlier = std::move(batch.earlier); batch.earlier.clear();
     f.after = std::move(batch.after); f.pools = std::move(batch.pools);
     WatchGpuWrites(batch.pending_writeback, &f.watched);
     f.writes = std::move(batch.pending_writes); f.reports = std::move(batch.pending_reports);
@@ -829,7 +1073,11 @@ void ReportDeviceAhead() {
            (deferred_bytes - eager_bytes) / 300.0 / 1048576.0, eager_bytes / 300.0 / 1048576.0, recalled_bytes / 300.0 / 1048576.0, pages);
     deferred_bytes = recalled_bytes = eager_bytes = 0;
 }
+std::atomic<u64> pending_write_serial{0};
+u64 PendingWriteSerial() { return pending_write_serial.load(std::memory_order_relaxed); }
 void NotePendingWrite(u64 address, u64 size, bool write_back) {
+    pending_write_serial.fetch_add(1, std::memory_order_relaxed);
+    if (pending_write_watch) pending_write_watch->push_back({address, size});
     if (!size) return;
     static const u64 watch = std::getenv("OOT_WRITE_WATCH") ? std::strtoull(std::getenv("OOT_WRITE_WATCH"), nullptr, 16) : 0;
     if (watch && address <= watch && watch < address + size) {
@@ -888,6 +1136,31 @@ void WaitForWrites(u64 address, u64 size) {
     std::lock_guard lock{BatchMutex()};
     if (TimelineOn()) tl_end.locked = TimelineMs();
     RecallDeviceAhead(address, size);
+    {   // OOT_READBACK_LATE=<rule>[,<rule>...] (after Longshot's readback_late.h): reads that do not wait for the GPU work
+        // writing them; the game then reads what memory holds, the results of the work before. Rules: `newest`, the
+        // range's writer is the open batch or the newest submission (the game invalidates right after submitting the
+        // work that fills the range: on the console it could not count on that work being done either); <hex size>,
+        // every range of exactly that many bytes. In Kokiri Forest the game's main thread stood 5.6 of its 18.3 ms a
+        // frame in these waits, most of it for two ranges of 0x3980 bytes. Not every range: the exposure meter read
+        // late is white flashes. Off unless set (the wait went from 4.7 to 1.2 ms with `3980`, but the frame rate did not
+        // move on an RTX 4070: the executor is the limit there); meant for the Steam Deck, where Longshot measured +25%.
+        struct Rules { bool newest = false; std::vector<u64> sizes; };
+        static const Rules rules = [] { Rules r; const char* e = std::getenv("OOT_READBACK_LATE");
+            // (on by default where the GPU shares the system's memory - the Steam Deck: Longshot measured +20% there; =0: off)
+            if (!e) e = Vk().properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? "newest" : ""; if (!std::strcmp(e, "0")) e = "";
+            for (const char* p = e; p && *p;) { if (!std::strncmp(p, "newest", 6)) r.newest = true; else if (const u64 n = std::strtoull(p, nullptr, 16)) r.sizes.push_back(n);
+                p = std::strchr(p, ','); if (p) ++p; }
+            return r; }();
+        bool late = std::find(rules.sizes.begin(), rules.sizes.end(), size) != rules.sizes.end();
+        if (!late && rules.newest) {
+            bool older = false;
+            for (size_t i = 0; i + 1 < in_flight.size(); ++i) older |= Overlaps(in_flight[i].writes, address, size) || Overlaps(in_flight[i].reports, address, size);
+            const bool newest = Overlaps(batch.pending_writes, address, size) || Overlaps(batch.pending_reports, address, size) ||
+                                (!in_flight.empty() && (Overlaps(in_flight.back().writes, address, size) || Overlaps(in_flight.back().reports, address, size)));
+            late = newest && !older;
+        }
+        if (late) { NoteLateReadRange(address, size); static std::atomic<u64> n{0}; if (n++ < 6) RT_LOG("readback %#llx+%#llx is read late (OOT_READBACK_LATE)", (unsigned long long)address, (unsigned long long)size); return; }
+    }
     static const bool trace_waits = std::getenv("OOT_READBACK_TRACE") != nullptr;
     const auto show = [&](const char* what, const std::map<u64, u64>& ranges) {
         if (!trace_waits) return;
@@ -910,6 +1183,23 @@ void WaitForWrites(u64 address, u64 size) {
     }
 }
 bool HasPendingWrite(u64 address, u64 size) {
+    if (resolve_worker) {
+        if (resolve_checked) resolve_checked->push_back({address, size});
+        // (GPU results the CPU has not read yet would be recalled here, which records: the executor's to do)
+        if (!device_ahead.empty() && size) {
+            const u64 first = address & ~(Page - 1), last = (address + size + Page - 1) & ~(Page - 1);
+            auto it = device_ahead.lower_bound(last);
+            while (it != device_ahead.begin()) {
+                --it;
+                if (it->second <= first) { if (it->first + (64ull << 20) < first) break; continue; }
+                const u64 lo = std::max(it->first, first), hi = std::min(it->second, last);
+                for (u64 page = lo & ~(Page - 1); page < hi; page += Page) if (!cpu_pages.count(page)) { RESOLVE_BAIL(); return true; }
+            }
+        }
+        if (Overlaps(batch.pending_writes, address, size)) return true;
+        for (const auto& f : in_flight) if (Overlaps(f.writes, address, size)) return true;
+        return false;
+    }
     std::lock_guard lock{BatchMutex()};
     RecallDeviceAhead(address, size); // (the runtime reads it: its results come back with the open batch)
     if (Overlaps(batch.pending_writes, address, size)) return true;
@@ -917,12 +1207,63 @@ bool HasPendingWrite(u64 address, u64 size) {
     return false;
 }
 
+// Several small ranges at once (a texture handle table: a word per element). Each is recorded and answered as
+// HasPendingWrite would, but when nothing GPU-written lies anywhere between the first and the last (the usual
+// case) that is one look instead of one per range.
+bool HasPendingWriteAny(const std::vector<std::pair<u64, u64>>& ranges) {
+    if (ranges.empty()) return false;
+    if (ranges.size() == 1) return HasPendingWrite(ranges[0].first, ranges[0].second);
+    u64 lo = ~0ull, hi = 0;
+    for (const auto& [address, size] : ranges) { lo = std::min(lo, address); hi = std::max(hi, address + size); }
+    const auto clear = [&] {
+        if (!device_ahead.empty()) {
+            const u64 first = lo & ~(Page - 1), last = (hi + Page - 1) & ~(Page - 1);
+            auto it = device_ahead.upper_bound(last);
+            if (it != device_ahead.begin() && std::prev(it)->second > first) return false;
+        }
+        if (Overlaps(batch.pending_writes, lo, hi - lo)) return false;
+        for (const auto& f : in_flight) if (Overlaps(f.writes, lo, hi - lo)) return false;
+        return true;
+    };
+    if (resolve_worker) {
+        if (clear()) { if (resolve_checked) resolve_checked->insert(resolve_checked->end(), ranges.begin(), ranges.end()); return false; }
+    } else {
+        std::lock_guard lock{BatchMutex()};
+        if (clear()) return false;
+    }
+    for (const auto& [address, size] : ranges) if (HasPendingWrite(address, size)) return true;
+    return false;
+}
+
+// Waits for the submitted batches whose reports cover the range (not for the open batch: nothing is submitted).
+// Returns whether the open batch still has reports there.
+bool WaitForSubmittedReports(u64 address, u64 size) {
+    BatchLock lock;
+    for (;;) {
+        size_t last = in_flight.size();
+        for (size_t i = in_flight.size(); i-- > 0;)
+            if (Overlaps(in_flight[i].reports, address, size) || Overlaps(in_flight[i].writes, address, size)) { last = i; break; }
+        if (last == in_flight.size()) break;
+        RetireOne(true); // (oldest first, up to the last batch reporting into the range)
+    }
+    return Overlaps(batch.pending_reports, address, size) || Overlaps(batch.pending_writes, address, size);
+}
+
 void NotePendingReport(u64 address) {
     std::lock_guard lock{BatchMutex()};
-    batch.pending_reports[address] = address + 16;
+    // (reports follow each other in memory: the run they form is one range, not a map entry each)
+    auto& reports = batch.pending_reports;
+    if (!reports.empty()) { auto last = std::prev(reports.end()); if (last->second == address) { last->second = address + 16; return; }
+        if (last->first <= address && address + 16 <= last->second) return; }
+    AddRange(reports, address, address + 16);
 }
 
 bool HasPendingReport(u64 address, u64 size) {
+    if (resolve_worker) { // (nothing is recorded or retired meanwhile: read without the lock its executor holds)
+        if (Overlaps(batch.pending_reports, address, size)) return true;
+        for (const auto& f : in_flight) if (Overlaps(f.reports, address, size)) return true;
+        return false;
+    }
     std::lock_guard lock{BatchMutex()};
     if (Overlaps(batch.pending_reports, address, size)) return true;
     for (const auto& f : in_flight) if (Overlaps(f.reports, address, size)) return true;

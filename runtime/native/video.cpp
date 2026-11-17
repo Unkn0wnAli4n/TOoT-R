@@ -58,6 +58,12 @@ void EventSignal(uint64_t key) {
     { std::lock_guard lock{events_mutex}; auto it = event_handles.find(key); if (it != event_handles.end()) handle = it->second; }
     if (handle) SignalKernelEvent(handle);
 }
+void EventClear(uint64_t key) {
+    u32 handle = 0;
+    { std::lock_guard lock{events_mutex}; auto it = event_handles.find(key); if (it != event_handles.end()) handle = it->second; }
+    if (handle) ClearKernelEvent(handle);
+}
+#define hos_system_event_clear(key) EventClear(key)
 #define hos_system_event_init(key, autoclear) EventInit(c, key, autoclear)
 #define hos_system_event_signal(key) EventSignal(key)
 // (Media Foundation's AV1 decoder is Windows-only: libdav1d decodes AV1 here, so these are never reached.)

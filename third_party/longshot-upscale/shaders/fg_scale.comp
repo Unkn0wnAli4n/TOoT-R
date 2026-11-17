@@ -1,0 +1,134 @@
+#version 450
+// the frame to the window's size (the Insert menu's Upscaling, Sharpness): Catmull-Rom or Lanczos 2, or the linear filter (each
+// stretched over the picture's pixels one window pixel covers when the picture is the larger), then
+// a contrast-adaptive sharpen in the manner of AMD FidelityFX RCAS that cannot go past the light around the pixel, so it adds no halos,
+// no clipping and no flashes
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D src;
+// (FG_SCALE_PQ, compiled into fg_scale_pq_comp_spv.h: the game's own HDR10 picture (Native HDR, PQ codes) into RGB10A2, which
+// keeps the codes' 10 bits; vk_framegen.cpp framegen_scale's pq)
+#ifdef FG_SCALE_PQ
+layout(binding = 1, rgb10_a2) uniform writeonly image2D dst;
+const float kSteps = 1023.0;   // (the destination's steps: the dither below)
+#else
+layout(binding = 1, rgba8) uniform writeonly image2D dst;
+const float kSteps = 255.0;
+#endif
+// (and ultrawide's menus: while a menu shows, the picture's sides outside the middle 16:9, x0..x1 of its width, out of focus
+// (side 1) or black (side 2), with a short soft edge; vk_framegen.cpp wide_sides. Side 3: this dispatch makes the picture at
+// 1/8 for side 1's blur instead, into dst; side 1 then reads it as small)
+layout(binding = 2) uniform sampler2D small;
+layout(push_constant) uniform P { int mode; float sharp; float x0; float x1; int side; } pc;
+const float PI = 3.14159265;
+float lanczos2(float x) {
+    x = abs(x);
+    if (x < 1e-4) return 1.0;
+    if (x >= 2.0) return 0.0;
+    const float p = PI * x;
+    return 2.0 * sin(p) * sin(p * 0.5) / (p * p);
+}
+float catmull(float x) {
+    x = abs(x);
+    if (x < 1.0) return 1.5 * x * x * x - 2.5 * x * x + 1.0;
+    if (x < 2.0) return -0.5 * x * x * x + 2.5 * x * x - 4.0 * x + 2.0;
+    return 0.0;
+}
+float tent(float x) { return max(1.0 - abs(x), 0.0); }
+// The filter's weight at d picture pixels, and how far it reaches (in picture pixels at stretch 1)
+float kernel(float d) { return pc.mode == 2 ? lanczos2(d) : pc.mode == 1 ? catmull(d) : tent(d); }
+float reach() { return pc.mode == 0 ? 1.0 : 2.0; }
+// Shrinking, the filter is stretched by the picture's pixels per window pixel: at the picture's own spacing its taps skip
+// most of the picture (4 x 4 of the 6 x 6 one window pixel's Lanczos needs at 3840 x 2160 to 2560 x 1440), and fine detail
+// came out as shimmer and moire, worse than the plain linear copy. shortcut: up to 4 (16 x 16 taps); a smaller window aliases
+// again past that, a mip chain first if anyone plays a 5K picture in a quarter-size window
+const float kMaxStretch = 4.0;
+vec3 filtered(vec2 uv) {
+    const vec2 size = vec2(textureSize(src, 0));
+    const vec2 s = clamp(size / vec2(imageSize(dst)), vec2(1.0), vec2(kMaxStretch));
+    if (pc.mode == 0 && s == vec2(1.0)) return textureLod(src, uv, 0.0).rgb;
+    const vec2 p = uv * size - 0.5;
+    // (at stretch 1: the 4 x 4 around p for Catmull-Rom and Lanczos, as before)
+    const ivec2 lo = ivec2(floor(p - reach() * s)) + 1, hi = ivec2(floor(p + reach() * s));
+    vec3 sum = vec3(0.0);
+    float weight = 0.0;
+    for (int y = lo.y; y <= hi.y; y++) {
+        const float wy = kernel((float(y) - p.y) / s.y);
+        for (int x = lo.x; x <= hi.x; x++) {
+            const float w = kernel((float(x) - p.x) / s.x) * wy;
+            sum += w * texelFetch(src, clamp(ivec2(x, y), ivec2(0), ivec2(size) - 1), 0).rgb;
+            weight += w;
+        }
+    }
+    return sum / weight;
+}
+// The Sharpness slider (pc.sharp 0 to 1) is RCAS's strength: 0 the picture as filtered, 1 its strongest lobe.
+const float kMaxLobe = 0.25 - 1.0 / 16.0;
+vec3 sharpen(vec3 c, vec3 n, vec3 s, vec3 w, vec3 e, float amount) {
+    // RCAS: the four neighbours weighted by a negative lobe, the largest that keeps the result inside 0..1 for this
+    // neighbourhood (smaller where the light is near black or white), then normalized. Two differences from RCAS's own
+    // maths: the room to black divides by 4 x the lightest of the pixel and its neighbours (RCAS: of the neighbours
+    // alone), never more room than RCAS gives, so only more careful; and like RCAS the room is the smallest of the three
+    // channels, so a saturated colour (a channel near 0 or 1, not only near black or white) is sharpened little
+    const vec3 lo4 = min(min(n, s), min(w, e)), hi4 = max(max(n, s), max(w, e));
+    const vec3 lo = min(lo4, c), hi = max(hi4, c);
+    const vec3 to_black = lo / max(4.0 * hi, vec3(1.0 / 1024.0));
+    const vec3 to_white = (1.0 - hi) / max(4.0 - 4.0 * lo4, vec3(1.0 / 1024.0));
+    const vec3 room = min(to_black, to_white);
+    const float lobe = -clamp(min(min(room.r, room.g), room.b), 0.0, kMaxLobe) * clamp(amount, 0.0, 1.0);
+    const vec3 sharp = (c + lobe * (n + s + w + e)) / (1.0 + 4.0 * lobe);
+    // (and no further than the lightest and darkest pixel around it: an edge gets steeper, no halo beside it)
+    return clamp(sharp, lo, hi);
+}
+// beside a menu: what the game draws there (a menu's neighbouring pages, the frame of play) out of focus, a little dimmed, so the
+// middle stands out. From the picture at 1/8 (side 3's dispatch, each of its pixels the mean of an 8 x 8 block): a Gaussian of 9 x 9
+// taps 2 of its pixels apart (sigma 4 of them, about 2% of the height)
+vec3 side_fill(vec2 uv) {
+    const vec2 step = 2.0 / vec2(textureSize(small, 0));
+    vec3 sum = vec3(0.0);
+    float weight = 0.0;
+    for (int y = -4; y <= 4; y++)
+        for (int i = -4; i <= 4; i++) {
+            const float w = exp(-float(i * i + y * y) / 8.0);   // (sigma 2 taps)
+            sum += w * textureLod(small, clamp(uv + vec2(i, y) * step, vec2(0.0), vec2(1.0)), 0.0).rgb;
+            weight += w;
+        }
+    return sum / weight * 0.75;
+}
+// (and less than one of the destination's steps of noise over it, kSteps: the dim, smooth sides showed 8-bit steps as contour lines)
+float dither(ivec2 g) { return (fract(52.9829189 * fract(0.06711056 * float(g.x) + 0.00583715 * float(g.y))) - 0.5) / kSteps; }
+void main() {
+    const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 d = imageSize(dst);
+    if (any(greaterThanEqual(g, d))) return;
+    const vec2 uv = (vec2(g) + 0.5) / vec2(d);
+    if (pc.side == 3) {   // the picture at 1/8: 4 x 4 bilinear taps on the corners of each pixel's block's 2 x 2s, its exact mean
+        const vec2 block = 1.0 / vec2(d);   // (one pixel of dst: 8 x 8 of the picture)
+        vec3 sum = vec3(0.0);
+        for (int y = 0; y < 4; y++)
+            for (int x = 0; x < 4; x++) sum += textureLod(src, uv + (vec2(x, y) - 1.5) * 0.25 * block, 0.0).rgb;
+        imageStore(dst, g, vec4(sum / 16.0, 1.0));
+        return;
+    }
+    // (beside a menu: the sides first, and wholly outside the middle nothing else, not the filter's 16 taps to throw away)
+    float outside = 0.0;
+    if (pc.side != 0 && pc.x1 > pc.x0) {
+        const float feather = 0.006;
+        outside = max(1.0 - smoothstep(pc.x0 - feather, pc.x0, uv.x), smoothstep(pc.x1, pc.x1 + feather, uv.x));
+        if (outside >= 1.0) {
+            imageStore(dst, g, vec4(pc.side == 2 ? vec3(0.0) : side_fill(uv) + dither(g), 1.0));
+            return;
+        }
+    }
+    vec3 c = filtered(uv);
+    if (pc.sharp > 0.0) {
+        // The neighbours one picture pixel away (one window pixel when the window is the smaller). They were one window
+        // pixel away, a fraction of a picture pixel when the window is larger (0.53 for 2048 x 1152 on a 3840 x 2160
+        // screen): what the slider did then hung on the window's size, not on the picture.
+        const vec2 e = max(1.0 / vec2(textureSize(src, 0)), 1.0 / vec2(d));
+        const vec3 n = textureLod(src, uv + vec2(0.0, -e.y), 0.0).rgb, s = textureLod(src, uv + vec2(0.0, e.y), 0.0).rgb;
+        const vec3 w = textureLod(src, uv + vec2(-e.x, 0.0), 0.0).rgb, r = textureLod(src, uv + vec2(e.x, 0.0), 0.0).rgb;
+        c = sharpen(c, n, s, w, r, pc.sharp);
+    }
+    if (outside > 0.0) c = mix(c, pc.side == 2 ? vec3(0.0) : side_fill(uv) + dither(g), outside);
+    imageStore(dst, g, vec4(c, 1.0));
+}

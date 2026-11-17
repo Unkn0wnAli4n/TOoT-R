@@ -1,5 +1,6 @@
 // Recorded NVN command lists and their execution on Vulkan.
 #pragma once
+#include <atomic>
 #include <chrono>
 
 #include <memory>
@@ -49,6 +50,8 @@ struct CommandList {
     std::vector<Command> commands;
     std::vector<u32> calls; // indices of the CallCommands entries (set when recording ends)
     bool indexed = false;   // `calls` is complete
+    mutable std::atomic<u32> submissions{0}; // (diagnostic, OOT_FLAG_TRACE: lists with flag decisions submitted again)
+    bool has_flags = false;
 };
 // A texture copy/clear target: view plus NVNcopyRegion {x, y, z, width, height, depth}.
 struct TextureCopy { TextureView view; s32 region[6]; };
@@ -57,14 +60,48 @@ bool ExecuteRenderCommand(const Command& command);
 // False once a command since the last full draw may change what a draw resolves (render.cpp).
 bool CurrentFrameSkipped(); // frame skip: this frame is neither rendered nor shown
 bool FrameSkipEnabled();
-inline bool fast_draw_allowed = false;
+inline thread_local bool fast_draw_allowed = false; // (per thread: draws are resolved on several, see batch.h resolve_worker)
 inline u64 fast_draw_breakers[128]{}; // (OOT_SET_STATS) commands that ended a run of fast-path draws
-inline u64 fast_draw_fails[8]{};      // reasons TryFastDraw declined
+inline u64 fast_draw_fails[8]{};
+inline u64 slow_draw_why[136]{};       // (OOT_SET_STATS) why a draw took the full path: [op] the command that changed state, 128.. see render.cpp      // reasons TryFastDraw declined
+// Before a command executes: whether the draw fast path (render.cpp) survives it.
+inline void NoteFastDrawBreaker(const Command& command) {
+    // Draw fast path (render.cpp): only these commands keep the previous draw's setup valid.
+    switch ((Op)command.op) {
+    case Op::DrawArrays: case Op::DrawElements: case Op::DrawArraysInstanced: case Op::DrawElementsInstanced:
+    case Op::DrawElementsBaseVertex: case Op::BindUniformBuffer: case Op::BindUniformBuffers:
+    case Op::BindVertexBuffer: case Op::BindVertexBuffers: case Op::BindVertexAttribState: case Op::BindVertexStreamState:
+    case Op::SetViewport: case Op::SetViewports: case Op::SetScissor: case Op::SetScissors: case Op::SetDepthRange: case Op::SetDepthRanges:
+    case Op::ReportCounter: case Op::ResetCounter: break;
+    // These invalidate only when they change a value (their handlers in render.cpp check).
+    case Op::BindProgram: case Op::BindTexture: case Op::SetRenderTargets: case Op::BindBlendState: case Op::BindColorState:
+    case Op::BindPolygonState: case Op::BindDepthStencilState: case Op::SetLineWidth: case Op::BindStorageBuffer: case Op::BindChannelMaskState:
+    case Op::SetPrimitiveRestart: case Op::SetPointSize: case Op::SetDepthClamp:
+    case Op::SetDepthBounds: case Op::SetSampleMask: case Op::SetRasterizerDiscard: break;
+    // Dynamic stencil state is emitted by Draw for both full and fast draws.
+    case Op::SetStencilMask: case Op::SetStencilValueMask: case Op::SetStencilRef: break;
+    case Op::SetBlendColor: case Op::SetDepthBias: break; // (dynamic state, set per draw)
+    // No effect on what a draw resolves: render enable is evaluated per draw; barriers are
+    // already implied by submission order here.
+    case Op::SetRenderEnable: case Op::SetRenderEnableConditional: case Op::Barrier:
+    case Op::SetTiledCacheAction: case Op::SetTiledCacheTileSize: case Op::SetAlphaRef:
+    case Op::SetGeometryProcessingMode: break;
+    default: if (fast_draw_allowed) ++fast_draw_breakers[std::min<u32>(command.op, 127)]; fast_draw_allowed = false;
+    }
+}
+// Command-list segments whose draws are resolved on several threads at once and committed in order (render.cpp).
+// Only segments of state changes, draws and counter reports qualify (commands.cpp, ScanSegment).
+struct ParallelSegment { const CommandList* list; size_t begin, end; };
+void ExecuteSegmentsParallel(const std::vector<ParallelSegment>& segments, const std::vector<u64>& report_addresses);
+void ExecuteSegmentSerial(const CommandList& list, size_t begin, size_t end); // (such a segment, the usual way)
+unsigned ParallelResolveThreads(); // helper threads (0: off)
+bool ParallelDrawsUsable();        // now (no diagnostic mode that needs one draw at a time)
 // Renderer state (bound shaders, targets, buffers): each queue has its own.
 std::shared_ptr<void> SaveRenderState();
 void RestoreRenderState(const std::shared_ptr<void>& saved);
 void ResetRenderCounter(u32 counter);
-void ReportRenderCounter(u32 counter, u64 address);
+bool SamplesRunOpen(); // (between a samples reset and its report: no submission of the executor's own may fall there)
+void ReportRenderCounter(u32 counter, u64 address, bool flag_applied = false); // (flag_applied: its word was put to 0 when the command was recorded)
 // GPU-written timestamp (and value) for the report at this point of the command stream; false:
 // the host writes them when the batch completes. GuestTimestampNs: the guest's timestamp clock.
 bool RecordReportTimestamp(u64 report_address, const u32* value);

@@ -8,6 +8,7 @@
 #include "upscale_spv.h"
 #include "fsr_easu_spv.h"
 #include "fsr_rcas_spv.h"
+#include "fxaa_spv.h"
 // FSR 1's constants on the CPU (AMD FidelityFX, MIT: third_party/fsr1).
 #define A_CPU 1
 #include "../../../third_party/fsr1/ffx_a.h"
@@ -18,9 +19,9 @@ namespace {
 struct Image { VkImage image = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; VkExtent2D extent{}; };
 struct State {
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE; VkPipelineLayout layout = VK_NULL_HANDLE; VkPipeline pipeline = VK_NULL_HANDLE;
-    VkPipeline easu = VK_NULL_HANDLE, rcas = VK_NULL_HANDLE;
-    VkDescriptorPool pool = VK_NULL_HANDLE; VkDescriptorSet set = VK_NULL_HANDLE, set_easu = VK_NULL_HANDLE, set_rcas = VK_NULL_HANDLE; VkSampler sampler = VK_NULL_HANDLE;
-    Image input, output, middle;
+    VkPipeline easu = VK_NULL_HANDLE, rcas = VK_NULL_HANDLE, fxaa = VK_NULL_HANDLE;
+    VkDescriptorPool pool = VK_NULL_HANDLE; VkDescriptorSet set = VK_NULL_HANDLE, set_easu = VK_NULL_HANDLE, set_rcas = VK_NULL_HANDLE, set_fxaa = VK_NULL_HANDLE; VkSampler sampler = VK_NULL_HANDLE;
+    Image input, output, middle, smoothed;
     bool failed = false;
 } s;
 
@@ -70,16 +71,16 @@ bool Initialize() {
         vkDestroyShaderModule(vk.device, module, nullptr);
         return r == VK_SUCCESS;
     };
-    if (!make(upscale_spv, sizeof upscale_spv, s.pipeline) || !make(fsr_easu_spv, sizeof fsr_easu_spv, s.easu) || !make(fsr_rcas_spv, sizeof fsr_rcas_spv, s.rcas)) {
+    if (!make(upscale_spv, sizeof upscale_spv, s.pipeline) || !make(fsr_easu_spv, sizeof fsr_easu_spv, s.easu) || !make(fsr_rcas_spv, sizeof fsr_rcas_spv, s.rcas) || !make(fxaa_spv, sizeof fxaa_spv, s.fxaa)) {
         s.failed = true; RT_LOG("upscaling: pipeline creation failed; using the linear blit"); return false; }
-    const VkDescriptorPoolSize sizes[2]{{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3}};
-    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pi.maxSets = 3; pi.poolSizeCount = 2; pi.pPoolSizes = sizes;
+    const VkDescriptorPoolSize sizes[2]{{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4}};
+    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pi.maxSets = 4; pi.poolSizeCount = 2; pi.pPoolSizes = sizes;
     VK_CHECK(vkCreateDescriptorPool(vk.device, &pi, nullptr, &s.pool));
-    const VkDescriptorSetLayout layouts[3]{s.set_layout, s.set_layout, s.set_layout};
-    VkDescriptorSet sets[3];
-    VkDescriptorSetAllocateInfo sa{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; sa.descriptorPool = s.pool; sa.descriptorSetCount = 3; sa.pSetLayouts = layouts;
+    const VkDescriptorSetLayout layouts[4]{s.set_layout, s.set_layout, s.set_layout, s.set_layout};
+    VkDescriptorSet sets[4];
+    VkDescriptorSetAllocateInfo sa{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; sa.descriptorPool = s.pool; sa.descriptorSetCount = 4; sa.pSetLayouts = layouts;
     VK_CHECK(vkAllocateDescriptorSets(vk.device, &sa, sets));
-    s.set = sets[0]; s.set_easu = sets[1]; s.set_rcas = sets[2];
+    s.set = sets[0]; s.set_easu = sets[1]; s.set_rcas = sets[2]; s.set_fxaa = sets[3];
     RT_LOG("upscaling: Catmull-Rom, Lanczos and FSR 1 (EASU + RCAS) available");
     VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO}; si.magFilter = si.minFilter = VK_FILTER_LINEAR;
     si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
@@ -94,11 +95,29 @@ void Barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayo
 }
 } // namespace
 
+// The filter alone, for the renderer's own use (render.cpp's stand-in for the game's upscaling networks): `set` is a
+// descriptor set of UpscaleSetLayout() the caller owns; both images are in the GENERAL layout; dst is an RGBA8 storage view.
+VkDescriptorSetLayout UpscaleSetLayout() { return Initialize() ? s.set_layout : VK_NULL_HANDLE; }
+void UpscaleCopy(VkCommandBuffer cmd, VkDescriptorSet set, VkImageView src, VkImageView dst, VkExtent2D extent, int mode, int decode) {
+    const VkDescriptorImageInfo input{s.sampler, src, VK_IMAGE_LAYOUT_GENERAL};
+    const VkDescriptorImageInfo output{VK_NULL_HANDLE, dst, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+    w[0].dstSet = set; w[0].dstBinding = 0; w[0].descriptorCount = 1; w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[0].pImageInfo = &input;
+    w[1].dstSet = set; w[1].dstBinding = 1; w[1].descriptorCount = 1; w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[1].pImageInfo = &output;
+    vkUpdateDescriptorSets(Vk().device, 2, w, 0, nullptr);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.layout, 0, 1, &set, 0, nullptr);
+    struct { s32 mode; float sharp; s32 decode; } push{mode, 0.0f, decode};
+    vkCmdPushConstants(cmd, s.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, &push);
+    vkCmdDispatch(cmd, (extent.width + 7) / 8, (extent.height + 7) / 8, 1);
+}
+
 bool UpscaleToWindow(VkCommandBuffer cmd, VkImage src, VkExtent2D src_extent, bool flip, VkImage dst, VkRect2D rect) {
     int mode = gfx::Current().upscaling; // 0 linear blit, 1 Catmull-Rom, 2 Lanczos, 3 FSR 1
     if (mode == 3 && (rect.extent.width <= src_extent.width || rect.extent.height <= src_extent.height)) mode = 2; // (EASU only upscales)
     const float sharpness = gfx::Current().sharpness / 100.0f;
-    if ((mode == 0 && sharpness <= 0) || rect.extent.width < 16 || rect.extent.height < 16 || !Initialize()) return false;
+    const bool fxaa = gfx::Fxaa(); // (the Anti-aliasing row: a filter on the finished picture, before it is scaled)
+    if ((mode == 0 && sharpness <= 0 && !fxaa) || rect.extent.width < 16 || rect.extent.height < 16 || !Initialize()) return false;
     auto& vk = Vk();
     Ensure(s.input, src_extent, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     Ensure(s.output, rect.extent, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
@@ -124,6 +143,18 @@ bool UpscaleToWindow(VkCommandBuffer cmd, VkImage src, VkExtent2D src_extent, bo
         vkUpdateDescriptorSets(vk.device, 2, w, 0, nullptr);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.layout, 0, 1, &set, 0, nullptr);
     };
+    const Image* scaled_from = &s.input;
+    if (fxaa) {
+        Ensure(s.smoothed, src_extent, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        Barrier(cmd, s.smoothed.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.fxaa);
+        bind(s.set_fxaa, s.input, s.smoothed);
+        vkCmdDispatch(cmd, (src_extent.width + 7) / 8, (src_extent.height + 7) / 8, 1);
+        Barrier(cmd, s.smoothed.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT,
+                VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        scaled_from = &s.smoothed;
+    }
     if (mode == 3) {
         // FSR 1: EASU into the middle image, then RCAS into the output (sharpness: RCAS stops, 0 the sharpest).
         Ensure(s.middle, rect.extent, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
@@ -134,13 +165,13 @@ bool UpscaleToWindow(VkCommandBuffer cmd, VkImage src, VkExtent2D src_extent, bo
                    (AF1)rect.extent.width, (AF1)rect.extent.height);
         u32 easu[16]; std::memcpy(easu, con0, 16); std::memcpy(easu + 4, con1, 16); std::memcpy(easu + 8, con2, 16); std::memcpy(easu + 12, con3, 16);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.easu);
-        bind(s.set_easu, s.input, s.middle);
+        bind(s.set_easu, *scaled_from, s.middle);
         vkCmdPushConstants(cmd, s.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof easu, easu);
         vkCmdDispatch(cmd, (rect.extent.width + 15) / 16, (rect.extent.height + 15) / 16, 1);
         Barrier(cmd, s.middle.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT,
                 VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
         varAU4(rcon);
-        FsrRcasCon(rcon, (AF1)(2.0f * (1.0f - sharpness)));
+        FsrRcasCon(rcon, (AF1)(2.0f * (1.0f - std::min(sharpness, 1.0f))));
         u32 rcas[4]; std::memcpy(rcas, rcon, 16);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.rcas);
         bind(s.set_rcas, s.middle, s.output);
@@ -148,8 +179,8 @@ bool UpscaleToWindow(VkCommandBuffer cmd, VkImage src, VkExtent2D src_extent, bo
         vkCmdDispatch(cmd, (rect.extent.width + 15) / 16, (rect.extent.height + 15) / 16, 1);
     } else {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.pipeline);
-        bind(s.set, s.input, s.output);
-        struct { s32 mode; float sharp; } push{mode, sharpness};
+        bind(s.set, *scaled_from, s.output);
+        struct { s32 mode; float sharp; s32 decode; } push{mode, sharpness, 0};
         vkCmdPushConstants(cmd, s.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, &push);
         vkCmdDispatch(cmd, (rect.extent.width + 7) / 8, (rect.extent.height + 7) / 8, 1);
     }

@@ -26,7 +26,15 @@ struct VulkanContext {
     std::mutex copy_mutex;               // (copy_queue's submissions, when it is its own queue)
     u32 queue_count = 1;
     bool mesh_shader_queries = false;
+    // Task and mesh programs: native stages (VK_EXT_mesh_shader), or the compute fallback (render.cpp "mesh fallback") where
+    // the extension is missing or its task stage cannot run the game's 32-lane programs (AMD, Intel). OOT_MESH_FALLBACK=0/1.
+    bool mesh_shader = false, mesh_fallback = false;
+    // A compute stage can be held to 32-lane subgroups, the console GPU's (VkPipelineShaderStageRequiredSubgroupSizeCreateInfo)
+    bool pin_subgroup = false, full_subgroups = false; u32 subgroup_size = 32;
+    u32 pin_stages = 0, subgroup_max = 32; // the stages that can be held to 32 lanes (compute among them with pin_subgroup), and the most lanes any other runs at
     bool dma_buf = false;
+    bool cooperative_matrix = false; // VK_KHR_cooperative_matrix with 16x8x16 f16 on the subgroup (the game's networks: vk.cpp ProbeMatrices)
+    bool memory_budget = false; // VK_EXT_memory_budget: how much video memory the system lets this process have right now
     bool placed_maps = false; // VK_EXT_map_memory_placed (memory.cpp: pools in GPU memory at their guest addresses)
     bool address_replay = false; // bufferDeviceAddressCaptureReplay (memory.cpp: GlobalAddressTable)
     bool robust = true; // bounds-checked buffer access (vk.cpp) // (VK_KHR_external_memory_fd + VK_EXT_external_memory_dma_buf enabled) // (VkPhysicalDeviceMeshShaderFeaturesEXT::meshShaderQueries enabled)

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <unordered_set>
 // NVN command buffers: recording into host command lists, and the executor.
 //
@@ -105,6 +106,7 @@ bool BackgroundGpuThreads() {
     static const bool on = !std::getenv("OOT_SYNC_EXECUTOR") && !std::getenv("OOT_NO_RETIRE_THREAD") && !std::getenv("OOT_GPU_PROFILE") && !std::getenv("OOT_BUSY_SYNC_WAIT");
     return on;
 }
+static bool IsDrawOp(u32 op) { switch ((Op)op) { case Op::DrawArrays: case Op::DrawElements: case Op::DrawArraysInstanced: case Op::DrawElementsInstanced: case Op::DrawElementsBaseVertex: return true; default: return false; } }
 bool TimelineOn() { static const bool on = std::getenv("OOT_TIMELINE") != nullptr; return on; }
 double TimelineMs() { static const auto t0 = std::chrono::steady_clock::now(); return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
 namespace {
@@ -152,8 +154,11 @@ void SwitchTo(u64 queue) {
 // (OoT releases a whole frame at once, ~9 ms to record in busy scenes; submitted at the end, the GPU
 // waited for all of it). OOT_SUBMIT_EVERY_US=<us> (0: only at the end, as before).
 void SubmitWhileRecording() {
-    // (NVIDIA only by default: on the Steam Deck a submission costs ~1 ms of the executor's time)
-    static const u64 every = std::getenv("OOT_SUBMIT_EVERY_US") ? std::strtoull(std::getenv("OOT_SUBMIT_EVERY_US"), nullptr, 10) * 1000 : Vk().properties.vendorID == 0x10DE ? 1'000'000 : 4'000'000;
+    // (every 4 ms where memory is imported: there a submission cost ~1 ms of the executor's time on the Steam Deck, the
+    // driver checking each import. With the pools as GPU memory in place a submission is 0.12 ms, and the Deck's GPU
+    // stood idle for almost half of a frame waiting for the next piece: every 1 ms there too, Castle Town 21.8 -> 23.6
+    // fps, 2026-11-17.)
+    static const u64 every = std::getenv("OOT_SUBMIT_EVERY_US") ? std::strtoull(std::getenv("OOT_SUBMIT_EVERY_US"), nullptr, 10) * 1000 : Vk().properties.vendorID == 0x10DE || nvn::PoolsInGpuMemory() ? 1'000'000 : 4'000'000;
     if (!every) return;
     static auto last = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
@@ -163,13 +168,155 @@ void SubmitWhileRecording() {
     nvn::Submit();
     flushes_seen = nvn::FlushCount(); last = now;
 }
+// OOT_LIST_REPEAT=1 (diagnostic): how much of a frame's draws sit in command-list segments that are the same as a
+// segment of one of the three frames before: exactly (A), but for uniform buffer addresses and inline uniform data
+// (B), but for every buffer address (C), and in their sequence of operations alone (D).
+void ListRepeatStats(const Work& w) {
+    static const bool on = std::getenv("OOT_LIST_REPEAT") != nullptr;
+    if (!on) return;
+    static std::array<std::unordered_set<u64>, 4> seen[4]; // [variant][frames ago]
+    static u64 draws_total = 0, draws_hit[4]{}, segments = 0, frames = 0;
+    const size_t e = std::min(w.end, w.list->commands.size());
+    u64 h[4]{0x1234, 0x1234, 0x1234, 0x1234}; u32 draws = 0; bool present = false;
+    const auto mix = [](u64& hash, u64 v) { hash = (hash ^ v) * 0x9E3779B97F4A7C15ull; hash ^= hash >> 31; };
+    for (size_t k = w.next; k < e; ++k) {
+        const Command& c = w.list->commands[k]; const Op op = (Op)c.op;
+        draws += IsDrawOp(c.op) || op == Op::DrawMeshTasks || op == Op::DrawMeshTasksIndirect; present |= op == Op::QueuePresent;
+        const bool uniform = op == Op::BindUniformBuffer || op == Op::BindUniformBuffers || op == Op::BindUniformBuffersDeferred || op == Op::UpdateUniformBuffer;
+        const bool buffer = uniform || op == Op::BindVertexBuffer || op == Op::BindVertexBuffers || op == Op::BindStorageBuffer || op == Op::BindStorageBuffers || op == Op::BindStorageBuffersDeferred || IsDrawOp(c.op);
+        u64 full = c.op; for (u64 v : c.x) mix(full, v); for (float f : c.f) { u32 b; std::memcpy(&b, &f, 4); mix(full, b); }
+        for (size_t i = 0; i + 8 <= c.data.size(); i += 8) { u64 v; std::memcpy(&v, c.data.data() + i, 8); mix(full, v); }
+        mix(h[0], full);
+        mix(h[1], uniform ? (u64)c.op << 32 | (u32)c.x[0] << 8 | (u32)c.x[1] : full);
+        mix(h[2], buffer ? (u64)c.op << 32 | (IsDrawOp(c.op) ? (u32)c.x[2] : (u32)c.x[0] << 8 | (u32)c.x[1]) : full);
+        mix(h[3], c.op);
+    }
+    if (draws >= 4) {
+        draws_total += draws; ++segments;
+        for (int v = 0; v < 4; ++v) { bool hit = false; for (int a = 1; a < 4; ++a) hit |= seen[v][a].count(h[v]) != 0; if (hit) draws_hit[v] += draws; seen[v][0].insert(h[v]); }
+    }
+    if (present) {
+        for (int v = 0; v < 4; ++v) { seen[v][3] = std::move(seen[v][2]); seen[v][2] = std::move(seen[v][1]); seen[v][1] = std::move(seen[v][0]); seen[v][0].clear(); }
+        if (++frames % 300 == 0 && draws_total) {
+            RT_LOG("list repeat: %.0f draws a frame in %.1f segments; in segments seen in the last 3 frames: exact %.0f%%, but uniform addresses %.0f%%, but all buffer addresses %.0f%%, same operations %.0f%%",
+                   draws_total / 300.0, segments / 300.0, 100.0 * draws_hit[0] / draws_total, 100.0 * draws_hit[1] / draws_total, 100.0 * draws_hit[2] / draws_total, 100.0 * draws_hit[3] / draws_total);
+            draws_total = segments = 0; for (auto& d : draws_hit) d = 0;
+        }
+    }
+}
+// The end of the run of commands from `begin` that ExecuteSegmentsParallel takes: state changes, draws and counter
+// commands (`end`, or the first command that is none of these). Its draws are counted, and the addresses its reports
+// write appended.
+size_t ParallelRunEnd(const CommandList& list, size_t begin, size_t end, u32* draws, std::vector<u64>* reports) {
+    for (size_t i = begin; i < end; ++i) {
+        const Command& command = list.commands[i];
+        switch ((Op)command.op) {
+        case Op::DrawArrays: case Op::DrawElements: case Op::DrawArraysInstanced: case Op::DrawElementsInstanced: case Op::DrawElementsBaseVertex: ++*draws; break;
+        case Op::ReportCounter: if (reports) reports->push_back(command.x[1]); break;
+        case Op::ResetCounter: case Op::Barrier: break;
+        // (run by the executor in their place, from the state they are met in: render.cpp, IsSerialItem)
+        case Op::ClearColor: case Op::ClearColori: case Op::ClearColorui: case Op::ClearDepthStencil: case Op::DrawMeshTasks: case Op::DrawMeshTasksIndirect: {
+            // OOT_PARALLEL_END_AT=<bits> (bisection): 1 mesh draws, 2 depth clears, 4 colour clears end a run (the executor runs them the usual way)
+            static const int end_at = std::getenv("OOT_PARALLEL_END_AT") ? std::atoi(std::getenv("OOT_PARALLEL_END_AT")) : 0;
+            const Op o = (Op)command.op; const bool mesh = o == Op::DrawMeshTasks || o == Op::DrawMeshTasksIndirect;
+            if ((mesh && (end_at & 1)) || (o == Op::ClearDepthStencil && (end_at & 2)) || (!mesh && o != Op::ClearDepthStencil && (end_at & 4))) return i;
+            break; }
+        case Op::BindProgram: case Op::BindUniformBuffer: case Op::BindUniformBuffers: case Op::BindStorageBuffer: case Op::BindStorageBuffers:
+        case Op::BindVertexBuffer: case Op::BindVertexBuffers: case Op::BindVertexAttribState: case Op::BindVertexStreamState:
+        case Op::BindTexture: case Op::BindTextures: case Op::BindImage: case Op::BindImages: case Op::SetTexturePool: case Op::SetSamplerPool:
+        case Op::SetRenderTargets: case Op::SetViewport: case Op::SetViewports: case Op::SetScissor: case Op::SetScissors: case Op::SetDepthRange: case Op::SetDepthRanges:
+        case Op::SetBlendColor: case Op::SetStencilMask: case Op::SetStencilValueMask: case Op::SetStencilRef: case Op::SetDepthBias: case Op::SetPointSize: case Op::SetLineWidth:
+        case Op::BindBlendState: case Op::BindChannelMaskState: case Op::BindColorState: case Op::BindDepthStencilState: case Op::BindMultisampleState: case Op::BindPolygonState:
+        case Op::SetPrimitiveRestart: case Op::SetRenderEnable: case Op::SetRenderEnableConditional: case Op::SetDepthClamp: case Op::SetAlphaRef: case Op::SetSampleMask:
+        case Op::SetRasterizerDiscard: case Op::SetDepthBounds: case Op::SetTiledCacheAction: case Op::SetTiledCacheTileSize: case Op::SetGeometryProcessingMode:
+        case Op::SetConservativeRasterEnable:
+        case Op::PushGraphicsConstants: case Op::PushComputeConstants: case Op::PushGraphicsConstantsDeferred: case Op::PushComputeConstantsDeferred:
+        case Op::BindTexturesDeferred: case Op::BindImagesDeferred: case Op::BindUniformBuffersDeferred: case Op::BindStorageBuffersDeferred: break;
+        default: return i;
+        }
+    }
+    return end;
+}
+constexpr u32 ParallelRunDraws = 12;   // a run of fewer draws is not worth a group
+constexpr u32 ParallelChunkDraws = 16; // draws a thread resolves in one piece (a run is cut wherever that many are reached)
+// A run's commands as pieces of about ParallelChunkDraws draws (each starts from the state the commands before leave).
+void AddChunks(std::vector<ParallelSegment>& group, const CommandList& list, size_t begin, size_t end, u32 draws) {
+    const u32 pieces = std::max(1u, (draws + ParallelChunkDraws / 2) / ParallelChunkDraws), each = std::max(1u, draws / pieces);
+    size_t from = begin; u32 in_piece = 0, made = 1;
+    for (size_t i = begin; i < end; ++i) {
+        switch ((Op)list.commands[i].op) {
+        case Op::DrawArrays: case Op::DrawElements: case Op::DrawArraysInstanced: case Op::DrawElementsInstanced: case Op::DrawElementsBaseVertex:
+            if (++in_piece >= each && made < pieces) { group.push_back({&list, from, i + 1}); from = i + 1; in_piece = 0; ++made; }
+            break;
+        default: break;
+        }
+    }
+    if (from < end) group.push_back({&list, from, end});
+}
+// With `w` first: the run of such commands at the front of the queue's work, across its segments, executed together.
+// False: `w` is to run the usual way, up to w.end (cut where the next run worth a group starts: the rest of it is
+// then the queue's next work).
+bool RunParallelGroup(QueueContext& c, Work& w) {
+    if (!ParallelResolveThreads() || !ParallelDrawsUsable()) return false;
+    static std::vector<ParallelSegment> group; static std::vector<u64> reports; static std::vector<Work> held;
+    group.clear(); reports.clear(); held.clear();
+    const size_t end = std::min(w.end, w.list->commands.size());
+    u32 draws = 0;
+    const size_t stop = ParallelRunEnd(*w.list, w.next, end, &draws, &reports);
+    if (draws < ParallelRunDraws && stop < end) {
+        // Not here: the usual way up to the next run that is.
+        size_t at = stop + 1, cut = end;
+        while (at < end) {
+            u32 d = 0;
+            const size_t next_stop = ParallelRunEnd(*w.list, at, end, &d, nullptr);
+            if (d >= ParallelRunDraws) { cut = at; break; }
+            at = next_stop + 1;
+        }
+        if (cut < end) { c.work.push_front({w.list, cut, w.end}); w.end = cut; }
+        return false;
+    }
+    u32 total = draws;
+    AddChunks(group, *w.list, w.next, stop, draws);
+    if (stop < end) c.work.push_front({w.list, stop, w.end}); // (what follows the run: the queue's next work)
+    else while (!c.work.empty() && group.size() < 192) {     // (the run goes on in the segments that follow)
+        Work& next = c.work.front();
+        const size_t next_end = std::min(next.end, next.list->commands.size());
+        u32 d = 0;
+        const size_t next_stop = ParallelRunEnd(*next.list, next.next, next_end, &d, &reports);
+        if (next_stop > next.next) { AddChunks(group, *next.list, next.next, next_stop, d); total += d; }
+        if (next_stop < next_end) { next.next = next_stop; break; }
+        held.push_back(std::move(next)); c.work.pop_front(); // (the lists stay alive while their segments run)
+    }
+    if (group.size() < 2 || total < 2 * ParallelRunDraws) { // (too little for a group: the usual way, in order)
+        for (const auto& segment : group) ExecuteSegmentSerial(*segment.list, segment.begin, segment.end);
+        return true;
+    }
+    {   // OOT_PARALLEL_GROUP_MASK=<hex> (bisection): only the frame's groups whose number (0.., 31 for the rest) is set run in parallel
+        static const char* mask_text = std::getenv("OOT_PARALLEL_GROUP_MASK");
+        if (mask_text) { static const u64 mask = std::strtoull(mask_text, nullptr, 16); static u64 frame = ~0ull; static u32 ordinal = 0;
+            if (const u64 now = CurrentFrameNumber(); now != frame) { frame = now; ordinal = 0; }
+            static const bool trace = std::getenv("OOT_PARALLEL_GROUP_TRACE") != nullptr; static u32 shown = 0;
+            if (trace && shown++ < 60) RT_LOG("parallel group %u of frame %llu: %zu segments, %u draws", ordinal, (unsigned long long)frame, group.size(), total);
+            const u32 bit = std::min(ordinal++, 31u);
+            if (!((mask >> bit) & 1)) { for (const auto& segment : group) ExecuteSegmentSerial(*segment.list, segment.begin, segment.end); return true; } } }
+    std::sort(reports.begin(), reports.end());
+    ExecuteSegmentsParallel(group, reports);
+    return true;
+}
 void Run(u64 queue) {
     SwitchTo(queue);
     auto& c = queues[queue];
     while (!c.work.empty()) {
         SubmitWhileRecording();
         Work w = std::move(c.work.front()); c.work.pop_front();
+        if (RunParallelGroup(c, w)) continue;
         size_t i = w.next; std::vector<u64> children; EventWait wait;
+        { static const bool shape = std::getenv("OOT_FRAME_SHAPE") != nullptr; // (diagnostic: the segments of ~3 frames, a minute in)
+          if (shape) { static const auto t0 = std::chrono::steady_clock::now(); static u32 shown = 0; const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (s > 75 && shown < 700) { ++shown; const size_t e = std::min(w.end, w.list->commands.size()); u32 draws = 0, rts = 0, disp = 0, presents = 0, waits = 0;
+                for (size_t k = w.next; k < e; ++k) { const Op op = (Op)w.list->commands[k].op; draws += IsDrawOp((u32)op) || op == Op::DrawMeshTasks || op == Op::DrawMeshTasksIndirect; rts += op == Op::SetRenderTargets; disp += op == Op::DispatchCompute || op == Op::DispatchComputeIndirect; presents += op == Op::QueuePresent; waits += op == Op::WaitEvent || op == Op::WaitSync || op == Op::FenceSync || op == Op::SignalEvent; }
+                RT_LOG("shape q %#llx list %p [%zu,%zu) draws %u targets %u dispatches %u sync %u present %u", (unsigned long long)queue, (void*)w.list.get(), w.next, e, draws, rts, disp, waits, presents); } } }
+        ListRepeatStats(w);
         const Step step = ExecuteFrom(*w.list, i, w.end, children, wait);
         if (step == Step::Done) continue;
         if (step == Step::Call) {
@@ -191,6 +338,7 @@ void Run(u64 queue) {
         return;
     }
 }
+void CaptureForResumedWork();
 void ResumeQueues() {
     for (bool progressed = true; progressed;) {
         progressed = false;
@@ -202,6 +350,7 @@ void ResumeQueues() {
             if (late) { static u32 shown = 0; if (shown++ < 10) RT_LOG("queue %#llx resumed without its event (%u wanted, %u now)", (unsigned long long)queue, c.wait.wanted, __atomic_load_n(c.wait.value, __ATOMIC_ACQUIRE)); }
             c.parked = false;
             if (TimelineOn()) RT_LOG("T %.2f resume queue %#llx (%zu segments)", TimelineMs(), (unsigned long long)queue, c.work.size());
+            CaptureForResumedWork();
             Run(queue);
             if (TimelineOn()) RT_LOG("T %.2f resumed queue %#llx done", TimelineMs(), (unsigned long long)queue);
             progressed = true;
@@ -218,9 +367,34 @@ std::atomic<u64> executor_idle_ns{0}, executor_parked_ns{0}, executor_busy_ns{0}
 namespace {
 std::mutex incoming_mutex;
 std::condition_variable incoming_cv, drained_cv;
-std::deque<std::pair<u64, std::deque<Work>>> incoming;
+struct Arrival { u64 first; std::deque<Work> second; void* capture = nullptr; }; // (capture: the CPU's pool writes as they were at the submit, memory.h)
+std::deque<Arrival> incoming;
 bool wake = false;
 u64 arrived = 0, executed = 0;
+std::deque<Arrival> taken;         // (the executor's: arrivals it took out of `incoming` and has not started yet)
+std::mutex submit_capture_mutex;   // a capture and its place in the order of arrivals are one step
+std::atomic<u64> resume_captures{0};
+// A parked queue's commands were submitted before the event they waited for. What the game wrote in between - it parks
+// the frame's last passes and then writes their constants, the exposure among them - is in no capture made at a submit
+// before the work runs: it ran with the constants of a frame or two earlier, in about two frames of three (the whole
+// picture brighter or darker for a frame). So work that resumes gets a capture of its own, after the ones made before
+// it (they would otherwise put older bytes over it). OOT_NO_RESUME_CAPTURE=1: not.
+void CaptureForResumedWork() {
+    static const bool off = std::getenv("OOT_NO_RESUME_CAPTURE") != nullptr;
+    if (off) return;
+    std::vector<void*> earlier; void* now = nullptr;
+    {
+        std::lock_guard order{submit_capture_mutex};
+        for (auto& a : taken) if (a.capture) { earlier.push_back(a.capture); a.capture = nullptr; }
+        { std::lock_guard lock{incoming_mutex}; for (auto& a : incoming) if (a.capture) { earlier.push_back(a.capture); a.capture = nullptr; } }
+        now = CapturePoolWrites();
+    }
+    if (earlier.empty() && !now) return;
+    nvn::Submit(); // (the work recorded so far keeps the data it was recorded with)
+    for (void* c : earlier) ApplyPoolCapture(c);
+    ApplyPoolCapture(now);
+    resume_captures.fetch_add(1, std::memory_order_relaxed);
+}
 bool SynchronousExecutor() { static const bool on = std::getenv("OOT_SYNC_EXECUTOR") != nullptr; return on; }
 thread_local u32 executing = 0; // (re-entry from AfterFlush actions run during a flush)
 void Execute(u64 queue, std::deque<Work>&& work) { // (execution_mutex held)
@@ -233,7 +407,7 @@ void Execute(u64 queue, std::deque<Work>&& work) { // (execution_mutex held)
 void ExecutorLoop() {
     rt::SetThreadName("nvn-exec");
     for (;;) {
-        std::deque<std::pair<u64, std::deque<Work>>> items;
+        std::deque<Arrival> items;
         {
             std::unique_lock lock{incoming_mutex};
             // (Also every 20 ms: parked queues whose event never comes resume after a timeout.)
@@ -249,7 +423,13 @@ void ExecutorLoop() {
         {
             const auto busy_from = std::chrono::steady_clock::now();
             std::lock_guard lock{execution_mutex};
-            for (auto& [queue, work] : items) { current_queue = queue; Execute(queue, std::move(work)); }
+            taken = std::move(items); items.clear();
+            size_t ran = 0;
+            while (!taken.empty()) {
+                Arrival a = std::move(taken.front()); taken.pop_front(); ++ran;
+                if (a.capture) { nvn::Submit(); ApplyPoolCapture(a.capture); } // (the work recorded so far keeps the data it was submitted with)
+                current_queue = a.first; Execute(a.first, std::move(a.second)); }
+            items.resize(ran); // (only their number is used below)
             ResumeQueues();
             nvn::Submit(); // the work starts on the GPU now
             executor_busy_ns += (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - busy_from).count();
@@ -265,14 +445,22 @@ void CommandExecutor::Submit(u64 queue, std::shared_ptr<const CommandList> list)
     if (serial) queue = 0;
     std::deque<Work> work;
     Flatten(list, 0, ~size_t{0}, work);
+    { static const bool trace = std::getenv("OOT_FLAG_TRACE") != nullptr;
+      if (trace) { static std::atomic<u64> lists{0}, with_flags{0}, again{0};
+        { std::vector<const CommandList*> met; for (const auto& w : work) { if (std::find(met.begin(), met.end(), w.list.get()) != met.end()) continue; met.push_back(w.list.get()); ++lists; if (!w.list->has_flags) continue; ++with_flags; if (w.list->submissions.fetch_add(1) > 0) ++again; } }
+        static std::atomic<u64> n{0}; if (++n % 3000 == 0) RT_LOG("flags: %llu list segments submitted, %llu with flag decisions, %llu of those from a list submitted before", (unsigned long long)lists.load(), (unsigned long long)with_flags.load(), (unsigned long long)again.load()); } }
     if (SynchronousExecutor()) {
+        void* const capture = CapturePoolWrites();
         std::lock_guard lock{execution_mutex};
+        if (capture) { nvn::Submit(); ApplyPoolCapture(capture); }
         current_queue = queue;
         Execute(queue, std::move(work));
         return;
     }
     StartExecutor();
-    { std::lock_guard lock{incoming_mutex}; incoming.emplace_back(queue, std::move(work)); ++arrived; }
+    { std::lock_guard order{submit_capture_mutex}; // (see CaptureForResumedWork)
+      void* const capture = CapturePoolWrites();
+      std::lock_guard lock{incoming_mutex}; incoming.push_back({queue, std::move(work), capture}); ++arrived; }
     incoming_cv.notify_one();
 }
 void CommandExecutor::Submit(u64 queue, u64 handle) {
@@ -304,6 +492,10 @@ void CommandExecutor::Drain() {
 void CommandExecutor::Flush() { nvn::Submit(); }
 void CommandExecutor::Finish() { Drain(); nvn::Flush(); }
 
+void ExecuteSegmentSerial(const CommandList& list, size_t begin, size_t end) {
+    std::vector<u64> children; EventWait wait; size_t index = begin;
+    if (ExecuteFrom(list, index, end, children, wait) != Step::Done) Fatal("a command-list segment of state changes and draws did not run to its end");
+}
 CommandExecutor& Executor() {
     static CommandExecutor executor;
     return executor;
@@ -358,6 +550,7 @@ NATIVE("nvnCommandBufferEndRecording") {
     const u64 handle = TakeControl(c, c->x[0], *cb);
     cb->recording = false;
     for (u32 i = 0; i < cb->list->commands.size(); ++i) if ((Op)cb->list->commands[i].op == Op::CallCommands) cb->list->calls.push_back(i);
+    for (const auto& command : cb->list->commands) if (((Op)command.op == Op::SetRenderEnableConditional || (Op)command.op == Op::ReportCounter) && command.x[7]) { cb->list->has_flags = true; break; }
     cb->list->indexed = true;
     {
         std::lock_guard lock{lists_mutex};
@@ -422,30 +615,11 @@ Step ExecuteFrom(const CommandList& list, size_t& index, size_t end, std::vector
     static const bool op_stats = std::getenv("OOT_OP_STATS") != nullptr;
     for (; index < end; ++index) {
         const auto& command = list.commands[index];
-        // Draw fast path (render.cpp): only these commands keep the previous draw's setup valid.
-        switch ((Op)command.op) {
-        case Op::DrawArrays: case Op::DrawElements: case Op::DrawArraysInstanced: case Op::DrawElementsInstanced:
-        case Op::DrawElementsBaseVertex: case Op::BindUniformBuffer: case Op::BindUniformBuffers:
-        case Op::BindVertexBuffer: case Op::BindVertexBuffers: case Op::BindVertexAttribState: case Op::BindVertexStreamState:
-        case Op::SetViewport: case Op::SetViewports: case Op::SetScissor: case Op::SetScissors: case Op::SetDepthRange: case Op::SetDepthRanges:
-        case Op::ReportCounter: case Op::ResetCounter: break;
-        // These invalidate only when they change a value (their handlers in render.cpp check).
-        case Op::BindProgram: case Op::BindTexture: case Op::SetRenderTargets: case Op::BindBlendState: case Op::BindColorState:
-        case Op::BindPolygonState: case Op::BindDepthStencilState: case Op::SetLineWidth: case Op::BindStorageBuffer: case Op::BindChannelMaskState:
-        case Op::SetPrimitiveRestart: case Op::SetPointSize: case Op::SetDepthClamp: break;
-        // Dynamic stencil state is emitted by Draw for both full and fast draws.
-        case Op::SetStencilMask: case Op::SetStencilValueMask: case Op::SetStencilRef: break;
-        case Op::SetBlendColor: case Op::SetDepthBias: break; // (dynamic state, set per draw)
-        // No effect on what a draw resolves: render enable is evaluated per draw; barriers are
-        // already implied by submission order here.
-        case Op::SetRenderEnable: case Op::SetRenderEnableConditional: case Op::Barrier:
-        case Op::SetTiledCacheAction: case Op::SetTiledCacheTileSize: case Op::SetAlphaRef: break;
-        default: if (fast_draw_allowed) ++fast_draw_breakers[std::min<u32>(command.op, 127)]; fast_draw_allowed = false;
-        }
+        NoteFastDrawBreaker(command);
         if (FrameLogged() && command.op > 7 && command.op != 55 && command.op != 56 && command.op != 77 && command.op != 79) RT_LOG("cmd op %u x %#llx %#llx %#llx", command.op, (unsigned long long)command.x[0], (unsigned long long)command.x[1], (unsigned long long)command.x[2]);
         if (op_stats) { static u64 counts[128]; static u64 total = 0; ++counts[std::min<u32>(command.op, 127)];
             if (++total % 1000000 == 0) { std::string t; for (u32 i = 0; i < 128; ++i) if (counts[i] > 10000) { char b[32]; std::snprintf(b, sizeof b, " %u:%llu", i, (unsigned long long)(counts[i] / 1000)); t += b; } RT_LOG("ops (thousands per million):%s", t.c_str()); std::memset(counts, 0, sizeof counts); } }
-        if (submit_every && ++since_submit >= submit_every) { since_submit = 0; nvn::Submit(); }
+        if (submit_every && ++since_submit >= submit_every && !SamplesRunOpen()) { since_submit = 0; nvn::Submit(); } // (not inside an occlusion test: its count would be cut in two)
         BatchMutex().Yield(); // (the game's thread waits for the batch lock: its readback or submit goes first)
         static const bool slow_ops = std::getenv("OOT_SLOW_OP") != nullptr;
         struct OpTimer { bool on; u32 op; std::chrono::steady_clock::time_point t0; u64 x0;
@@ -489,8 +663,25 @@ Step ExecuteFrom(const CommandList& list, size_t& index, size_t end, std::vector
             // The sync is unsignalled until the work before it completes; queues waiting for it
             // (WaitSync) may run once it is recorded (queue order).
             u32* sync = reinterpret_cast<u32*>(x[0]);
-            static const bool early = std::getenv("OOT_EARLY_FENCES") != nullptr; // experiment: signalled once recorded
-            if (early) { __atomic_store_n(sync, 1u, __ATOMIC_RELEASE); break; }
+            // When the game sees a fence signalled. The game waits for frame N's fence before it releases frame N+1,
+            // so with "done" (the GPU finished the work) recording never overlapped the GPU's tail of the frame before:
+            // Castle Town 46 fps. "submit": once the work before the fence is submitted, which is when the CPU-written
+            // pool data it reads has been copied to the device (RecordPoolTransfers), so the game may write its next
+            // frame's data; GPU results are still waited for where they are read (WaitForWrites, page faults): 54 fps.
+            // OOT_FENCE=done|submit|record (record: as soon as recorded, an experiment: later CPU writes can reach
+            // the frame's draws). OOT_EARLY_FENCES=1 is record, as before.
+            static const int fence_mode = [] { const char* e = std::getenv("OOT_FENCE");
+                if (std::getenv("OOT_EARLY_FENCES") || (e && !std::strcmp(e, "record"))) return 2;
+                return e && !std::strcmp(e, "done") ? 0 : 1; }();
+            if (fence_mode == 2) { __atomic_store_n(sync, 1u, __ATOMIC_RELEASE); break; }
+            if (fence_mode == 1) {
+                __atomic_store_n(sync, 0u, __ATOMIC_RELEASE);
+                nvn::Submit();
+                __atomic_store_n(sync, 1u, __ATOMIC_RELEASE);
+                if (TimelineOn()) RT_LOG("T %.2f fence %p signalled at submit", TimelineMs(), (void*)sync);
+                NotifySyncSignalled();
+                break;
+            }
             __atomic_store_n(sync, 0u, __ATOMIC_RELEASE);
             { std::lock_guard lock{event_mutex}; pending_events[sync] = 1; }
             if (TimelineOn()) RT_LOG("T %.2f fence %p recorded", TimelineMs(), (void*)sync);
@@ -523,8 +714,8 @@ Step ExecuteFrom(const CommandList& list, size_t& index, size_t end, std::vector
             break;
         }
         case Op::ReportCounter: {
-            if (FrameLogged()) RT_LOG("counter report %llu", (unsigned long long)x[0]);
-            ReportRenderCounter((u32)x[0],x[1]);
+            if (FrameLogged()) RT_LOG("counter report %llu @%#llx", (unsigned long long)x[0], (unsigned long long)x[1]);
+            ReportRenderCounter((u32)x[0],x[1],x[7]!=0);
             break;
         }
         case Op::ReportValue: {
@@ -576,7 +767,9 @@ Step ExecuteFrom(const CommandList& list, size_t& index, size_t end, std::vector
             for (size_t i = 0; i < command.data.size() / 8; ++i) children.push_back(reinterpret_cast<const u64*>(command.data.data())[i]);
             ++index;
             return Step::Call;
-        default: if (!ExecuteRenderCommand(command)) Fatal("NVN command executor pending: operation %u", command.op);
+        default: { const bool allowed_before = fast_draw_allowed; const bool ok = ExecuteRenderCommand(command);
+            if (allowed_before && !fast_draw_allowed && command.op < 128 && !IsDrawOp(command.op)) ++slow_draw_why[command.op];
+            if (!ok) Fatal("NVN command executor pending: operation %u", command.op); }
         }
     }
     return Step::Done;
@@ -630,7 +823,39 @@ NVN_COMMAND(FenceSync)
 NVN_COMMAND(WaitSync)
 NVN_COMMAND(SignalEvent)
 NVN_COMMAND(WaitEvent)
-NVN_COMMAND(ReportCounter)
+// The game's one-shot flags. Its CPU writes 1 into a report's counter word to ask for something drawn under
+// SetRenderEnableConditional(not equal) - doors, vines, the ornaments on a shield, button prompts - and a report of
+// another counter after that draw puts the word back to 0. On the console the GPU is done with a frame before the game
+// writes the next frame's flags. Here the executor is behind the game's threads: its 0, written when it reached the
+// report, landed on the 1 the game had already written for the next frame (that object's shading was skipped for a
+// frame: its depth-only pre-pass left a hole that bloom blew up, a one-frame glow), and a condition it read could
+// already hold the next frame's 1 (a prompt drawn a frame early from stale data, anywhere on the screen).
+// Both now happen in the game's own order, while it records: a report of such a counter clears its word at once,
+// and a condition on such a word is decided at once and travels with the command. OOT_FLAGS_LATE=1: as before.
+namespace {
+std::mutex flag_words_mutex;
+std::unordered_set<u64> flag_words; // addresses reports of other counters than samples were made to, or where a condition met the game's request (1 against 0)
+std::unordered_set<u64> sample_words; // addresses samples reports were made to: never flags
+bool FlagsAtRecord() { static const bool on = std::getenv("OOT_FLAGS_LATE") == nullptr && std::getenv("OOT_FLAG_REPORTS_LATE") == nullptr && std::getenv("OOT_DYNAMIC_RESOLUTION") == nullptr; return on; }
+}
+NATIVE("nvnCommandBufferReportCounter") {
+    Command& command = Record(c, Op::ReportCounter);
+    if (!FlagsAtRecord()) return;
+    const u64 counter = command.x[0], address = command.x[1];
+    { static std::atomic<u64> n{0}; if (++n % 50000 == 0 && std::getenv("OOT_FLAG_TRACE")) RT_LOG("flags: report %llu: counter %llu @%#llx", (unsigned long long)n.load(), (unsigned long long)counter, (unsigned long long)address); }
+    { std::lock_guard lock{flag_words_mutex}; if (counter == 1) { flag_words.erase(address); sample_words.insert(address); } else { flag_words.insert(address); sample_words.erase(address); } }
+    if (counter == 1) {
+        // A samples report's slot reads "visible" from the moment the game records it. The slots are a ring, a new one
+        // for every object every frame, and the game's lists run on several queues: a condition on a slot was at times
+        // reached before the report that fills it had been executed, and read what the slot held before - 0 - so an
+        // object counted at 8,000 pixels a frame earlier lost its shading for a frame (the one-frame glows: its
+        // depth-only pre-pass left a hole). The real count is written over it when the GPU has it (Longshot does the
+        // same for work held back, f3fe1763). OOT_FLAGS_LATE=1: not.
+        if (auto* word = static_cast<u64*>(ResolveAddress(address, 16))) *word = 4096;
+        return;
+    }
+    if (auto* word = static_cast<u64*>(ResolveAddress(address, 16))) { *word = 0; command.x[7] = 1; }
+}
 NVN_COMMAND(ResetCounter)
 NVN_COMMAND(SetTiledCacheAction)
 NVN_COMMAND(SetTiledCacheTileSize)
@@ -659,7 +884,22 @@ NATIVE("nvnCommandBufferPushComputeConstantsDeferred") { Record(c, Op::PushCompu
 NATIVE("nvnCommandBufferDrawMeshTasks") { Record(c, Op::DrawMeshTasks); }
 NATIVE("nvnCommandBufferDrawMeshTasksIndirect") { Record(c, Op::DrawMeshTasksIndirect); }
 NATIVE("nvnCommandBufferClearBuffer") { Record(c, Op::ClearBuffer); }
-NATIVE("nvnCommandBufferSetRenderEnableConditional") { Record(c, Op::SetRenderEnableConditional); }
+NATIVE("nvnCommandBufferSetRenderEnableConditional") {
+    Command& command = Record(c, Op::SetRenderEnableConditional);
+    if (!FlagsAtRecord()) return;
+    const u64 address = command.x[1];
+    { static std::atomic<u64> all{0}; if (++all % 20000 == 0 && std::getenv("OOT_FLAG_TRACE")) { std::lock_guard lock{flag_words_mutex}; RT_LOG("flags: %llu conditions recorded, %zu flag words known, this one %#llx mode %llu", (unsigned long long)all.load(), flag_words.size(), (unsigned long long)address, (unsigned long long)command.x[0]); } }
+    const auto* words = static_cast<const u64*>(ResolveAddress(address, 24));
+    if (!words) return;
+    const u64 x = words[0], y = words[2];
+    {   // (a flag word: one a report of another counter resets, or - as Longshot tells them, nvn_native.c - one where the
+        // game's request stands, 1 against 0, that no samples report was made to. The game gates clears with them too.)
+        std::lock_guard lock{flag_words_mutex};
+        if (!flag_words.count(address)) { if (x == 1 && y == 0 && !sample_words.count(address)) flag_words.insert(address); else return; }
+    }
+    command.x[7] = ((x == y) == (command.x[0] == 0)) ? 1 : 2; // (decided: 1 drawn, 2 skipped)
+    { static std::atomic<u64> n{0}, hits{0}; if (command.x[7]) ++hits; if (++n % 20000 == 0 && std::getenv("OOT_FLAG_TRACE")) RT_LOG("flags: %llu of %llu conditions on flag words decided at record", (unsigned long long)hits.load(), (unsigned long long)n.load()); }
+}
 NATIVE("nvnCommandBufferReportValue") { Record(c, Op::ReportValue); }
 // Deferred bindings retain the client array until submission, instead of
 // capturing its current contents as the ordinary binding entry points do.

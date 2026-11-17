@@ -1,0 +1,61 @@
+#version 450
+// Fast approximate anti-aliasing on the finished picture (the settings window's Anti-aliasing at FXAA), after the method
+// of Timothy Lottes' FXAA 3.11 (public domain): an edge is found from the luma of a pixel and its neighbours, its
+// direction and length searched along the edge, and the pixel blended towards the neighbour across it by how far along
+// the edge it lies. Written for this renderer: one pass, 8 search steps a side.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1, rgba8) uniform writeonly image2D dst;
+float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+void main() {
+    const ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 size = imageSize(dst);
+    if (at.x >= size.x || at.y >= size.y) return;
+    const vec2 texel = 1.0 / vec2(textureSize(src, 0));
+    const vec2 uv = (vec2(at) + 0.5) * texel;
+    const vec3 centre = textureLod(src, uv, 0.0).rgb;
+    const float lM = luma(centre);
+    const float lN = luma(textureLodOffset(src, uv, 0.0, ivec2(0, -1)).rgb), lS = luma(textureLodOffset(src, uv, 0.0, ivec2(0, 1)).rgb);
+    const float lW = luma(textureLodOffset(src, uv, 0.0, ivec2(-1, 0)).rgb), lE = luma(textureLodOffset(src, uv, 0.0, ivec2(1, 0)).rgb);
+    const float lo = min(lM, min(min(lN, lS), min(lW, lE))), hi = max(lM, max(max(lN, lS), max(lW, lE)));
+    const float range = hi - lo;
+    if (range < max(0.0312, hi * 0.125)) { imageStore(dst, at, vec4(centre, 1.0)); return; } // (no edge here)
+    const float lNW = luma(textureLodOffset(src, uv, 0.0, ivec2(-1, -1)).rgb), lNE = luma(textureLodOffset(src, uv, 0.0, ivec2(1, -1)).rgb);
+    const float lSW = luma(textureLodOffset(src, uv, 0.0, ivec2(-1, 1)).rgb), lSE = luma(textureLodOffset(src, uv, 0.0, ivec2(1, 1)).rgb);
+    const float edgeH = abs(lNW + lSW - 2.0 * lW) + 2.0 * abs(lN + lS - 2.0 * lM) + abs(lNE + lSE - 2.0 * lE);
+    const float edgeV = abs(lNW + lNE - 2.0 * lN) + 2.0 * abs(lW + lE - 2.0 * lM) + abs(lSW + lSE - 2.0 * lS);
+    const bool horizontal = edgeH >= edgeV; // (the edge runs along x: blend across y)
+    const float l1 = horizontal ? lN : lW, l2 = horizontal ? lS : lE;
+    const float g1 = l1 - lM, g2 = l2 - lM;
+    const bool first = abs(g1) >= abs(g2); // (the steeper side)
+    const float gradient = 0.25 * max(abs(g1), abs(g2));
+    float step_across = horizontal ? texel.y : texel.x;
+    float edge_luma;
+    if (first) { step_across = -step_across; edge_luma = 0.5 * (l1 + lM); } else edge_luma = 0.5 * (l2 + lM);
+    vec2 on_edge = uv;
+    if (horizontal) on_edge.y += step_across * 0.5; else on_edge.x += step_across * 0.5;
+    const vec2 along = horizontal ? vec2(texel.x, 0.0) : vec2(0.0, texel.y);
+    // The edge's two ends: where the luma between the two rows stops being the edge's.
+    const float steps[8] = float[8](1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0);
+    vec2 p1 = on_edge - along, p2 = on_edge + along;
+    float e1 = luma(textureLod(src, p1, 0.0).rgb) - edge_luma, e2 = luma(textureLod(src, p2, 0.0).rgb) - edge_luma;
+    bool done1 = abs(e1) >= gradient, done2 = abs(e2) >= gradient;
+    for (int i = 1; i < 8 && !(done1 && done2); i++) {
+        if (!done1) { p1 -= along * steps[i]; e1 = luma(textureLod(src, p1, 0.0).rgb) - edge_luma; done1 = abs(e1) >= gradient; }
+        if (!done2) { p2 += along * steps[i]; e2 = luma(textureLod(src, p2, 0.0).rgb) - edge_luma; done2 = abs(e2) >= gradient; }
+    }
+    const float d1 = horizontal ? uv.x - p1.x : uv.y - p1.y, d2 = horizontal ? p2.x - uv.x : p2.y - uv.y;
+    const bool nearer1 = d1 < d2;
+    const float span = d1 + d2;
+    // (only when the end's luma goes the other way than the centre's: the pixel is on the edge's own side)
+    const bool good = ((nearer1 ? e1 : e2) < 0.0) != (lM - edge_luma < 0.0);
+    float offset = good ? 0.5 - min(d1, d2) / span : 0.0;
+    // Single-pixel detail (sub-pixel aliasing): a blend by how much the pixel differs from its neighbourhood.
+    const float average = (2.0 * (lN + lS + lW + lE) + lNW + lNE + lSW + lSE) / 12.0;
+    const float sub = clamp(abs(average - lM) / range, 0.0, 1.0);
+    const float sub_offset = (-2.0 * sub + 3.0) * sub * sub;
+    offset = max(offset, sub_offset * sub_offset * 0.75);
+    vec2 final = uv;
+    if (horizontal) final.y += offset * step_across; else final.x += offset * step_across;
+    imageStore(dst, at, vec4(textureLod(src, final, 0.0).rgb, 1.0));
+}

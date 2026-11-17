@@ -68,6 +68,8 @@ struct BufferRange {
 
 // Finds the pool containing a GPU address (nullptr if none).
 BufferRange LookupAddress(u64 address);
+BufferRange LookupAddressCpu(u64 address); // for CPU reads and writes only: does not bring the pool to the GPU (buffer may be null)
+bool GuestRegionAround(u64 address, u64* start, u64* end); // (the pool or mapped range holding it)
 // The same, for binding the range to GPU work: may first give its pool a device-memory copy
 // (recording a copy into the open batch).
 BufferRange GpuLookupAddress(u64 address);
@@ -76,6 +78,8 @@ u64 PoolGeneration(); // changes when pools or mappings change
 // update: rewrite it first if pools changed (waits for work that may still read it); only draws
 // and dispatches whose shaders access global memory need that.
 u64 GlobalAddressTable(bool update = true);
+u64 GuestPageTableAddress(); // (Longshot's translator: the page table's device address, pushed to its programs; else 0)
+bool GlobalAddressTableCurrent(); // (written for the pools as they are: nothing to do)
 // Resolves GPU virtual storage to its imported physical pool. Never dereference a
 // virtual GPU address directly: its host reservation deliberately has no CPU access.
 void* ResolveAddress(u64 address, u64 size);
@@ -87,6 +91,11 @@ Pool* PoolOf(u64 guest_pool_object);
 // back to guest memory. Returns a lock that must be held until the batch was submitted.
 // Storage writes are copied back by `writeback` (a submission after the batch) when given: their pages go
 // to `pending`, for MarkWritebackPending once submitted.
+// What the CPU wrote to mirrored pools since the last capture, copied now (the game's thread, when it submits
+// commands); null: nothing. ApplyPoolCapture: it goes to the device copies with the next batch (the executor, where
+// that submission's commands begin: the open batch is submitted first).
+void* CapturePoolWrites();
+void ApplyPoolCapture(void* capture);
 std::shared_lock<std::shared_mutex> RecordPoolTransfers(VkCommandBuffer uploads, bool* any_uploads, VkCommandBuffer cmd,
     const std::map<u64, u64>& gpu_writes, const std::map<u64, u64>& gpu_reports,
     VkCommandBuffer writeback = VK_NULL_HANDLE, std::vector<std::pair<u64, u64>>* pending = nullptr);
@@ -103,6 +112,9 @@ u32 ArmTextureMemory(u64 address, u64 size);
 // every imported (userptr) page at each submission, and one read-only page gets the submission rejected and the
 // device lost (measured on the Steam Deck). Textures are then checked by content (texture_data.cpp).
 bool PageProtectionUsable();
+bool PoolsInGpuMemory(); // (every pool is GPU memory mapped at its address or plain memory: nothing imported, submissions are cheap)
+bool TextureWatchUsable(); // (CPU writes to texture memory are found by page protection: memory.cpp)
+void NoteLateReadRange(u64 address, u64 size); // (its pages are never made inaccessible for a pending write-back)
 // GPU results kept in a pool's device copy (batch.cpp): inaccessible to the CPU until copied back.
 void ProtectDeviceAhead(u64 start, u64 end, const std::set<u64>* keep = nullptr);
 void SettleDeviceAhead(u64 start, u64 end);

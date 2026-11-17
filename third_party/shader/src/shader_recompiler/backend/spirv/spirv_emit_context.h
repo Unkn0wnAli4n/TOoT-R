@@ -390,6 +390,8 @@ public:
     u32 mesh_map_bytes{};
     u32 mesh_primitive_base{}; ///< first word of the per-primitive groups
     std::vector<MeshLineTarget> mesh_vertex_targets;
+    struct MeshDefault { Id variable; u32 missing; }; ///< (from Longshot) components of a per-vertex generic output no line writes
+    std::vector<MeshDefault> mesh_vertex_defaults;
     std::vector<MeshLineTarget> mesh_primitive_targets;
     std::array<Id, 2> mesh_outputs_marker{};
     bool mesh_zero_outputs_marker{}; ///< OpStore(zero, zero) becomes OpSetMeshOutputsEXT 0 0 (Hookshot d91d203)

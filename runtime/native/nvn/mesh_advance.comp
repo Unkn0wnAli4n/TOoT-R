@@ -1,0 +1,22 @@
+// Between two mesh fallback draws that share the records buffer (MeshFallbackDispatch in render.cpp): the header made
+// ready for the next draw. The allocator counts records of the program that just ran; the next program's records have
+// another size, so its first record is the first one past the words taken so far. Its command starts there with no
+// vertices, and no mesh workgroups are started yet.
+// Regenerate with
+//   glslangValidator -V --target-env vulkan1.2 --vn mesh_advance_spv mesh_advance.comp -o mesh_advance_spv.h
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference : require
+layout(local_size_x = 1) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Header {
+    uint vertex_count; uint instance_count; uint first_vertex; uint first_instance; uint allocator; uint groups_x; uint groups_y; uint groups_z;
+};
+layout(push_constant) uniform Parameters { uint64_t header; uint words_before; uint words_now; } p;
+void main() {
+    Header h = Header(p.header);
+    const uint64_t taken = uint64_t(h.allocator) * uint64_t(p.words_before);
+    const uint64_t first = (taken + uint64_t(p.words_now) - 1ul) / uint64_t(max(p.words_now, 1u));
+    const uint start = uint(min(first, 0xfffffff0ul)); // (past the buffer: the next program's own check takes nothing)
+    h.vertex_count = 0u; h.instance_count = 1u; h.first_vertex = start; h.first_instance = 0u;
+    h.allocator = start; h.groups_x = 0u; h.groups_y = 1u; h.groups_z = 1u;
+}

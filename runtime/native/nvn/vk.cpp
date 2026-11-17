@@ -12,6 +12,8 @@
 #include <SDL3/SDL_vulkan.h>
 
 #include "vk.h"
+#include "vk_dlss.h" // (third_party/longshot-upscale)
+#include "shader_compiler.h"
 
 namespace nvn {
 namespace {
@@ -21,6 +23,16 @@ void CreateInstance(VulkanContext& vk) {
     const char* const* sdl_extensions = SDL_Vulkan_GetInstanceExtensions(&count);
     if (!sdl_extensions) rt::Fatal("SDL_Vulkan_GetInstanceExtensions: %s", SDL_GetError());
     std::vector<const char*> extensions(sdl_extensions, sdl_extensions + count);
+    {   // (HDR surfaces are listed only with this: output.cpp)
+        u32 n = 0; vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
+        std::vector<VkExtensionProperties> have(n); vkEnumerateInstanceExtensionProperties(nullptr, &n, have.data());
+        for (const auto& e : have) if (!std::strcmp(e.extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) { extensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME); break; }
+    }
+    {   // (NVIDIA DLSS's, in a build with it: the vendored upscalers, longshot_upscale.cpp)
+        u32 n = 0; vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
+        std::vector<VkExtensionProperties> have(n); vkEnumerateInstanceExtensionProperties(nullptr, &n, have.data());
+        mkwvk::dlss_instance_extensions(extensions, have);
+    }
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "tootr";
     app.apiVersion = VK_API_VERSION_1_3;
@@ -102,8 +114,9 @@ void PickDevice(VulkanContext& vk) {
     // The shader translator emits subgroup operations in every stage, task and mesh included
     // (shader_compiler.cpp supported_subgroup_stages).
     const VkShaderStageFlags needed = VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT;
+    vk.subgroup_size = subgroup.subgroupSize;
     if ((subgroup.supportedStages & needed) != needed || subgroup.subgroupSize != 32)
-        RT_LOG("warning: subgroup operations in stages %#x (size %u); task/mesh programs may compute wrong warp results",
+        RT_LOG("subgroup operations in stages %#x, size %u (the game's programs are written for 32 lanes)",
                subgroup.supportedStages, subgroup.subgroupSize);
     RT_LOG("Vulkan device: %s (host import alignment %#llx)", vk.properties.deviceName,
            (unsigned long long)vk.host_import_alignment);
@@ -120,13 +133,76 @@ void CreateDevice(VulkanContext& vk) {
         VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME,
         VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME,
         VK_KHR_INDEX_TYPE_UINT8_EXTENSION_NAME, // NVN's UNSIGNED_BYTE index type
-        VK_EXT_MESH_SHADER_EXTENSION_NAME,      // NVN2 task/mesh programs
         VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,     // NVN unbound image handles read zero
     };
     u32 extension_count=0;
     VK_CHECK(vkEnumerateDeviceExtensionProperties(vk.physical,nullptr,&extension_count,nullptr));
     std::vector<VkExtensionProperties> available(extension_count);
     VK_CHECK(vkEnumerateDeviceExtensionProperties(vk.physical,nullptr,&extension_count,available.data()));
+    // NVN2 task/mesh programs: native stages where the driver runs them as the console does (NVIDIA); elsewhere compute
+    // programs and a generated vertex stage (render.cpp "mesh fallback"): RADV's task stage runs 64-lane waves, which the
+    // game's 32-lane programs do not survive (the Steam Deck's GPU reset when the camera turned).
+    for (const auto& e : available) vk.mesh_shader |= !std::strcmp(e.extensionName, VK_EXT_MESH_SHADER_EXTENSION_NAME);
+    if (vk.mesh_shader) {
+        VkPhysicalDeviceMeshShaderFeaturesEXT have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; query.pNext = &have;
+        vkGetPhysicalDeviceFeatures2(vk.physical, &query);
+        vk.mesh_shader = have.taskShader && have.meshShader;
+    }
+    {
+        const char* e = std::getenv("OOT_MESH_FALLBACK");
+        vk.mesh_fallback = e ? std::atoi(e) != 0 : (!vk.mesh_shader || vk.properties.vendorID != 0x10DE);
+        if (!vk.mesh_fallback && !vk.mesh_shader) { RT_LOG("OOT_MESH_FALLBACK=0 ignored: this GPU has no mesh shader stages"); vk.mesh_fallback = true; }
+        if (vk.mesh_fallback) vk.mesh_shader = false;
+        else extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+        RT_LOG("task/mesh programs: %s", vk.mesh_fallback ? "compute fallback" : "native mesh shader stages");
+    }
+    {   // (compute stages held to the console's 32-lane subgroups where the GPU's own are larger)
+        VkPhysicalDeviceVulkan13Features have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; query.pNext = &have;
+        vkGetPhysicalDeviceFeatures2(vk.physical, &query);
+        VkPhysicalDeviceVulkan13Properties limits{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2}; p2.pNext = &limits;
+        vkGetPhysicalDeviceProperties2(vk.physical, &p2);
+        const bool can = have.subgroupSizeControl && (limits.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) && limits.minSubgroupSize <= 32 && limits.maxSubgroupSize >= 32;
+        const char* e = std::getenv("OOT_PIN_SUBGROUP");
+        vk.pin_subgroup = can && (e ? std::atoi(e) != 0 : vk.subgroup_size != 32);
+        vk.full_subgroups = vk.pin_subgroup && have.computeFullSubgroups;
+        // (the graphics stages the GPU can hold to 32 lanes too are: RDNA 2's fragment, task and mesh stages. The ones it
+        // cannot, its vertex stage, run at the device's size, and are translated for that: shader_compiler_ls.cpp)
+        const bool sizes = have.subgroupSizeControl && limits.minSubgroupSize <= 32 && limits.maxSubgroupSize >= 32 && vk.subgroup_size != 32 && !(e && !std::atoi(e));
+        // (graphics stages: opt-in, OOT_PIN_GRAPHICS=1. With it on, a Steam Deck hung at the title's first frame in three
+        // runs of three, 2026-11-16 runs 10-12; without it run 9 reached gameplay.)
+        static const bool graphics = std::getenv("OOT_PIN_GRAPHICS") && std::atoi(std::getenv("OOT_PIN_GRAPHICS")) != 0;
+        vk.pin_stages = sizes ? (graphics ? limits.requiredSubgroupSizeStages : limits.requiredSubgroupSizeStages & (u32)VK_SHADER_STAGE_COMPUTE_BIT) : 0;
+        if (!graphics) vk.subgroup_max = 32; // (no stage is translated for wider subgroups either)
+        if (!vk.pin_subgroup) vk.pin_stages &= ~(u32)VK_SHADER_STAGE_COMPUTE_BIT;
+        if (graphics) vk.subgroup_max = std::max(vk.subgroup_size, have.subgroupSizeControl ? limits.maxSubgroupSize : vk.subgroup_size);
+        if (vk.subgroup_size != 32) RT_LOG("subgroups: stages %#x are held to 32 lanes, the others run at up to %u", vk.pin_stages, vk.subgroup_max);
+        RT_LOG("compute subgroups: device %u lanes (%u-%u), %s", vk.subgroup_size, limits.minSubgroupSize, limits.maxSubgroupSize, vk.pin_subgroup ? "held to 32" : can ? "as the device runs them" : "cannot be set");
+    }
+    mkwvk::dlss_device_extensions(extensions, available); mkwvk::dlss_fg_device_extensions(extensions, available); // (VK_NVX_binary_import, VK_NVX_image_view_handle, and frame generation's)
+    for (const auto& e : available) if (!std::strcmp(e.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) { extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME); vk.memory_budget = true; break; }
+    // The game's neural networks (the movie's and the picture's upscalers) multiply 16x8x16 half-float matrices: on the
+    // device's cooperative matrices where it has that shape (NVIDIA), in software otherwise. OOT_NATIVE_MMA=0: software.
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+    for (const auto& e : available) if (!std::strcmp(e.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
+        const char* off = std::getenv("OOT_NATIVE_MMA"); if (off && !std::atoi(off)) break;
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; query.pNext = &coop;
+        vkGetPhysicalDeviceFeatures2(vk.physical, &query);
+        const auto properties = reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(vkGetInstanceProcAddr(vk.instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
+        bool shape = false;
+        if (coop.cooperativeMatrix && properties) {
+            u32 n = 0; properties(vk.physical, &n, nullptr);
+            std::vector<VkCooperativeMatrixPropertiesKHR> list(n, VkCooperativeMatrixPropertiesKHR{VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
+            properties(vk.physical, &n, list.data());
+            for (const auto& p : list) shape |= p.MSize == 16 && p.NSize == 8 && p.KSize == 16 && p.AType == VK_COMPONENT_TYPE_FLOAT16_KHR && p.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                p.CType == VK_COMPONENT_TYPE_FLOAT16_KHR && p.ResultType == VK_COMPONENT_TYPE_FLOAT16_KHR && p.scope == VK_SCOPE_SUBGROUP_KHR;
+        }
+        if (shape) { extensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME); vk.cooperative_matrix = true; }
+        coop = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR}; coop.cooperativeMatrix = shape;
+        break;
+    }
     bool checkpoints=false;
     if(std::getenv("OOT_GPU_CHECKPOINTS"))for(const auto& extension:available)
         if(!std::strcmp(extension.extensionName,VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)){
@@ -194,7 +270,7 @@ void CreateDevice(VulkanContext& vk) {
     mesh_shaders.pNext=&robustness;
     mesh_shaders.taskShader = VK_TRUE;
     mesh_shaders.meshShader = VK_TRUE;
-    {   // (draw-log statistics of task/mesh invocations, where the driver has them: RADV does not)
+    if (vk.mesh_shader) {   // (draw-log statistics of task/mesh invocations, where the driver has them: RADV does not)
         VkPhysicalDeviceMeshShaderFeaturesEXT supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
         VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; query.pNext = &supported;
         vkGetPhysicalDeviceFeatures2(vk.physical, &query);
@@ -203,13 +279,14 @@ void CreateDevice(VulkanContext& vk) {
     }
     VkPhysicalDeviceIndexTypeUint8FeaturesKHR uint8_indices{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_KHR};
     uint8_indices.indexTypeUint8 = VK_TRUE;
-    uint8_indices.pNext = &mesh_shaders;
+    uint8_indices.pNext = vk.mesh_shader ? static_cast<void*>(&mesh_shaders) : static_cast<void*>(&robustness);
     VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     v13.pNext = &uint8_indices;
     v13.dynamicRendering = VK_TRUE;
     v13.synchronization2 = VK_TRUE;
     v13.maintenance4 = VK_TRUE;
     v13.pipelineCreationCacheControl = VK_TRUE; // (render.cpp: a pipeline from the driver's cache only, or not now)
+    v13.subgroupSizeControl = vk.pin_subgroup || vk.pin_stages != 0; v13.computeFullSubgroups = vk.full_subgroups;
     VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     v12.pNext = &v13;
     v12.bufferDeviceAddress = VK_TRUE;
@@ -219,6 +296,9 @@ void CreateDevice(VulkanContext& vk) {
         vkGetPhysicalDeviceFeatures2(vk.physical, &query);
         vk.address_replay = have.bufferDeviceAddressCaptureReplay && !std::getenv("OOT_NO_ADDRESS_REPLAY");
         v12.bufferDeviceAddressCaptureReplay = vk.address_replay;
+        // (what the translated shaders declare: narrow members in uniform blocks, the Vulkan memory model)
+        v12.uniformAndStorageBuffer8BitAccess = have.uniformAndStorageBuffer8BitAccess;
+        v12.vulkanMemoryModel = have.vulkanMemoryModel; v12.vulkanMemoryModelDeviceScope = have.vulkanMemoryModelDeviceScope;
     }
     v12.hostQueryReset = VK_TRUE; // occlusion query ring reset after each batch (render.cpp)
     v12.timelineSemaphore = VK_TRUE;
@@ -236,6 +316,12 @@ void CreateDevice(VulkanContext& vk) {
     VkPhysicalDeviceVulkan11Features v11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     v11.pNext = &v12;
     v11.storageBuffer16BitAccess = VK_TRUE;
+    {
+        VkPhysicalDeviceVulkan11Features have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; query.pNext = &have;
+        vkGetPhysicalDeviceFeatures2(vk.physical, &query);
+        v11.uniformAndStorageBuffer16BitAccess = have.uniformAndStorageBuffer16BitAccess;
+    }
     v11.shaderDrawParameters = VK_TRUE;
     v11.variablePointersStorageBuffer = VK_TRUE;
     v11.variablePointers = VK_TRUE;
@@ -279,6 +365,7 @@ void CreateDevice(VulkanContext& vk) {
         }
     }
     if (vk.placed_maps) { placed.pNext = features.pNext; features.pNext = &placed; }
+    if (vk.cooperative_matrix) { coop.pNext = features.pNext; features.pNext = &coop; }
     VkDeviceCreateInfo info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     info.pNext = &features;
     info.queueCreateInfoCount = 1;
@@ -302,6 +389,76 @@ void CreateDevice(VulkanContext& vk) {
     VK_CHECK(vkCreateCommandPool(vk.device, &pool, nullptr, &vk.command_pool));
 }
 
+// One workgroup of a 32-thread compute program over a storage buffer of words (shader_compiler.h ProbeCooperativeMatrices).
+VulkanContext* probing = nullptr;
+bool RunMatrixProgram(const std::vector<uint32_t>& code, std::vector<uint32_t>& words) {
+    auto& vk = *probing; const VkDeviceSize size = words.size() * 4; bool ok = false;
+    VkBuffer buffer = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE; VkDescriptorSetLayout set_layout = VK_NULL_HANDLE; VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkShaderModule module = VK_NULL_HANDLE; VkPipeline pipeline = VK_NULL_HANDLE; VkDescriptorPool pool = VK_NULL_HANDLE; VkCommandBuffer cmd = VK_NULL_HANDLE; VkFence fence = VK_NULL_HANDLE;
+    do {
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bi.size = size; bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        if (vkCreateBuffer(vk.device, &bi, nullptr, &buffer) != VK_SUCCESS) break;
+        VkMemoryRequirements req; vkGetBufferMemoryRequirements(vk.device, buffer, &req);
+        u32 type = ~0u; const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        for (u32 i = 0; i < vk.memory_properties.memoryTypeCount && type == ~0u; ++i) if ((req.memoryTypeBits >> i & 1) && (vk.memory_properties.memoryTypes[i].propertyFlags & want) == want) type = i;
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize = req.size; ai.memoryTypeIndex = type;
+        if (type == ~0u || vkAllocateMemory(vk.device, &ai, nullptr, &memory) != VK_SUCCESS) break;
+        vkBindBufferMemory(vk.device, buffer, memory, 0);
+        u32* mapped = nullptr; if (vkMapMemory(vk.device, memory, 0, size, 0, reinterpret_cast<void**>(&mapped)) != VK_SUCCESS) break;
+        std::memcpy(mapped, words.data(), size);
+        VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; li.bindingCount = 1; li.pBindings = &binding;
+        if (vkCreateDescriptorSetLayout(vk.device, &li, nullptr, &set_layout) != VK_SUCCESS) break;
+        VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; pl.setLayoutCount = 1; pl.pSetLayouts = &set_layout;
+        if (vkCreatePipelineLayout(vk.device, &pl, nullptr, &layout) != VK_SUCCESS) break;
+        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO}; mi.codeSize = code.size() * 4; mi.pCode = code.data();
+        if (vkCreateShaderModule(vk.device, &mi, nullptr, &module) != VK_SUCCESS) break;
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO}; ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; ci.stage.module = module; ci.stage.pName = "main"; ci.layout = layout;
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo lanes{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO}; lanes.requiredSubgroupSize = 32;
+        if (vk.pin_subgroup) ci.stage.pNext = &lanes;
+        if (vkCreateComputePipelines(vk.device, VK_NULL_HANDLE, 1, &ci, nullptr, &pipeline) != VK_SUCCESS) break;
+        VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+        VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; dp.maxSets = 1; dp.poolSizeCount = 1; dp.pPoolSizes = &ps;
+        if (vkCreateDescriptorPool(vk.device, &dp, nullptr, &pool) != VK_SUCCESS) break;
+        VkDescriptorSetAllocateInfo da{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; da.descriptorPool = pool; da.descriptorSetCount = 1; da.pSetLayouts = &set_layout;
+        VkDescriptorSet set = VK_NULL_HANDLE; if (vkAllocateDescriptorSets(vk.device, &da, &set) != VK_SUCCESS) break;
+        VkDescriptorBufferInfo info{buffer, 0, size};
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; write.dstSet = set; write.descriptorCount = 1; write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; write.pBufferInfo = &info;
+        vkUpdateDescriptorSets(vk.device, 1, &write, 0, nullptr);
+        VkCommandBufferAllocateInfo ca{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO}; ca.commandPool = vk.command_pool; ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ca.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(vk.device, &ca, &cmd) != VK_SUCCESS) break;
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd, &begin);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER}; barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+        vkEndCommandBuffer(cmd);
+        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; if (vkCreateFence(vk.device, &fi, nullptr, &fence) != VK_SUCCESS) break;
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+        if (vkQueueSubmit(vk.queue, 1, &si, fence) != VK_SUCCESS || vkWaitForFences(vk.device, 1, &fence, VK_TRUE, 5'000'000'000ull) != VK_SUCCESS) break;
+        std::memcpy(words.data(), mapped, size); ok = true;
+    } while (false);
+    if (fence) vkDestroyFence(vk.device, fence, nullptr);
+    if (cmd) vkFreeCommandBuffers(vk.device, vk.command_pool, 1, &cmd);
+    if (pool) vkDestroyDescriptorPool(vk.device, pool, nullptr);
+    if (pipeline) vkDestroyPipeline(vk.device, pipeline, nullptr);
+    if (module) vkDestroyShaderModule(vk.device, module, nullptr);
+    if (layout) vkDestroyPipelineLayout(vk.device, layout, nullptr);
+    if (set_layout) vkDestroyDescriptorSetLayout(vk.device, set_layout, nullptr);
+    if (buffer) vkDestroyBuffer(vk.device, buffer, nullptr);
+    if (memory) vkFreeMemory(vk.device, memory, nullptr);
+    return ok;
+}
+void ProbeMatrices(VulkanContext& vk) {
+    if (!vk.cooperative_matrix) { RT_LOG("matrix multiplies: in software (no 16x8x16 half-float cooperative matrices)"); return; }
+    probing = &vk; std::string report;
+    const bool native = nvshader::ProbeCooperativeMatrices(RunMatrixProgram, &report);
+    RT_LOG("matrix multiplies: %s (%s)", native ? "cooperative matrices" : "in software", report.c_str());
+}
+
 } // namespace
 
 VulkanContext& Vk() {
@@ -316,11 +473,14 @@ VulkanContext& Vk() {
                                      
                                      (std::getenv("OOT_WINDOW_HIDDEN") ? SDL_WINDOW_HIDDEN : 0));
         if (!vk.window) rt::Fatal("SDL_CreateWindow: %s", SDL_GetError());
+        if (const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(vk.window)); mode && mode->h > 0) gfx::display_ratio.store((double)mode->w / mode->h);
+        if (const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(vk.window)); mode && mode->refresh_rate > 1) gfx::display_refresh.store(mode->refresh_rate);
         CreateInstance(vk);
         if (!SDL_Vulkan_CreateSurface(vk.window, vk.instance, nullptr, &vk.surface))
             rt::Fatal("SDL_Vulkan_CreateSurface: %s", SDL_GetError());
         PickDevice(vk);
         CreateDevice(vk);
+        ProbeMatrices(vk);
     });
     return vk;
 }
@@ -463,3 +623,5 @@ VkResult TracedCreateBuffer(const VkBufferCreateInfo* info, VkBuffer* buffer, co
     return r;
 }
 } // namespace nvn
+// (engine_hooks.cpp: the display's shape is known once the window exists)
+void oot_ensure_window() { nvn::Vk(); }
