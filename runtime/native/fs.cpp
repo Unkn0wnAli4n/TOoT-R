@@ -1,6 +1,9 @@
 // nn::fs natively: "rom" mounts read the game's RomFS straight out of the .nup (base RomFS with the
 // update's files overlaid), save data and temporary storage live in host directories.
 
+#include <memory>
+#include <deque>
+#include <zstd.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -32,6 +35,7 @@ constexpr u32 ResultUnsupported = 0x31C02;
 struct RomEntry {
     bool directory;
     u64 offset = 0, size = 0;
+    u64 stored = 0; u8 codec = 0; // (a file the package keeps compressed: its bytes in the package, 1 zstd)
     std::map<std::string, std::string> children; // name -> full path (directories)
 };
 
@@ -81,7 +85,7 @@ struct NupRomFs {
             std::memcpy(&dir_list[i].count, p + 12, 4);
             dir_list[i].name.assign(reinterpret_cast<const char*>(&toc[pool_off + no]), nl);
         }
-        struct File { std::string name; u64 size, offset; u8 codec; };
+        struct File { std::string name; u64 size, offset, stored; u8 codec; };
         std::vector<File> file_list(files);
         for (u64 i = 0; i < files; ++i, p += 0x50) {
             u32 no, nl;
@@ -89,6 +93,7 @@ struct NupRomFs {
             std::memcpy(&nl, p + 4, 4);
             std::memcpy(&file_list[i].size, p + 8, 8);
             std::memcpy(&file_list[i].offset, p + 16, 8);
+            std::memcpy(&file_list[i].stored, p + 24, 8);
             file_list[i].codec = p[0x40];
             file_list[i].name.assign(reinterpret_cast<const char*>(&toc[pool_off + no]), nl);
         }
@@ -107,22 +112,49 @@ struct NupRomFs {
                     self(self, child, sub);
                 } else {
                     const File& f = file_list[child - dirs];
-                    if (f.codec != 0) ++compressed;
+                    if (f.codec == 1) ++compressed;
+                    else if (f.codec != 0) Fatal("the game package keeps %s in a way this version does not read (codec %u)", f.name.c_str(), f.codec);
                     const std::string sub = Join(path, f.name);
                     entries[path].children[f.name] = sub;
-                    entries[sub] = RomEntry{false, f.offset, f.size};
+                    entries[sub] = RomEntry{false, f.offset, f.size, f.stored, f.codec};
                 }
             }
         };
         for (const auto& k : pkgs)
             if (k.romfs != 0xffffffffu && (k.kind == 0 || k.kind == 1)) add_dir(add_dir, k.romfs, "/");
-        if (compressed) Fatal("%zu compressed RomFS files are not supported yet", compressed);
+        // (packages made with compression keep each file as one zstd frame: such a file is unpacked whole when it is
+        // opened, Contents below. An uncompressed package is read in place and loads faster.)
+        if (compressed) RT_LOG("RomFS: %zu of the package's files are compressed (zstd): each is unpacked when the game opens it", compressed);
         RT_LOG("RomFS: %zu entries from %s", entries.size(), path.c_str());
     }
 
     const RomEntry* Find(const std::string& path) const {
         auto it = entries.find(path.empty() ? "/" : path);
         return it == entries.end() ? nullptr : &it->second;
+    }
+
+    // A compressed file's contents, unpacked. Shared by everything that has the file open; the last ones used stay in
+    // memory (256 MiB of them) for the game's habit of opening the same file again and again.
+    std::mutex unpack_mutex;
+    std::unordered_map<u64, std::weak_ptr<const std::vector<u8>>> unpacked; // by the file's place in the package
+    std::deque<std::shared_ptr<const std::vector<u8>>> kept; u64 kept_bytes = 0;
+    std::shared_ptr<const std::vector<u8>> Contents(const RomEntry& e) {
+        std::lock_guard lock{unpack_mutex};
+        if (auto have = unpacked[e.offset].lock()) return have;
+        std::vector<u8> packed(e.stored);
+        for (u64 done = 0; done < e.stored;) {
+            const ssize_t n = pread(fd, packed.data() + done, e.stored - done, (off_t)(e.offset + done));
+            if (n <= 0) Fatal("the game package ends inside a file (at %llu)", (unsigned long long)e.offset);
+            done += (u64)n;
+        }
+        auto out = std::make_shared<std::vector<u8>>(e.size);
+        const size_t r = e.size ? ZSTD_decompress(out->data(), out->size(), packed.data(), packed.size()) : 0;
+        if (ZSTD_isError(r) || r != e.size) Fatal("a compressed file of the game package cannot be unpacked (at %llu: %s)", (unsigned long long)e.offset, ZSTD_isError(r) ? ZSTD_getErrorName(r) : "wrong size");
+        unpacked[e.offset] = out;
+        kept.push_back(out); kept_bytes += e.size;
+        while (kept_bytes > (256ull << 20) && kept.size() > 1) { kept_bytes -= kept.front()->size(); kept.pop_front(); }
+        if (unpacked.size() > 4096) std::erase_if(unpacked, [](const auto& kv) { return kv.second.expired(); });
+        return out;
     }
 };
 
@@ -176,6 +208,7 @@ bool Split(const char* full, Mount& mount, std::string& path) {
 struct OpenFile {
     bool rom;
     u64 rom_offset = 0, rom_size = 0;
+    std::shared_ptr<const std::vector<u8>> rom_data; // (a compressed file: unpacked)
     int host_fd = -1;
     int mode = 0;
 };
@@ -247,6 +280,7 @@ NATIVE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci") {
         }
         f.rom_offset = e->offset;
         f.rom_size = e->size;
+        if (e->codec == 1) f.rom_data = Rom().Contents(*e);
     } else {
         const int flags = (mode & 2) ? O_RDWR : O_RDONLY;
         f.host_fd = ::open(HostPath(m, path).string().c_str(), flags | O_CLOEXEC);
@@ -291,7 +325,8 @@ static u32 DoRead(u64 h, s64 offset, void* buffer, u64 size, u64* read) {
     if (f->rom) {
         if ((u64)offset > f->rom_size) return 0x7802; // OutOfRange-like
         size = std::min<u64>(size, f->rom_size - offset);
-        n = GuestPread(Rom().fd, buffer, size, f->rom_offset + offset);
+        if (f->rom_data) { nvn::PrepareHostWrite(reinterpret_cast<u64>(buffer), size); std::memcpy(buffer, f->rom_data->data() + offset, size); n = (ssize_t)size; }
+        else n = GuestPread(Rom().fd, buffer, size, f->rom_offset + offset);
     } else {
         n = GuestPread(f->host_fd, buffer, size, offset);
     }
@@ -464,6 +499,7 @@ NATIVE("_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE") {
 bool ReadRomFile(const std::string& path, std::vector<unsigned char>& out) {
     const RomEntry* e = Rom().Find(path);
     if (!e || e->directory) return false;
+    if (e->codec == 1) { const auto data = Rom().Contents(*e); out.assign(data->begin(), data->end()); return true; }
     out.resize(e->size);
     return pread(Rom().fd, out.data(), e->size, (off_t)e->offset) == (ssize_t)e->size;
 }

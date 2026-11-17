@@ -91,6 +91,13 @@ namespace rt {
 const std::string& DataDir() {
     static const std::string dir = [] {
         if (const char* env = std::getenv("OOT_RECOMP_DATA"); env && *env) return std::string(env);
+        // (started by hand from an installation's own folder, <installation>\app\tootr.exe: that installation's data)
+        char exe[MAX_PATH]; const DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+        if (n && n < MAX_PATH) {
+            std::string up(exe, n);
+            for (int i = 0; i < 2; ++i) if (const size_t cut = up.find_last_of("\\/"); cut != std::string::npos) up.resize(cut);
+            if (GetFileAttributesA((up + "\\main.img").c_str()) != INVALID_FILE_ATTRIBUTES) return up;
+        }
         const char* base = std::getenv("LOCALAPPDATA");
         if (!base) base = std::getenv("USERPROFILE");
         std::string d = std::string(base ? base : ".") + "\\tootr";
@@ -108,11 +115,20 @@ void SetThreadName(const char* name) {
 
 #else // POSIX
 #include <pthread.h>
+#include <unistd.h>
 
 namespace rt {
 const std::string& DataDir() {
     static const std::string dir = [] {
         if (const char* env = std::getenv("OOT_RECOMP_DATA"); env && *env) return std::string(env);
+        // (started by hand from an installation's own folder, <installation>/app/tootr: that installation's data. The
+        // installer's "tootr" command and menu entry name the folder themselves)
+        char exe[4096]; const ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+        if (n > 0) {
+            std::string up(exe, (size_t)n);
+            for (int i = 0; i < 2; ++i) if (const size_t cut = up.rfind('/'); cut != std::string::npos) up.resize(cut);
+            if (!up.empty() && access((up + "/main.img").c_str(), R_OK) == 0) return up;
+        }
         if (const char* xdg = std::getenv("XDG_DATA_HOME"); xdg && *xdg) return std::string(xdg) + "/tootr";
         const char* home = std::getenv("HOME");
         return std::string(home ? home : ".") + "/.local/share/tootr";

@@ -158,7 +158,7 @@ void LoadModules(const std::string& data_dir) {
     for (const auto& spec : specs) {
         const std::string path = data_dir + "/" + spec.name + ".img";
         std::ifstream f(path, std::ios::binary);
-        if (!f) Fatal("missing %s (see extraction tools and build instructions in STATUS.md)", path.c_str());
+        if (!f) Fatal("%s is missing: the game has not been set up in this folder. Start it with the \"tootr\" command or the TOoT:R menu entry the installer made (it finds the folder the game was installed into), or run the installer again. To start this file directly, set OOT_RECOMP_DATA to the installation's folder.", path.c_str());
         std::vector<char> data((std::istreambuf_iterator<char>(f)), {});
         Module m;
         m.name = spec.name;
