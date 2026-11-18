@@ -563,6 +563,21 @@ void Window(bool appeared) {
         ImGui::EndTabBar();
     }
     ImGui::Separator();
+    {   // Quit and restart, asked once more (what was not saved is lost).
+        static int leaving = 0;
+        if (ImGui::Button("Restart Game")) { leaving = 2; ImGui::OpenPopup("Leave the game"); }
+        ImGui::SameLine();
+        if (ImGui::Button("Quit Game")) { leaving = 1; ImGui::OpenPopup("Leave the game"); }
+        if (ImGui::BeginPopupModal("Leave the game", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextUnformatted(leaving == 2 ? "Restart the game now?" : "Quit the game now?");
+            ImGui::TextDisabled("Anything since the last save is lost.");
+            if (ImGui::Button(leaving == 2 ? "Restart" : "Quit")) { leave_request.store(leaving); ImGui::CloseCurrentPopup(); }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+            ImGui::SetItemDefaultFocus();
+            ImGui::EndPopup();
+        }
+    }
     ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x);
     if (restart_notice) ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "Restart the game to apply this setting.");
     ImGui::TextDisabled("%s", help ? help : "F1 or Insert, or Select and Start together on a controller: show or hide this window. LB and RB change tabs.");

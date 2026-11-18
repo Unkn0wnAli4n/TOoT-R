@@ -4,11 +4,14 @@
 
 #include "vk.h"
 
+#include <atomic>
 namespace nvn::overlay {
 
 // The window's SDL events (the thread that polls them): Insert toggles the window; while it is
 // shown, mouse and keyboard events go to it.
 void Event(const SDL_Event& event);
+// The settings window's Quit Game (1) and Restart Game (2), taken by the presenter (present.cpp).
+inline std::atomic<int> leave_request{0};
 void Toggle();    // shows or hides the window (any thread)
 bool Shown();
 

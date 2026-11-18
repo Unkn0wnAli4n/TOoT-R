@@ -7,6 +7,8 @@
 #include <cstring>
 #include <filesystem>
 #include <thread>
+#include <string>
+#include <vector>
 
 #include <fcntl.h>
 #ifdef _WIN32
@@ -84,6 +86,25 @@ void OpenLogFile() {
             else { std::clearerr(in); std::this_thread::sleep_for(std::chrono::milliseconds(40)); }
         }
     }).detach();
+}
+
+// The settings window's Restart Game: the same program with the same arguments and environment.
+void RestartProcess() {
+    std::fflush(stdout); std::fflush(stderr);
+#ifdef _WIN32
+    std::wstring line = GetCommandLineW();
+    STARTUPINFOW si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
+    if (CreateProcessW(nullptr, line.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
+    std::_Exit(0);
+#else
+    // (the new game takes the console this one was started from, not this one's log file)
+    if (console_fd >= 0) { dup2(console_fd, 2); dup2(console_fd, 1); }
+    std::vector<std::string> words; { std::string all; if (FILE* f = std::fopen("/proc/self/cmdline", "rb")) { char b[4096]; size_t n; while ((n = std::fread(b, 1, sizeof b, f)) > 0) all.append(b, n); std::fclose(f); }
+        for (size_t at = 0; at < all.size();) { words.emplace_back(all.c_str() + at); at += words.back().size() + 1; } }
+    std::vector<char*> argv; for (auto& w : words) argv.push_back(w.data()); argv.push_back(nullptr);
+    if (!words.empty()) execv("/proc/self/exe", argv.data());
+    std::_Exit(0);
+#endif
 }
 
 void ShowFatal(const char* message) {

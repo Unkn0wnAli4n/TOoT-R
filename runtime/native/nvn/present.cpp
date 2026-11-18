@@ -35,6 +35,7 @@ extern "C" volatile unsigned long long oot_dynres_context;
 #include "output.h"
 #include "latency.h"
 #include "longshot_upscale.h"
+#include "../../logfile.h"
 #include "pipeline_list.h"
 
 std::atomic<int> profile_present_tid{0}; // (profiler.cpp: OOT_PROFILE_WALL=present)
@@ -422,6 +423,20 @@ void PresentPacing() {
             if (g.display_mode == 0 && g.resolution > 0) SDL_SetWindowSize(Vk().window, (int)std::lround(sizes[g.resolution][0] / density), (int)std::lround(sizes[g.resolution][1] / density));
         }
     }
+    // (the settings window's Quit Game and Restart Game; OOT_TEST_LEAVE=<1|2>: asked for after 600 frames, for tests)
+    {static const int test_leave = std::getenv("OOT_TEST_LEAVE") ? std::atoi(std::getenv("OOT_TEST_LEAVE")) : 0; static int frames = 0;
+     if (test_leave && ++frames == 600 && !std::getenv("OOT_LEFT_ONCE")) { 
+#ifdef _WIN32
+        _putenv_s("OOT_LEFT_ONCE", "1");
+#else
+        setenv("OOT_LEFT_ONCE", "1", 1);
+#endif
+        nvn::overlay::leave_request.store(test_leave); }
+     if (const int leave = nvn::overlay::leave_request.exchange(0)) {
+        RT_LOG("%s from the settings window", leave == 2 ? "restart" : "quit");
+        SavePipelineCacheBlocking(); plist::Save(true);
+        if (leave == 2) rt::RestartProcess();
+        std::_Exit(0); } }
     SDL_Event e;
     while (NextWindowEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT) { SavePipelineCacheBlocking(); plist::Save(true); std::_Exit(0); }

@@ -7,5 +7,6 @@
 namespace rt {
 void OpenLogFile();                    // first thing in main: stderr and stdout go to the file (and on to the console)
 const std::string& LogFilePath();      // "" when no file is kept (OOT_NO_LOG_FILE=1, or the folder cannot be written)
+void RestartProcess();                 // starts the game again with the arguments it had, and ends this one (does not return)
 void ShowFatal(const char* message);   // a message box with the error and the log's place; nothing with OOT_NO_DIALOG=1
 } // namespace rt
