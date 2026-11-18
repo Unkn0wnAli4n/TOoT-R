@@ -70,6 +70,9 @@ typedef struct {
     int eos;                         /* the last submission is in and decoded: an empty queue is the end */
     Pending *phead, *ptail;          /* submissions not decoded yet, oldest first */
     int64_t submits, acquires;
+    /* (tootr) pictures decoded ahead of the game's asking, on a thread of the decoder's own: see ahead_main */
+    pthread_t ahead; int ahead_on, ahead_stop, decoding; pthread_cond_t idle;
+    Picture held[8]; int held_n;     /* (-1: frames go straight into the queue; else ahead_main collects them here) */
     int npending;                    /* submissions not decoded yet (the list's length): the input limit's count */
     int64_t refused;                 /* submissions refused while the decoder was full */
     uint64_t ready;                  /* its submission-ready event (0: not asked for); ready_clear: clear now, the decoder full */
@@ -211,6 +214,15 @@ HLE(_ZN2nn5codec26ReadDecoderOutputImageNv12EPKNS0_25VideoDecoderImagePoolTypeEj
 }
 
 /* ---- decoders ---- */
+/* (tootr) Decoding ahead. The pictures were decoded when the game asked for one, on the game's thread: a step that
+   took long - 60 to 110 ms now and then on a six-core laptop, where the average was 5 - put the movie behind its
+   clock and pictures were skipped to catch up, 8 to 50 in every 100: a 60 fps movie that looked like 30 and
+   stuttered. A thread of the decoder's own keeps a few pictures decoded ahead instead; the game takes the oldest
+   and never waits for the decoder. The decoder itself is used outside the lock (`decoding` says so: a flush waits
+   for the step to end), the queue only under it. libavcodec's decoders only; HOS_VIDEO_AHEAD=0: as before. */
+#define AHEAD_PICTURES 5
+static void ahead_start(Dec *d);
+static void ahead_end(Dec *d);
 static void dec_init_sized(Ctx *c, enum AVCodecID id, const char *what, int w, int h);
 static void dec_init(Ctx *c, enum AVCodecID id, const char *what) { dec_init_sized(c, id, what, 0, 0); }
 static void dec_init_sized(Ctx *c, enum AVCodecID id, const char *what, int w, int h) {
@@ -223,6 +235,8 @@ static void dec_init_sized(Ctx *c, enum AVCodecID id, const char *what, int w, i
     if (!codec) codec = avcodec_find_decoder(id);
     Dec *d = (Dec *)calloc(1, sizeof *d);
     pthread_mutex_init(&d->lock, nullptr);
+    pthread_cond_init(&d->idle, nullptr);
+    d->held_n = -1;
     if (codec) {
         d->ctx = avcodec_alloc_context3(codec);
         d->ctx->thread_count = id == AV_CODEC_ID_AV1 ? 4 : 2;   /* (1080p AV1 in software) */
@@ -231,6 +245,7 @@ static void dec_init_sized(Ctx *c, enum AVCodecID id, const char *what, int w, i
     if (!d->ctx && id == AV_CODEC_ID_AV1) d->mf = mf_av1_open(w, h);
     d->pkt = av_packet_alloc();
     d->frame = av_frame_alloc();
+    ahead_start(d);
     set_host(ARG(0), DEC_MAGIC, d);
     static int logged;
     if (logged++ < 4)
@@ -256,6 +271,7 @@ static void ready_event_give_back(uint64_t event);
 static void dec_finalize(Ctx *c) {
     Dec *d = (Dec *)host_of(ARG(0), DEC_MAGIC);
     if (!d) return;
+    ahead_end(d);
     ready_event_give_back(d->ready);
     pending_free(d);
     for (int i = 0; i < d->qn; i++) picture_free(&d->queue[(d->qhead + i) % MAX_QUEUE]);
@@ -266,6 +282,14 @@ static void dec_finalize(Ctx *c) {
     av_frame_free(&d->frame);
     free(d);
     set_host(ARG(0), DEC_MAGIC, NULL);
+}
+static void queue_push(Dec *d, Picture p) {
+    if (d->qn == MAX_QUEUE) {
+        picture_free(&d->queue[d->qhead]);
+        d->qhead = (d->qhead + 1) % MAX_QUEUE, d->qn--;
+    }
+    d->queue[(d->qhead + d->qn) % MAX_QUEUE] = p;
+    d->qn++;
 }
 /* a decoded frame into the queue, as RGBA and NV12 (the oldest dropped when the reader falls behind) */
 static void queue_frame(Dec *d, const AVFrame *f) {
@@ -296,12 +320,8 @@ static void queue_frame(Dec *d, const AVFrame *f) {
                 uv[(size_t)y * w + 2 * x + 1] = f->data[2][(size_t)y * f->linesize[2] + x];
             }
     }
-    if (d->qn == MAX_QUEUE) {
-        picture_free(&d->queue[d->qhead]);
-        d->qhead = (d->qhead + 1) % MAX_QUEUE, d->qn--;
-    }
-    d->queue[(d->qhead + d->qn) % MAX_QUEUE] = p;
-    d->qn++;
+    if (d->held_n >= 0) { if (d->held_n < 8) d->held[d->held_n++] = p; else picture_free(&p); return; }   /* (tootr: ahead_main's, pushed under the lock) */
+    queue_push(d, p);
 }
 static void mf_picture(void *user, const uint8_t *y, const uint8_t *uv, int w, int h, int stride, int64_t pts) {
     AVFrame f;
@@ -337,6 +357,7 @@ static void video_stats(void) {
     vstat_asked = vstat_repeated = vstat_skipped = vstat_decode_ns = vstat_decodes = vstat_worst_ns = 0;
 }
 static void decode_pending(Dec *d) {
+    if (d->ahead_on) return;   /* (tootr: ahead_main decodes) */
     while (!d->qn && d->phead) decode_timed(d);
 }
 /* one submission decoded (its pictures into the queue, if any) */
@@ -374,6 +395,72 @@ static void decode_next(Dec *d) {
         }
         free(n);
     }
+}
+static void *ahead_main(void *arg) {
+    Dec *d = (Dec *)arg;
+    pthread_mutex_lock(&d->lock);
+    while (!d->ahead_stop) {
+        if (!d->phead || d->qn >= AHEAD_PICTURES) {
+            pthread_mutex_unlock(&d->lock);
+            hos_sleep_ns(1000000);
+            pthread_mutex_lock(&d->lock);
+            continue;
+        }
+        Pending *n = d->phead;   /* (the oldest submission: taken out under the lock, decoded outside it) */
+        d->phead = n->next;
+        if (!d->phead) d->ptail = NULL;
+        if (d->npending > 0) d->npending--;
+        if (n->pkt) d->eos = 0;
+        d->decoding = 1;
+        d->held_n = 0;
+        pthread_mutex_unlock(&d->lock);
+        movie_decoding();
+        const int64_t t0 = hos_now_ns();
+        const int end = !n->pkt;
+        if (n->pkt) {
+            if (avcodec_send_packet(d->ctx, n->pkt) == AVERROR(EAGAIN)) {   /* (full: its pictures out first) */
+                drain(d);
+                avcodec_send_packet(d->ctx, n->pkt);
+            }
+            drain(d);
+            av_packet_free(&n->pkt);
+        } else {   /* (the end: the rest out) */
+            avcodec_send_packet(d->ctx, NULL);
+            drain(d);
+            avcodec_flush_buffers(d->ctx);   /* (a stream after it starts again) */
+        }
+        free(n);
+        const int64_t spent = hos_now_ns() - t0;
+        pthread_mutex_lock(&d->lock);
+        for (int i = 0; i < d->held_n; i++) queue_push(d, d->held[i]);
+        d->held_n = -1;
+        if (end) {
+            d->eos = 1;
+            if (d->qn) d->queue[(d->qhead + d->qn - 1) % MAX_QUEUE].last = 1;
+        }
+        vstat_decode_ns += spent; vstat_decodes++;
+        if (spent > vstat_worst_ns) vstat_worst_ns = spent;
+        d->decoding = 0;
+        pthread_cond_broadcast(&d->idle);
+        input_room(d);
+    }
+    pthread_mutex_unlock(&d->lock);
+    return NULL;
+}
+static void ahead_start(Dec *d) {
+    static int off = -1;
+    if (off < 0) { const char *e = getenv("HOS_VIDEO_AHEAD"); off = e && e[0] == '0'; }
+    if (off || !d->ctx) return;
+    d->ahead_stop = 0;
+    if (pthread_create(&d->ahead, NULL, ahead_main, d) == 0) d->ahead_on = 1;
+}
+static void ahead_end(Dec *d) {
+    if (!d->ahead_on) return;
+    pthread_mutex_lock(&d->lock);
+    d->ahead_stop = 1;
+    pthread_mutex_unlock(&d->lock);
+    pthread_join(d->ahead, NULL);
+    d->ahead_on = 0;
 }
 static void pending_push(Dec *d, AVPacket *pkt) {
     Pending *n = (Pending *)calloc(1, sizeof *n);
@@ -423,6 +510,7 @@ static void dec_flush(Ctx *c) {
     Dec *d = (Dec *)host_of(ARG(0), DEC_MAGIC);
     if (d && (d->ctx || d->mf)) {
         pthread_mutex_lock(&d->lock);
+        while (d->decoding) pthread_cond_wait(&d->idle, &d->lock);   /* (tootr: a step of ahead_main's ends first) */
         if (d->ctx) avcodec_flush_buffers(d->ctx);
         else mf_av1_flush(d->mf);
         pending_free(d);
@@ -482,7 +570,7 @@ static void dec_acquire(Ctx *c) {
     d->acquires++;
     video_stats();
     if (!d->qn) {
-        if (!d->eos) vstat_repeated++;   /* (nothing decoded: the buffer's last picture again; after the last submission, as the last) */
+        if (!d->eos && (d->phead || d->decoding)) vstat_repeated++;   /* (a movie is running and its next picture is late) */   /* (nothing decoded: the buffer's last picture again; after the last submission, as the last) */
         d->busy[slot] = 1;
         if (d->eos) d->slot_last[slot] = 1;
         if (video_log()) hos_log("video: acquire %lld: nothing decoded%s, buffer %d again", (long long)d->acquires,
@@ -507,7 +595,7 @@ static void dec_acquire(Ctx *c) {
             const int64_t due = d->clock_pts + (now - d->clock_ns);
             if (d->queue[d->qhead].pts + late >= due) break;
             if (d->qn < 2) {
-                if (!d->phead) break;
+                if (!d->phead || d->ahead_on) break;   /* (tootr: with ahead_main the next ones come by themselves) */
                 decode_timed(d);
                 continue;
             }

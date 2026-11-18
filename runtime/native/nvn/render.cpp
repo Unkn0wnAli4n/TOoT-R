@@ -3022,6 +3022,10 @@ void Draw(const Command& command) {
         std::string k;for(u32 i=0;i<16;++i){const u32 a=(*tls_state).attributes[i];char b[40];std::snprintf(b,sizeof b," a%u:%08x",i,a);if(a)k+=b;}
         k+=" ubo";for(u32 u=0;u<8;++u){char b[32];std::snprintf(b,sizeof b," %u:%llx",u,(unsigned long long)(*tls_state).stages[0].uniforms[u].size);k+=b;}
         char b[32];std::snprintf(b,sizeof b," stride %u",(*tls_state).streams[0][0]);k+=b;
+        // (where it draws: the colour targets' formats and size, the depth state - a pass with this and the last frame's
+        // bones that writes a two-channel target would be the game's own motion vectors)
+        k+=" ->";for(u32 i=0;i<(*tls_state).color_count;++i)if(colors[i]){char t[48];std::snprintf(t,sizeof t," c%u:f%u %ux%u",i,colors[i]->format,colors[i]->width,colors[i]->height);k+=t;}
+        {char t[64];std::snprintf(t,sizeof t," depth %s state %#x",depth?"yes":"no",(u32)(*tls_state).depth&0xff);k+=t;}
         if(seen.insert(k).second)RT_LOG("draw layout:%s",k.c_str());}
      ls_scan_done:;}
     pk.ls_skinned=!mesh&&LsSkinned(command,pk.ls_skin,(*tls_state).stages[0].shader?(*tls_state).stages[0].shader->address:0);
