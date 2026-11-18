@@ -25,6 +25,8 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+
+#include "logfile.h"
 #include <unordered_map>
 
 #ifndef _WIN32
@@ -1005,14 +1007,26 @@ u32 SvcGetInfo(Cpu* c) {
     return ResultSuccess;
 }
 
-u32 SvcSetHeapSize(Cpu* c) {
-    const u64 size = c->x[1];
-    std::lock_guard lock{k_lock};
-    if (size > HeapReserve || (size & 0xfff)) return ResultInvalidSize;
-    for (const auto& [address, m] : stack_mappings)
-        if (m.source < HeapBase + HeapReserve && m.source + m.size > HeapBase + size)
-            return ResultInvalidCurrentMemory;
-    if (!heap_reserved) {
+// A fixed place of the game's could not be reserved: something of the system's or a driver's sits there already.
+// Windows lays a process out differently at every start, so starting again usually finds the place free - twice at
+// most, then the error is shown. (Seen "from time to time" on a reporter's PC: the heap's and the alias region's.)
+[[noreturn]] void ReserveFailed(const char* what) {
+#ifdef _WIN32
+    const char* tried = std::getenv("OOT_RESERVE_RETRIES"); const int n = tried ? std::atoi(tried) : 0;
+    if (n < 2) {
+        RT_LOG("%s: its place in memory is taken; starting again (attempt %d)", what, n + 2);
+        _putenv_s("OOT_RESERVE_RETRIES", n ? "2" : "1");
+        rt::RestartProcess();
+    }
+#endif
+    Fatal("%s", what);
+}
+// The heap's 16 GiB of addresses, reserved at start-up with the other regions (InitializeKernel): reserved only when
+// the game first asked for its heap, after the graphics driver had loaded and thousands of pipelines were being
+// made, the driver's own memory could already lie there.
+void ReserveHeap() {
+    if (heap_reserved) return;
+    {
 #if OOT_ANONYMOUS_MEMORY
         void* p = mmap(reinterpret_cast<void*>(HeapBase), HeapReserve, PROT_NONE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0);
@@ -1022,7 +1036,7 @@ u32 SvcSetHeapSize(Cpu* c) {
         void* p = mmap(reinterpret_cast<void*>(HeapBase), HeapReserve, PROT_NONE,
                        MAP_SHARED | MAP_FIXED_NOREPLACE | MAP_NORESERVE, heap_fd, 0);
 #endif
-        if (p != reinterpret_cast<void*>(HeapBase)) Fatal("cannot reserve heap");
+        if (p != reinterpret_cast<void*>(HeapBase)) ReserveFailed("cannot reserve heap");
 #ifdef __linux__
         // (no transparent huge pages: the renderer imports guest pages into the GPU (userptr on amdgpu), and a huge
         // page split or merged invalidates the imports, pinned again at the next submission; from Hookshot, issue 312)
@@ -1030,6 +1044,16 @@ u32 SvcSetHeapSize(Cpu* c) {
 #endif
         heap_reserved = true;
     }
+}
+
+u32 SvcSetHeapSize(Cpu* c) {
+    const u64 size = c->x[1];
+    std::lock_guard lock{k_lock};
+    if (size > HeapReserve || (size & 0xfff)) return ResultInvalidSize;
+    for (const auto& [address, m] : stack_mappings)
+        if (m.source < HeapBase + HeapReserve && m.source + m.size > HeapBase + size)
+            return ResultInvalidCurrentMemory;
+    ReserveHeap();
     // (Windows: the heap's new part stays reserved and becomes usable where the game first touches it - the game asks
     // for 9.4 GiB at once and all of it counted against the system's memory from then on, on a 16 GiB PC too.
     // OOT_HEAP_COMMIT=1: all at once, as before.)
@@ -1131,13 +1155,14 @@ void InitializeKernel() {
     void* p = mmap(reinterpret_cast<void*>(AliasBase), AliasSize, PROT_NONE,
                    MAP_SHARED | MAP_FIXED_NOREPLACE | MAP_NORESERVE, physical_fd, 0);
 #endif
-    if (p != reinterpret_cast<void*>(AliasBase)) Fatal("cannot reserve the alias region");
+    if (p != reinterpret_cast<void*>(AliasBase)) ReserveFailed("cannot reserve the alias region");
 #ifdef __linux__
     if (!std::getenv("OOT_THP")) madvise(reinterpret_cast<void*>(AliasBase), AliasSize, MADV_NOHUGEPAGE); // (as the heap's)
 #endif
     p = mmap(reinterpret_cast<void*>(StackBase), StackSize, PROT_NONE,
              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0);
-    if (p != reinterpret_cast<void*>(StackBase)) Fatal("cannot reserve the stack region");
+    if (p != reinterpret_cast<void*>(StackBase)) ReserveFailed("cannot reserve the stack region");
+    ReserveHeap();
 }
 
 KThread* CreateMainThread(u64 stack_top) {
