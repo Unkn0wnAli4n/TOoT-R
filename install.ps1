@@ -88,13 +88,21 @@ if ($Nup -and -not (Test-Path -LiteralPath $Nup -PathType Leaf)) { Say "no such 
 if (-not $Nup) { $Nup = Pick-Game }
 if (-not $Nup) { Say "no game file selected"; exit 1 }
 if (-not (Test-Path -LiteralPath $Nup -PathType Leaf)) { Say "no such file: $Nup"; exit 1 }
+# (an installation is a folder with the game's images or the built game in it)
+function Is-Install($path) { $path -and ((Test-Path -LiteralPath (Join-Path $path "main.img")) -or (Test-Path -LiteralPath (Join-Path $path "app\tootr.exe"))) }
+$default = Join-Path $env:LOCALAPPDATA "tootr"
+# (installing again, to add DLSS or repair: the default installation is used as it is, without asking - picking it in the
+# folder window made a TOoT-R folder inside it, and the whole game was built again there)
+if (-not $Dir -and (Is-Install $default)) { $Dir = $default; Say "an installation is already in $Dir: it is updated there" }
 if (-not $Dir) {
-    $default = Join-Path $env:LOCALAPPDATA "tootr"
     Add-Type -AssemblyName System.Windows.Forms
     $folder = New-Object System.Windows.Forms.FolderBrowserDialog
     $folder.Description = "Choose where to install TOoT:R (a TOoT-R folder is made there). Cancel: $default"
     $folder.ShowNewFolderButton = $true
-    if ($folder.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK -and $folder.SelectedPath) { $Dir = Join-Path $folder.SelectedPath "TOoT-R" }
+    if ($folder.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK -and $folder.SelectedPath) {
+        # (an existing installation chosen: that one; a folder holding one in TOoT-R: that one; else a new TOoT-R folder in it)
+        if (Is-Install $folder.SelectedPath) { $Dir = $folder.SelectedPath } else { $Dir = Join-Path $folder.SelectedPath "TOoT-R" }
+    }
     else { $Dir = $default }
 }
 $Dir = [System.IO.Path]::GetFullPath($Dir)
