@@ -216,6 +216,7 @@ NATIVE("nnsocketSend") {
 NATIVE("nnsocketRecv") {
     const SOCKET s = Sock(c);
     rt::CoreRelease release;
+    rt::EnsureCommitted(Ptr<char>(c, 1), (size_t)c->x[2]);
     Ret(c, (u64)Wsa(recv(s, Ptr<char>(c, 1), (int)c->x[2], HostMsgFlags((int)c->x[3]))));
 }
 // msghdr: name, namelen (u32), iov {void*, size_t}*, iovlen (u32), ... Sent/received as one buffer.

@@ -5,6 +5,8 @@
 #ifdef _WIN32
 #include <windows.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <string>
@@ -70,6 +72,53 @@ int madvise(void* addr, size_t len, int advice) {
     return ok ? 0 : (errno = EINVAL, -1);
 }
 
+namespace rt {
+namespace {
+std::atomic<std::uint64_t> lazy_base{0}, lazy_end{0};
+constexpr std::uint64_t LazyChunk = 64u << 10; // (a megabyte at a time held 16 GiB committed for 6 GiB in use: the heap is touched sparsely)
+// Commits the reserved pages of [from, to) (pages already committed keep their protection: only reserved runs are touched).
+bool CommitReserved(std::uint64_t from, std::uint64_t to) {
+    auto* p = reinterpret_cast<std::uint8_t*>(from); auto* const end = reinterpret_cast<std::uint8_t*>(to);
+    while (p < end) {
+        MEMORY_BASIC_INFORMATION info;
+        if (!VirtualQuery(p, &info, sizeof info)) return false;
+        auto* const region_end = static_cast<std::uint8_t*>(info.BaseAddress) + info.RegionSize;
+        auto* const run_end = region_end < end ? region_end : end;
+        if (info.State == MEM_RESERVE && !VirtualAlloc(p, (size_t)(run_end - p), MEM_COMMIT, PAGE_READWRITE)) return false;
+        if (info.State == MEM_FREE) return false;
+        p = run_end;
+    }
+    return true;
+}
+LONG CALLBACK LazyHandler(EXCEPTION_POINTERS* e) {
+    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || e->ExceptionRecord->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    return CommitOnFault(reinterpret_cast<void*>(e->ExceptionRecord->ExceptionInformation[1]), e->ExceptionRecord->ExceptionInformation[0] == 1) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+}
+} // namespace
+void LazyCommitRange(void* base, size_t size) {
+    static bool installed = false;
+    if (!installed) { installed = true; AddVectoredExceptionHandler(1, LazyHandler); }
+    lazy_end.store(0); lazy_base.store(reinterpret_cast<std::uint64_t>(base)); lazy_end.store(reinterpret_cast<std::uint64_t>(base) + size);
+}
+bool CommitOnFault(void* address, bool write) {
+    const std::uint64_t a = reinterpret_cast<std::uint64_t>(address), base = lazy_base.load(), end = lazy_end.load();
+    if (a < base || a >= end) return false;
+    MEMORY_BASIC_INFORMATION info;
+    if (!VirtualQuery(address, &info, sizeof info)) return false;
+    // (committed by now: another thread touched the same megabyte between this thread's fault and here. The access
+    // goes again where the page allows it; a write to a read-only page is a fault of another kind, the page tracker's.)
+    if (info.State == MEM_COMMIT) return info.Protect == PAGE_READWRITE || (!write && info.Protect == PAGE_READONLY);
+    if (info.State != MEM_RESERVE) return false;
+    const std::uint64_t from = std::max(base, a & ~(LazyChunk - 1)), to = std::min(end, (a & ~(LazyChunk - 1)) + LazyChunk);
+    return CommitReserved(from, to);
+}
+void EnsureCommitted(const void* address, size_t size) {
+    const std::uint64_t a = reinterpret_cast<std::uint64_t>(address), base = lazy_base.load(), end = lazy_end.load();
+    if (!size || a + size <= base || a >= end) return;
+    CommitReserved(std::max(base, a & ~0xfffull), std::min(end, (a + size + 0xfff) & ~0xfffull));
+}
+} // namespace rt
+
 static ssize_t PositionalIo(int fd, void* buffer, size_t size, long long offset, bool write) {
     const HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
     if (h == INVALID_HANDLE_VALUE) { errno = EBADF; return -1; }
@@ -78,6 +127,7 @@ static ssize_t PositionalIo(int fd, void* buffer, size_t size, long long offset,
     o.OffsetHigh = (DWORD)((unsigned long long)offset >> 32);
     DWORD done = 0;
     const DWORD n = size > 0x7fffffff ? 0x7fffffff : (DWORD)size;
+    rt::EnsureCommitted(buffer, n); // (the system fails the call on a page not yet committed: see LazyCommitRange)
     const BOOL ok = write ? WriteFile(h, buffer, n, &done, &o) : ReadFile(h, buffer, n, &done, &o);
     if (!ok && GetLastError() != ERROR_HANDLE_EOF) { errno = EIO; return -1; }
     return (ssize_t)done;

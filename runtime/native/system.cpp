@@ -164,6 +164,7 @@ u64 FontAddress(u64* size) {
             length = (u64)std::ftell(f);
             std::fseek(f, 0, SEEK_SET);
             address = ArenaAlloc(length, 0x1000);
+            rt::EnsureCommitted(reinterpret_cast<void*>(address), length);
             std::fread(reinterpret_cast<void*>(address), 1, length, f);
             std::fclose(f);
             RT_LOG("shared font: %s", path);

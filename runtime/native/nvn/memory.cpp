@@ -120,6 +120,7 @@ std::shared_ptr<HostImport> CreateImport(u64 base, u64 size) {
                (unsigned long long)i->base, (unsigned long long)i->size);
         return nullptr;
     }
+    rt::EnsureCommitted(reinterpret_cast<void*>(base), size); // (Windows: the driver cannot import pages not yet committed)
     static auto get_props = reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
         vkGetDeviceProcAddr(vk.device, "vkGetMemoryHostPointerPropertiesEXT"));
     VkMemoryHostPointerPropertiesEXT props{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
@@ -573,6 +574,7 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* e) {
     if (e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || e->ExceptionRecord->NumberParameters < 2)
         return EXCEPTION_CONTINUE_SEARCH;
     const u64 address = (u64)e->ExceptionRecord->ExceptionInformation[1];
+    if (rt::CommitOnFault(reinterpret_cast<void*>(address), e->ExceptionRecord->ExceptionInformation[0] == 1)) return EXCEPTION_CONTINUE_EXECUTION; // (heap not yet touched: platform.h)
     if (HandleFault(address, (u64)e->ContextRecord->Rip)) return EXCEPTION_CONTINUE_EXECUTION;
     char line[160];
     const int n = std::snprintf(line, sizeof line, "[rt] access violation at %#llx, host pc %#llx\n",
@@ -1550,6 +1552,7 @@ void WritebackDone(const std::vector<std::pair<u64, u64>>& ranges, u64 serial) {
 }
 
 void PrepareHostWrite(u64 address, u64 size) {
+    rt::EnsureCommitted(reinterpret_cast<void*>(address), size);
     if (!size || !track::dirty) return;
     track::SettleRange(address, size);
     const u64 first = address & ~(track::PageSize - 1), end = (address + size + track::PageSize - 1) & ~(track::PageSize - 1);

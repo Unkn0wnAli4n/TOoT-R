@@ -1030,8 +1030,16 @@ u32 SvcSetHeapSize(Cpu* c) {
 #endif
         heap_reserved = true;
     }
+    // (Windows: the heap's new part stays reserved and becomes usable where the game first touches it - the game asks
+    // for 9.4 GiB at once and all of it counted against the system's memory from then on, on a 16 GiB PC too.
+    // OOT_HEAP_COMMIT=1: all at once, as before.)
+#ifdef _WIN32
+    static const bool lazy_heap = std::getenv("OOT_HEAP_COMMIT") == nullptr;
+#else
+    constexpr bool lazy_heap = false;
+#endif
     if (size > heap_size) {
-        if (mprotect(reinterpret_cast<void*>(HeapBase + heap_size), size - heap_size, PROT_READ | PROT_WRITE) != 0)
+        if (!lazy_heap && mprotect(reinterpret_cast<void*>(HeapBase + heap_size), size - heap_size, PROT_READ | PROT_WRITE) != 0)
             return ResultOutOfResource;
     } else if (size < heap_size) {
         if (madvise(reinterpret_cast<void*>(HeapBase + size), heap_size - size, DiscardAdvice) != 0 ||
@@ -1039,8 +1047,9 @@ u32 SvcSetHeapSize(Cpu* c) {
             return ResultOutOfResource;
     }
     heap_size = size;
+    if (lazy_heap) LazyCommitRange(reinterpret_cast<void*>(HeapBase), size);
     memory_regions_dirty = true;
-    RT_LOG("memory: heap %llu MiB", (unsigned long long)(size >> 20));
+    RT_LOG("memory: heap %llu MiB%s", (unsigned long long)(size >> 20), lazy_heap ? " (made usable as it is touched)" : "");
     c->x[1] = HeapBase;
     return ResultSuccess;
 }
