@@ -1714,11 +1714,24 @@ NATIVE("nvnMemoryPoolInitialize") {
         std::unique_lock lock{pools_mutex};
         if (!reserved || reserved > 0x4000000000ULL || next_virtual_address > 0x7000000000ULL - reserved)
             Fatal("GPU virtual address space exhausted");
+        // (any free place will do: the game asks the pool for its address. A place taken already - by the graphics driver's
+        // own memory, on Windows with NVIDIA DLSS built in: "cannot reserve GPU virtual pool" at every start of a player's
+        // game - is passed over, a 64 KiB step at a time up to the region's end)
+        {static const bool test=[]{if(!std::getenv("OOT_TEST_TAKE_VIRTUAL"))return false; // (test: the first places taken, as the driver did)
+            return mmap(reinterpret_cast<void*>(0x3000000000ULL),0x40000000ULL,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE|MAP_NORESERVE,-1,0)!=MAP_FAILED;}();(void)test;}
+        void* memory = MAP_FAILED; u32 passed = 0;
+        while (next_virtual_address <= 0x7000000000ULL - reserved) {
+            memory = mmap(reinterpret_cast<void*>(next_virtual_address), reserved, PROT_NONE,
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0);
+            if (memory != MAP_FAILED && reinterpret_cast<u64>(memory) == next_virtual_address) break;
+            if (memory != MAP_FAILED) munmap(memory, reserved); // (placed elsewhere: not this place)
+            memory = MAP_FAILED; ++passed;
+            next_virtual_address += passed < 64 ? 0x10000ULL : 0x40000000ULL; // (64 KiB steps, then 1 GiB ones past a large occupant)
+        }
+        if (memory == MAP_FAILED) Fatal("cannot reserve GPU virtual pool");
+        if (passed) RT_LOG("memory: a GPU virtual pool placed at %#llx, past %u taken places", (unsigned long long)next_virtual_address, passed);
         p->address = next_virtual_address;
         next_virtual_address += reserved;
-        void* memory = mmap(reinterpret_cast<void*>(p->address), reserved, PROT_NONE,
-                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0);
-        if (memory == MAP_FAILED) Fatal("cannot reserve GPU virtual pool");
         p->import_base = p->address;
     } else {
         if (!p->address) Fatal("memory pool without storage");
