@@ -2,7 +2,8 @@
 
 A native PC port of **The Legend of Zelda: Ocarina of Time** (Nintendo Switch 2 release), made by
 static recompilation: the game's AArch64 code is translated to C++ and compiled for x86-64, and the
-console's SDK and NVN graphics API are reimplemented on SDL3, Vulkan and FFmpeg. No emulator runs.
+console's system functions (files, input, sound, video, threads) and its graphics API are
+reimplemented on SDL3, Vulkan and FFmpeg. No emulator runs.
 
 **This repository contains no game code or assets.** The installer builds the port from your own
 legally obtained dump of the game, on your machine.
@@ -31,7 +32,7 @@ legally obtained dump of the game, on your machine.
 - **Game files.** Compressed `.nup` packages are read as well as uncompressed ones.
 
 NVIDIA DLSS is not part of this project and is not distributed with it. When you tick the DLSS
-option, the installer downloads NVIDIA's DLSS SDK from NVIDIA's own repository onto your PC, under
+option, the installer downloads NVIDIA's DLSS files from NVIDIA's own repository onto your PC, under
 NVIDIA's licence, which you accept there. Without it everything else works the same. DLSS is
 offered by the Linux installer for now; on Windows it is not built in yet.
 
