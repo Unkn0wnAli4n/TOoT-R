@@ -43,6 +43,7 @@ using namespace rt;
 namespace nvn {
 bool LsReadSubmitted(u64 address, void* dst, u64 size);
 void LsNoteDraw(Texture* colour, Texture* depth, VkExtent2D extent, u64 camera, u64 camera_size); // (the vendored upscalers, below)
+std::atomic<u64> skin_reject[12];
 bool LsSkinned(const Command& command, mkwvk::SkinnedDraw& k, u64 program);
 void LsNoteSkinned(mkwvk::SkinnedDraw& k, Texture* depth, VkExtent2D extent);
 void PreSubmit(); // (before each submission: report processing and timestamps)
@@ -3026,9 +3027,18 @@ void Draw(const Command& command) {
         // bones that writes a two-channel target would be the game's own motion vectors)
         k+=" ->";for(u32 i=0;i<(*tls_state).color_count;++i)if(colors[i]){char t[48];std::snprintf(t,sizeof t," c%u:f%u %ux%u",i,colors[i]->format,colors[i]->width,colors[i]->height);k+=t;}
         {char t[64];std::snprintf(t,sizeof t," depth %s state %#x",depth?"yes":"no",(u32)(*tls_state).depth&0xff);k+=t;}
+        {char t[64];std::snprintf(t,sizeof t," vs %#llx",(unsigned long long)((*tls_state).stages[0].shader?(*tls_state).stages[0].shader->address:0));k+=t;}
         if(seen.insert(k).second)RT_LOG("draw layout:%s",k.c_str());}
      ls_scan_done:;}
     pk.ls_skinned=!mesh&&LsSkinned(command,pk.ls_skin,(*tls_state).stages[0].shader?(*tls_state).stages[0].shader->address:0);
+    {static const bool scan=std::getenv("OOT_SKIN_SCAN")!=nullptr; // (diagnostic: which scene draws carry a bone palette, and why the actor motion passes them by)
+     if(scan&&!resolve_worker&&CurrentFrameNumber()>1500&&depth&&extent.width>=640){static std::mutex m;static std::map<std::string,u64> seen;static u64 at=0;
+        const u64 b3=(*tls_state).stages[0].uniforms[3].size;
+        std::string k=mesh?"mesh":"draw";u32 active=0;for(u32 i=0;i<16;++i)if((*tls_state).attributes[i]&0x40)++active;
+        char t[200];std::snprintf(t,sizeof t," attrs %u a6 %s ubo3 %llx%s c0 f%u op %u",active,((*tls_state).attributes[6]&0x40)?"on":"off",(unsigned long long)b3,b3&&b3%48==0?"(bones)":"",colors[0]?colors[0]->format:0,command.op);k+=t;
+        std::lock_guard l{m};++seen[k];
+        if(CurrentFrameNumber()-at>600){at=CurrentFrameNumber();std::vector<std::pair<u64,std::string>> v;for(auto& [a,b]:seen)v.push_back({b,a});std::sort(v.rbegin(),v.rend());
+            for(size_t i=0;i<v.size()&&i<30;++i)RT_LOG("skin scan %llu: %s",(unsigned long long)v[i].first,v[i].second.c_str());seen.clear();}}}
     pk.predicate=predicate;pk.inverted=inverted;pk.mesh=mesh?(pipeline.fallback?2:1):0;pk.indirect_slot=indirect_slot;pk.stats_pool=stats_pool;pk.sample_query=sample_query;
     pk.checkpoint=vk.checkpoint?((*tls_state).stages[1].shader?(*tls_state).stages[1].shader->address:0)|1:0;
     const u64 profile_key=(*tls_state).stages[1].shader?(*tls_state).stages[1].shader->address:0;
@@ -3244,18 +3254,25 @@ void LsNoteDraw(Texture* colour, Texture* depth, VkExtent2D extent, u64 camera, 
 // attribute 0 (RGB32F or RGBA16F), the weights at 4 (and 5), the joints at 6 (and 7), the bone palette (3 x 4 matrices)
 // in the vertex stage's uniform slot 3 and the object's origin in slot 1 (at 0x40). What it reads is the state of the
 // draw being resolved, so a thread resolving ahead fills it too; the executor notes it when the draw is committed.
+void SkinRejectReport(){static const bool on=std::getenv("OOT_SKIN_SCAN")!=nullptr;static u64 at=0;if(!on||CurrentFrameNumber()-at<600)return;at=CurrentFrameNumber();
+    RT_LOG("skin check: not wanted %llu, not indexed %llu, position %llu, bones %llu, joints %llu, stride/offsets %llu, index type %llu, accepted %llu; noted: no depth %llu, not scene size %llu, off %llu, noted %llu",
+        (unsigned long long)skin_reject[0].exchange(0),(unsigned long long)skin_reject[1].exchange(0),(unsigned long long)skin_reject[2].exchange(0),(unsigned long long)skin_reject[3].exchange(0),(unsigned long long)skin_reject[4].exchange(0),(unsigned long long)skin_reject[5].exchange(0),(unsigned long long)skin_reject[6].exchange(0),(unsigned long long)skin_reject[7].exchange(0),
+        (unsigned long long)skin_reject[8].exchange(0),(unsigned long long)skin_reject[9].exchange(0),(unsigned long long)skin_reject[10].exchange(0),(unsigned long long)skin_reject[11].exchange(0));}
 bool LsSkinned(const Command& command, mkwvk::SkinnedDraw& k, u64 program) {
-    if (!mkwvk::temporal_wanted() && !mkwvk::temporal_fg_inputs()) return false;
+    SkinRejectReport();
+    if (!mkwvk::temporal_wanted() && !mkwvk::temporal_fg_inputs()) { ++skin_reject[0]; return false; }
     const Op op = (Op)command.op;
-    if (op != Op::DrawElements && op != Op::DrawElementsBaseVertex) return false;
+    // (this game version draws its characters as instanced draws of one instance: x[6] the count, x[5] the first)
+    const bool one_instance = op == Op::DrawElementsInstanced && command.x[6] == 1 && command.x[5] == 0;
+    if (op != Op::DrawElements && op != Op::DrawElementsBaseVertex && !one_instance) { ++skin_reject[1]; return false; }
     const State& st = *tls_state;
     struct Attr { u32 fmt, offset, stream; bool on; };
     const auto attr = [&](int i) { const u32 a = st.attributes[i]; return Attr{a >> 21 & 0x3ff, a >> 7 & 0x3fff, a & 31, (a & 0x40) != 0}; };
     enum : u32 { R8 = 0x1, R8UI = 0x3, R16UI = 0x8, RG8 = 0xd, RG8UI = 0xf, RGB32F = 0x22, RGBA8 = 0x25, RGBA8UI = 0x27, RGBA16F = 0x29, RGBA16UI = 0x2c };
     const Attr pos = attr(0);
-    if (!pos.on || (pos.fmt != RGB32F && pos.fmt != RGBA16F) || pos.stream != 0 || !attr(6).on) return false;
+    if (!pos.on || (pos.fmt != RGB32F && pos.fmt != RGBA16F) || pos.stream != 0 || !attr(6).on) { ++skin_reject[2]; return false; }
     const Buffer& bones = st.stages[0].uniforms[3];
-    if (!bones.address || bones.size < 48 || bones.size % 48) return false;
+    if (!bones.address || bones.size < 48 || bones.size % 48) { ++skin_reject[3]; return false; }
     k = mkwvk::SkinnedDraw{};
     k.formats = pos.fmt == RGBA16F ? dlss_actor::kHalfPosition : 0;
     for (int set = 0; set < 2; ++set) {
@@ -3275,16 +3292,22 @@ bool LsSkinned(const Command& command, mkwvk::SkinnedDraw& k, u64 program) {
         k.weights[set] = w.offset; k.joints[set] = j.offset; k.sets = set + 1;
     }
     const u32 stride = st.streams[0][0];
-    if (!k.sets || !stride || stride % 4 || pos.offset % 4 || !st.vertices[0].address || command.x[1] > 2) return false;
+    if (!k.sets) { ++skin_reject[4]; { static int shown = 0; static const bool scan = std::getenv("OOT_SKIN_SCAN") != nullptr; if (scan && shown++ < 12) { std::string d; for (int i = 0; i < 10; ++i) { const Attr a = attr(i); char b[48]; std::snprintf(b, sizeof b, " a%d:%s fmt %#x off %u s%u", i, a.on ? "on" : "off", a.fmt, a.offset, a.stream); d += b; } RT_LOG("skin check: joints not understood:%s", d.c_str()); } } return false; }
+    if (!stride || stride % 4 || pos.offset % 4 || !st.vertices[0].address) { ++skin_reject[5]; return false; }
+    if (command.x[1] > 2) { ++skin_reject[6]; return false; }
+    ++skin_reject[7];
     k.vbuf = st.vertices[0].address; k.vsize = st.vertices[0].size; k.stride = stride; k.pos = pos.offset;
-    k.ibuf = command.x[3]; k.itype = (int)command.x[1]; k.count = (int)command.x[2]; k.base_vertex = op == Op::DrawElementsBaseVertex ? (int)(s32)command.x[4] : 0;
+    k.ibuf = command.x[3]; k.itype = (int)command.x[1]; k.count = (int)command.x[2]; k.base_vertex = op == Op::DrawElementsBaseVertex || one_instance ? (int)(s32)command.x[4] : 0;
     k.bones = bones.address; k.bones_size = bones.size; k.object = st.stages[0].uniforms[1].address; k.object_size = st.stages[0].uniforms[1].size;
     k.program = program;
     return true;
 }
 void LsNoteSkinned(mkwvk::SkinnedDraw& k, Texture* depth, VkExtent2D extent) {
     static const bool off = std::getenv("OOT_ACTOR_MOTION") && !std::atoi(std::getenv("OOT_ACTOR_MOTION")); // (=0: the camera's motion alone)
-    if (off || !depth || !depth->image || !mkwvk::temporal_scene_size(extent.width, extent.height)) return;
+    if (off) { ++skin_reject[10]; return; }
+    if (!depth || !depth->image) { ++skin_reject[8]; return; }
+    if (!mkwvk::temporal_scene_size(extent.width, extent.height)) { ++skin_reject[9]; return; }
+    ++skin_reject[11];
     k.depth = ls::Texture(*depth);
     mkwvk::temporal_note_skinned_draw(k);
 }
