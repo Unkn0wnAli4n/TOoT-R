@@ -16,6 +16,8 @@
 
 #include <zstd.h>
 
+#include <map>
+#include <mutex>
 #include "../ops.h"
 #include "../rt.h"
 #include "../addresses.h"
@@ -60,6 +62,9 @@ void ScaleApply(Cpu* c) {
 // ---- the sun's shadow maps (Shadow Quality) ----------------------------------------------------------------------------
 // w23: the cascades' size this frame, rounded to a multiple of 8 (1600 as shipped); x19: the shadow object.
 void ShadowSize(Cpu* c) {
+    {static const bool trace = std::getenv("OOT_SHADOW_TRACE") != nullptr; // (which shadow objects pass here, and their sizes)
+     if (trace && Readable(c->x[19])) { static std::mutex m; static std::map<std::pair<u64, u32>, u64> seen; std::lock_guard l{m};
+        if (++seen[{Load<u64>(c->x[19]), (u32)c->x[23]}] == 1) RT_LOG("shadow trace: object class %#llx (sun's is %#llx), size %u", (unsigned long long)Load<u64>(c->x[19]), (unsigned long long)OOT_AT(0x4b8a0a8), (u32)c->x[23]); }}
     const int choice = gfx::Current().shadow_quality;
     if (!choice || !Readable(c->x[19]) || Load<u64>(c->x[19]) != OOT_AT(0x4b8a0a8)) return; // (the sun's shadow object only)
     const u32 size = (u32)c->x[23];
