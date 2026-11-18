@@ -58,7 +58,7 @@ Msys ("pacman -S --needed --noconfirm " + ($packages -join " "))
 Step "source"
 $source = $PSScriptRoot
 $temp = $null
-if (-not (Test-Path (Join-Path $source "tools\build_game.py"))) {
+if (-not (Test-Path -LiteralPath (Join-Path $source "tools\build_game.py"))) {
     Say "downloading $Repo"
     $temp = Join-Path $env:TEMP ("tootr-" + [guid]::NewGuid())
     New-Item -ItemType Directory $temp | Out-Null
@@ -69,15 +69,21 @@ if (-not (Test-Path (Join-Path $source "tools\build_game.py"))) {
 }
 
 # ---- the game -------------------------------------------------------------------------------------
-if (-not $Nup) {
+# The file given, or asked for. A path that is not a file is asked for again, not refused: the window that opens
+# shows what is there. (-LiteralPath: a dump's name has square brackets - "[v131072]" - which Test-Path would read as
+# a wildcard and find no file: every game file named that way was refused here.)
+function Pick-Game {
     Add-Type -AssemblyName System.Windows.Forms
     $dialog = New-Object System.Windows.Forms.OpenFileDialog
-    $dialog.Title = "Select your dump of The Legend of Zelda: Ocarina of Time (Switch 2, v131072)"
+    $dialog.Title = "Select your dump of The Legend of Zelda: Ocarina of Time (Switch 2; update v131072 is the tested one)"
     $dialog.Filter = "Switch 2 package (*.nup)|*.nup|All files (*.*)|*.*"
-    if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { Say "no game file selected"; exit 1 }
-    $Nup = $dialog.FileName
+    if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return "" }
+    return $dialog.FileName
 }
-if (-not (Test-Path $Nup)) { Say "no such file: $Nup"; exit 1 }
+if ($Nup -and -not (Test-Path -LiteralPath $Nup -PathType Leaf)) { Say "no such file: $Nup - choose the game file"; $Nup = "" }
+if (-not $Nup) { $Nup = Pick-Game }
+if (-not $Nup) { Say "no game file selected"; exit 1 }
+if (-not (Test-Path -LiteralPath $Nup -PathType Leaf)) { Say "no such file: $Nup"; exit 1 }
 if (-not $Dir) {
     $default = Join-Path $env:LOCALAPPDATA "tootr"
     Add-Type -AssemblyName System.Windows.Forms
@@ -112,7 +118,7 @@ set "OOT_RECOMP_HOME=$data"
 cd /d "$data"
 "$python" "$data\source\installer\launcher.py" run %*
 if errorlevel 1 pause
-"@ | Set-Content -Encoding ASCII $runner
+"@ | Set-Content -Encoding ASCII -LiteralPath $runner
 
 $shell = New-Object -ComObject WScript.Shell
 foreach ($dir in @([Environment]::GetFolderPath("Programs"), [Environment]::GetFolderPath("Desktop"))) {

@@ -11,6 +11,7 @@
 #ifndef _UNICODE
 #define _UNICODE
 #endif
+#include <algorithm>
 #include <windows.h>
 #include <commctrl.h>
 #include <commdlg.h>
@@ -83,22 +84,25 @@ std::wstring Size(ULONGLONG bytes) {
     return t;
 }
 
-// The newest .nup in the folders a dump usually ends up in.
-std::wstring FindGame() {
-    std::wstring best; FILETIME newest{};
+// The .nup files in the folders a dump usually ends up in, newest first.
+struct FoundGame { std::wstring path; FILETIME written; ULONGLONG size; };
+std::vector<FoundGame> found_games;
+void FindGames() {
+    found_games.clear();
     wchar_t profile[MAX_PATH];
-    if (!GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH)) return best;
+    if (!GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH)) return;
     for (const wchar_t* folder : {L"\\Downloads", L"\\Desktop", L"\\Documents", L""}) {
         const std::wstring base = std::wstring(profile) + folder + L"\\";
         WIN32_FIND_DATAW found;
         HANDLE h = FindFirstFileW((base + L"*.nup").c_str(), &found);
         if (h == INVALID_HANDLE_VALUE) continue;
         do {
-            if (CompareFileTime(&found.ftLastWriteTime, &newest) > 0) { newest = found.ftLastWriteTime; best = base + found.cFileName; }
+            if (!(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) found_games.push_back({base + found.cFileName, found.ftLastWriteTime, (ULONGLONG)found.nFileSizeHigh << 32 | found.nFileSizeLow});
         } while (FindNextFileW(h, &found));
         FindClose(h);
     }
-    return best;
+    std::sort(found_games.begin(), found_games.end(), [](const FoundGame& a, const FoundGame& b) { return CompareFileTime(&a.written, &b.written) > 0; });
+    if (found_games.size() > 12) found_games.resize(12);
 }
 
 // What the Setup page says under its two fields, and whether Install may be pressed.
@@ -106,7 +110,8 @@ void Check() {
     const std::wstring nup = Text(nup_edit);
     WIN32_FILE_ATTRIBUTE_DATA info;
     nup_ok = false;
-    if (nup.empty()) nup_note = L"Choose your .nup file.";
+    if (nup.empty()) nup_note = found_games.size() > 1 ? std::to_wstring(found_games.size()) + L" game files were found on this PC: press Browse to choose which one to build."
+                                                       : L"Choose your .nup file.";
     else if (!GetFileAttributesExW(nup.c_str(), GetFileExInfoStandard, &info) || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) nup_note = L"There is no such file.";
     else {
         const ULONGLONG size = (ULONGLONG)info.nFileSizeHigh << 32 | info.nFileSizeLow;
@@ -131,6 +136,22 @@ void Check() {
 }
 
 void BrowseNup() {
+    // (several dumps found: a menu of them first - which one is built is the player's choice - with "Browse..." last)
+    if (found_games.size() > 1) {
+        HMENU menu = CreatePopupMenu();
+        for (size_t i = 0; i < found_games.size(); ++i) {
+            const std::wstring& p = found_games[i].path;
+            const std::wstring label = p.substr(p.find_last_of(L"\\/") + 1) + L"   (" + Size(found_games[i].size) + L")";
+            AppendMenuW(menu, MF_STRING, 1 + i, label.c_str());
+        }
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, 1000, L"Browse for another file...");
+        RECT r; GetWindowRect(nup_browse, &r);
+        const int choice = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTALIGN | TPM_TOPALIGN, r.right, r.bottom, 0, window, nullptr);
+        DestroyMenu(menu);
+        if (choice >= 1 && choice <= (int)found_games.size()) { SetWindowTextW(nup_edit, found_games[choice - 1].path.c_str()); return; }
+        if (choice != 1000) return;
+    }
     wchar_t path[MAX_PATH] = L"";
     OPENFILENAMEW of{sizeof of};
     of.hwndOwner = window;
@@ -357,7 +378,7 @@ void Paint(HDC dc) {
     Draw(dc, L"A native PC version of the game, built on this computer from your own copy.", 106, 58, w - 130, Muted, font);
     if (page == Setup) {
         Draw(dc, L"1   Your copy of the game", 26, 112, 500, Accent, heading_font);
-        Draw(dc, L"The Legend of Zelda: Ocarina of Time for Nintendo Switch 2, update v131072, dumped as one .nup file. It is only read on this computer: nothing from it is uploaded or downloaded.",
+        Draw(dc, L"The Legend of Zelda: Ocarina of Time for Nintendo Switch 2, dumped as one .nup file (update v131072, also called 1.1.1, is the tested one). It is only read on this computer: nothing from it is uploaded or downloaded.",
              26, 134, w - 52, Muted, font);
         Draw(dc, nup_note, 26, 206, w - 52, nup_ok ? Good : Text(nup_edit).empty() ? Muted : Bad, font);
         Draw(dc, L"2   Where to install", 26, 246, 500, Accent, heading_font);
@@ -440,8 +461,8 @@ LRESULT CALLBACK Proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         close_button = Make(L"BUTTON", L"Close", WS_TABSTOP | BS_OWNERDRAW, IdClose);
         install_button = Make(L"BUTTON", L"Install", WS_TABSTOP | BS_OWNERDRAW, IdInstall);
         play_button = Make(L"BUTTON", L"Play", WS_TABSTOP | BS_OWNERDRAW, IdPlay);
-        const std::wstring game = FindGame();
-        if (!game.empty()) SetWindowTextW(nup_edit, game.c_str());
+        FindGames();
+        if (found_games.size() == 1) SetWindowTextW(nup_edit, found_games[0].path.c_str()); // (several: the player chooses, Check says so)
         Layout();
         Check();
         return 0;
