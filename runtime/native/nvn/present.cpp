@@ -372,7 +372,7 @@ void PresentPacing() {
             if (next > now) {
                 // (precise: sleep to just short of the time, then spin; a plain sleep overshoots by a scheduler tick)
                 const auto spin = std::chrono::microseconds(1200);
-                if (next - now > spin) std::this_thread::sleep_until(next - spin);
+                if (next - now > spin) rt::SleepUntilNs(std::chrono::duration_cast<std::chrono::nanoseconds>((next - spin).time_since_epoch()).count());
                 while (std::chrono::steady_clock::now() < next) { }
                 now = std::chrono::steady_clock::now();
             }
@@ -609,7 +609,7 @@ void FgLoop() {
             { std::lock_guard queue{vk.queue_mutex}; VK_CHECK(vkQueueSubmit(vk.queue, 1, &submit, fences[i])); }
             used = i + 1;
             // (its time: the set's pictures a frame time apart in all, the first at once)
-            if (i > 0) std::this_thread::sleep_until(at + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(interval * i / steps)));
+            if (i > 0) rt::SleepUntilNs(std::chrono::duration_cast<std::chrono::nanoseconds>((at + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(interval * i / steps))).time_since_epoch()).count());
             VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR}; present.waitSemaphoreCount = 1; present.pWaitSemaphores = &sc.rendered[image_index];
             present.swapchainCount = 1; present.pSwapchains = &sc.swapchain; present.pImageIndices = &image_index;
             VkResult shown;

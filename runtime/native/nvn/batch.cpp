@@ -946,7 +946,7 @@ void RetireLoop() {
         if (queue_for_lock) lock.lock();
         else while (!lock.try_lock()) {
             if (retired_serial_atomic.load(std::memory_order_acquire) >= done) break;
-            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            rt::SleepNs(200000);
         }
         if (!lock.owns_lock()) continue;
         while (RetireOne(false)) {}

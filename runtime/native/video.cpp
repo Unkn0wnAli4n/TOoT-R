@@ -40,7 +40,7 @@ using Ctx = Cpu;
 void hos_sleep_ns(int64_t ns) {
     if (ns > 0) {
         rt::CoreRelease release; // submissions on this guest core must run while acquisition waits
-        std::this_thread::sleep_for(std::chrono::nanoseconds(ns));
+        rt::SleepNs(ns);
     }
 }
 int64_t hos_now_ns() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }

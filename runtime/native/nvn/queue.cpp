@@ -132,7 +132,7 @@ NATIVE("nvnSyncWait") {
             WaitUntil([state] { return __atomic_load_n(state, __ATOMIC_ACQUIRE) != 0; });
             if (__atomic_load_n(state, __ATOMIC_ACQUIRE) || timeout == 0 || std::chrono::steady_clock::now() >= deadline) break;
             Executor().Resume();
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            rt::SleepNs(50000);
         }
     }
     Ret(c, __atomic_load_n(state, __ATOMIC_ACQUIRE) ? 1 : 2);

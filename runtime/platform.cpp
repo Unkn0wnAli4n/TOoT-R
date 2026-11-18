@@ -1,5 +1,8 @@
 #include "platform.h"
 
+#include <chrono>
+#include <thread>
+
 #include <cstdlib>
 
 #ifdef _WIN32
@@ -161,6 +164,39 @@ void SetThreadName(const char* name) {
     const int n = MultiByteToWideChar(CP_UTF8, 0, name, -1, wide, 64);
     if (n > 0) SetThreadDescription(GetCurrentThread(), wide);
 }
+namespace {
+long long NowNs() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+bool PlainSleeps() { static const bool plain = std::getenv("OOT_PLAIN_SLEEPS") != nullptr; return plain; }
+// (the 1 ms tick: for every timed wait in the process - condition variables, the driver's - not only the sleeps here)
+const bool fine_tick = [] {
+    if (std::getenv("OOT_PLAIN_SLEEPS")) return false;
+    if (const HMODULE winmm = LoadLibraryA("winmm.dll"))
+        if (const auto begin = reinterpret_cast<unsigned(__stdcall*)(unsigned)>(reinterpret_cast<void*>(GetProcAddress(winmm, "timeBeginPeriod")))) { begin(1); return true; }
+    return false;
+}();
+}
+void SleepNs(long long ns) {
+    if (ns <= 0) { SwitchToThread(); return; }
+    if (PlainSleeps()) { std::this_thread::sleep_for(std::chrono::nanoseconds(ns)); return; }
+    const long long until = NowNs() + ns;
+    if (ns >= 100000) {
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+        // (one timer a thread, made at its first sleep; Windows before 10 1803 has no such timer: Sleep, to the 1 ms tick)
+        static thread_local const HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        // (it wakes up to a fraction of a millisecond late: sleep to 0.3 ms short of the time, the rest below)
+        const long long coarse = ns - 300000;
+        if (coarse >= 100000) {
+            LARGE_INTEGER due; due.QuadPart = -(coarse / 100);
+            if (timer && SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0)) WaitForSingleObject(timer, INFINITE);
+            else if (coarse >= 2000000) Sleep((DWORD)(coarse / 1000000 - 1));
+        }
+    }
+    // (the rest, or a sleep too short for any timer: the core is offered to other threads until the time has passed)
+    while (NowNs() < until) { if (!SwitchToThread()) YieldProcessor(); }
+}
+void SleepUntilNs(long long at) { const long long now = NowNs(); if (at > now) SleepNs(at - now); }
 } // namespace rt
 
 #else // POSIX
@@ -186,5 +222,7 @@ const std::string& DataDir() {
     return dir;
 }
 void SetThreadName(const char* name) { pthread_setname_np(pthread_self(), name); }
+void SleepNs(long long ns) { if (ns > 0) std::this_thread::sleep_for(std::chrono::nanoseconds(ns)); else std::this_thread::yield(); }
+void SleepUntilNs(long long at) { std::this_thread::sleep_until(std::chrono::steady_clock::time_point(std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::nanoseconds(at)))); }
 } // namespace rt
 #endif

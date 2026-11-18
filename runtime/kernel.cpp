@@ -1198,7 +1198,7 @@ void rt_svc(Cpu* c, u32 imm) {
             static thread_local bool set = false;
             if (!set) { set = true; if (const char* e = std::getenv("OOT_TIMER_SLACK_NS")) prctl(PR_SET_TIMERSLACK, std::strtoul(e, nullptr, 10), 0, 0, 0); }
 #endif
-            std::this_thread::sleep_for(std::chrono::nanoseconds(ns));
+            rt::SleepNs(ns); // (exact on Windows too: platform.h)
         }
         return;
     }

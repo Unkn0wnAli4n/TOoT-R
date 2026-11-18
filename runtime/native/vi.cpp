@@ -34,7 +34,7 @@ NATIVE("_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7DisplayE"
             auto next = std::chrono::steady_clock::now();
             for (;;) {
                 next += std::chrono::nanoseconds(16666667);
-                std::this_thread::sleep_until(next);
+                rt::SleepUntilNs(std::chrono::duration_cast<std::chrono::nanoseconds>(next.time_since_epoch()).count());
                 SignalKernelEvent(writable);
             }
         }).detach();
