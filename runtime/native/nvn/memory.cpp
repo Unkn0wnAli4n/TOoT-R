@@ -1523,6 +1523,14 @@ bool PageProtectionUsable() {
 bool PoolsInGpuMemory() { return BackPools() && Vk().placed_maps; }
 bool TextureWatchUsable() {
     static const bool usable = [] {
+        // (OOT_NO_TEXTURE_WATCH=1: by content everywhere)
+        if (std::getenv("OOT_NO_TEXTURE_WATCH")) { RT_LOG("CPU writes: textures checked by content (asked for)"); return false; }
+#ifdef _WIN32
+        // Windows: NVIDIA's driver loses the device at the first submission after imported pages were write-protected
+        // (an RTX 3050 laptop, driver 617.42: device lost as the first textures went in; none with the watch off).
+        // OOT_TEXTURE_WATCH=1: protected all the same.
+        if (!std::getenv("OOT_TEXTURE_WATCH")) { RT_LOG("CPU writes: Windows, no page protection of texture memory (textures checked by content)"); return false; }
+#endif
         if (PageProtectionUsable()) return true;
         const char* e = std::getenv("OOT_BACKED_WATCH");
         const bool v = BackPools() && Vk().placed_maps && !(e && std::atoi(e) == 0);
