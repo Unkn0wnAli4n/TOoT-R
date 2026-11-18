@@ -4,6 +4,7 @@
 // Microsoft runtime libraries the SDK library names.)
 #if defined(_WIN32) && defined(LONGSHOT_NGX)
 #include <windows.h>
+#include <climits>
 #include <cstdint>
 #include <cstdlib>
 
@@ -14,14 +15,20 @@ std::uintptr_t __security_cookie = 0x00002B992DDFA232ull;
 void __security_check_cookie(std::uintptr_t cookie) { if (cookie != __security_cookie) std::abort(); }
 // The unwinder's handler for such functions: nothing to do during a search.
 EXCEPTION_DISPOSITION __GSHandlerCheck(PEXCEPTION_RECORD, PVOID, PCONTEXT, PVOID) { return ExceptionContinueSearch; }
-EXCEPTION_DISPOSITION __GSHandlerCheck_EH(PEXCEPTION_RECORD, PVOID, PCONTEXT, PVOID) { return ExceptionContinueSearch; }
+// The handler of frames that have both the stack check and C++ exception handling: after the (skipped) check it is the
+// system's C++ frame handler, as in Microsoft's runtime - NVIDIA's code catches its own exceptions, and without it they
+// would pass through its frames uncaught.
+EXCEPTION_DISPOSITION __CxxFrameHandler3(PEXCEPTION_RECORD, PVOID, PCONTEXT, PVOID);
+EXCEPTION_DISPOSITION __GSHandlerCheck_EH(PEXCEPTION_RECORD record, PVOID frame, PCONTEXT context, PVOID dispatcher) {
+    return __CxxFrameHandler3(record, frame, context, dispatcher);
+}
 
 // Function-local statics made safely on first use (Microsoft's scheme: the guard is 0 before, -1 during, and
 // afterwards the number of the initialisation that finished).
 static SRWLOCK init_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE init_done = CONDITION_VARIABLE_INIT;
 static int init_epoch = INT_MIN;
-__declspec(thread) int _Init_thread_epoch = INT_MIN;
+thread_local int _Init_thread_epoch = INT_MIN; // (read by NVIDIA's compiled code itself, through the TLS index)
 void _Init_thread_header(int* guard) {
     AcquireSRWLockExclusive(&init_lock);
     if (*guard == 0) *guard = -1;
