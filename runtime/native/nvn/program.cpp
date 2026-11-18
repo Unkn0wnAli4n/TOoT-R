@@ -1,5 +1,8 @@
 // Shader programs keep the GPU code and control metadata; pipelines compile them
 // with the textures, constant buffers and render state bound at each draw.
+#include "texture.h"
+#include <mutex>
+#include <deque>
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -15,6 +18,21 @@ namespace nvn {
 Program* HostProgram(u64 object) { return *reinterpret_cast<Program**>(object); }
 }
 namespace {
+// A program the game ended. The executor runs behind the game: commands it has not reached yet still draw with the
+// program, and every compiled variant of its shaders points at its ShaderCode (render.cpp ShaderVariant::source,
+// variants_by_code). Deleted at once, as it was, a map change (hundreds of programs end) left those pointing at freed
+// memory: a crash in the next draws' descriptor writing, or another program's code under the same address. Ended
+// programs are kept instead; their code bytes, which only a first compile reads, are let go ten seconds of frames later.
+void Retire(nvn::Program* program) {
+    if (!program) return;
+    struct Ended { u64 frame; nvn::Program* program; };
+    static std::mutex mutex; static std::deque<Ended> ended; static size_t trimmed = 0;
+    std::lock_guard lock{mutex};
+    const u64 now = nvn::CurrentFrameNumber();
+    ended.push_back({now, program});
+    for (; trimmed < ended.size() && now - ended[trimmed].frame > 600; ++trimmed)
+        for (nvn::ShaderCode& code : ended[trimmed].program->shaders) { std::vector<u8>().swap(code.control); std::vector<u8>().swap(code.code); std::vector<u8>().swap(code.constants); }
+}
 struct ShaderData { u64 address, control; };
 bool SetShaders(Cpu* c, Program& program, s32 count, const ShaderData* data) {
     if (count < 0 || count > 6 || (count && !data)) return false;
@@ -80,6 +98,7 @@ bool SetShaders(Cpu* c, Program& program, s32 count, const ShaderData* data) {
         }
         shaders.push_back(std::move(shader));
     }
+    if (!program.shaders.empty()) { auto* old = new Program{}; old->shaders = std::move(program.shaders); Retire(old); } // (the shaders it had may still be drawn with)
     program.shaders = std::move(shaders);
     return true;
 }
@@ -109,7 +128,7 @@ NATIVE("nvnProgramSetShadersExt") {
     for(s32 i=0;i<count;++i)std::memcpy(&data[i],input+i*24,sizeof(ShaderData));
     Ret(c,SetShaders(c,*HostProgram(object),count,data.data()));
 }
-NATIVE("nvnProgramFinalize") { delete HostProgram(c->x[0]); *Ptr<Program*>(c, 0) = nullptr; }
+NATIVE("nvnProgramFinalize") { Retire(HostProgram(c->x[0])); *Ptr<Program*>(c, 0) = nullptr; }
 NATIVE("nvnProgramSetDebugLabel") {}
 NATIVE("nvnProgramSetSampleShading") { HostProgram(c->x[0])->sample_shading = c->x[1] != 0; }
 // Host Vulkan pipelines allocate their own scratch/compute memory.

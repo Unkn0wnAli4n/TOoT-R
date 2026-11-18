@@ -67,6 +67,9 @@ inline std::atomic<bool> release_asked{false}; // Escape let the mouse go; a cli
 inline std::atomic<int64_t> camera_live_ns{0};
 inline std::atomic<bool> camera_free{true};  // HID: none of the buttons the game takes the right stick for is held
 inline std::atomic<bool> gyro_seen{false};      // a connected controller has a gyroscope
+inline std::atomic<int> pad_now[4]{};          // HID: the sticks as the game gets them (left x, y, right x, y; -32767..32767)
+inline std::atomic<bool> swallow_sticks{false};  // the free camera has the sticks: the game gets them at rest
+inline std::atomic<uint64_t> pad_buttons{0};   // HID: the buttons held (bit = Action)
 inline std::atomic<bool> stick_turning{false}; // HID: the stick or the camera keys turn the camera now
 int64_t NowNs();
 

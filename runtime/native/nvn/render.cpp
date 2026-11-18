@@ -2952,6 +2952,7 @@ void LsNoteDraw(Texture* colour, Texture* depth, VkExtent2D extent, u64 camera, 
                    (unsigned long long)camera, (unsigned long long)camera_size, (int)read, c[0x120 / 4], c[0x124 / 4], c[0xa0 / 4], c[0xa4 / 4], c[0xa8 / 4], c[0xac / 4], (int)mkwvk::temporal_scene_size(extent.width, extent.height)); } }
     if (!mkwvk::temporal_scene_size(extent.width, extent.height)) return;
     if (ls_scene_frame != CurrentFrameNumber() || extent.width * extent.height >= ls_scene_w * ls_scene_h) { ls_scene_frame = CurrentFrameNumber(); ls_scene_depth = depth; ls_scene_w = extent.width; ls_scene_h = extent.height; }
+    ls::SceneDepth(depth);
     mkwvk::temporal_note_scene_draw(LsColour(*colour), extent.width, extent.height, ls::Texture(*depth), camera, camera_size);
     mkwvk::fsr3_inputs::note_scene_draw(LsColour(*colour), extent.width, extent.height, ls::Texture(*depth), camera, camera_size); // (frame generation's inputs)
 }
@@ -3346,7 +3347,7 @@ bool ExecuteRenderCommand(const Command& command) {
     case Op::BindProgram: {
         const auto before=std::array<const ShaderCode*,9>{(*tls_state).stages[0].shader,(*tls_state).stages[1].shader,(*tls_state).stages[2].shader,(*tls_state).stages[3].shader,(*tls_state).stages[4].shader,(*tls_state).stages[5].shader,(*tls_state).stages[6].shader,(*tls_state).stages[7].shader,(*tls_state).stages[8].shader};
         struct Check{const std::array<const ShaderCode*,9>& b;~Check(){for(u32 i=0;i<9;++i)if((*tls_state).stages[i].shader!=b[i]){fast_draw_allowed=false;break;}}} check{before}; // (the same program bound again keeps the fast path)
-        auto* program=HostProgram(x[0]);
+        auto* program=reinterpret_cast<const Program*>(x[0]); // (the host's program, taken when the command was recorded)
         for(u32 i=0;i<9;++i) if(x[1]&(1u<<i)) (*tls_state).stages[i].shader=nullptr;
         if(program) for(const auto& code:program->shaders) {
             if(code.stage>7)Fatal("binding NVN shader stage %u",code.stage);
@@ -4328,8 +4329,9 @@ void ReportSlowFrame(double ms){
     const double st=upload_staging_ns.exchange(0)/1e6,sw=upload_swizzle_ns.exchange(0)/1e6,dc=upload_decode_ns.exchange(0)/1e6;
     static u64 last_wait=FenceWaitNanoseconds();const u64 wait_now=FenceWaitNanoseconds();const double fence=(wait_now-last_wait)/1e6;last_wait=wait_now;
     extern std::atomic<u64> executor_idle_ns,executor_parked_ns;const double idle=executor_idle_ns.exchange(0)/1e6,parked=executor_parked_ns.exchange(0)/1e6;
-    if(ms>threshold)RT_LOG("slow frame %.0f ms: shader translation %.1f ms, pipeline waits %.1f ms (%llu draws skipped), texture uploads %.1f ms (%llu; staging %.1f, deswizzle %.1f, decode %.1f), fence waits %.1f ms, executor idle %.1f ms (a queue parked %.1f ms)",
-        ms,hitch.translate*1000,hitch.pipeline_wait*1000,(unsigned long long)pending,up,(unsigned long long)n,st,sw,dc,fence,idle,parked);
+    extern std::atomic<u64> image_make_ns_frame;const double made=image_make_ns_frame.exchange(0)/1e6;
+    if(ms>threshold)RT_LOG("slow frame %.0f ms: shader translation %.1f ms, pipeline waits %.1f ms (%llu draws skipped), texture uploads %.1f ms (%llu; staging %.1f, deswizzle %.1f, decode %.1f), image creation %.1f ms, fence waits %.1f ms, executor idle %.1f ms (a queue parked %.1f ms)",
+        ms,hitch.translate*1000,hitch.pipeline_wait*1000,(unsigned long long)pending,up,(unsigned long long)n,st,sw,dc,made,fence,idle,parked);
     hitch={};
 }
 u32 TakePrewarmHits(){return prewarm_hits.exchange(0);}

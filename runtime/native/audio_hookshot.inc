@@ -569,7 +569,19 @@ static void output_open(void) {
     if ((getenv("HOS_AUDIO") && atoi(getenv("HOS_AUDIO")) == 0) || (getenv("OOT_AUDIO") && atoi(getenv("OOT_AUDIO")) == 0)) return;
     if (!SDL_WasInit(SDL_INIT_AUDIO) && !SDL_InitSubSystem(SDL_INIT_AUDIO)) { hos_log("audio: SDL audio: %s", SDL_GetError()); return; }
     const SDL_AudioSpec spec = {SDL_AUDIO_S16LE, 2, RATE};
-    wout = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+    {   /* (the Game tab's Sound Output row: the n-th playback device; the default one when it is gone) */
+        SDL_AudioDeviceID device = SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK;
+        const int chosen = oot_audio_device_choice();
+        if (chosen > 0) {
+            int count = 0;
+            SDL_AudioDeviceID *list = SDL_GetAudioPlaybackDevices(&count);
+            if (list && chosen <= count) device = list[chosen - 1];
+            else hos_log("audio: the chosen output device (%d) is not there: the default one is used", chosen);
+            SDL_free(list);
+        }
+        wout = SDL_OpenAudioDeviceStream(device, &spec, NULL, NULL);
+        if (!wout && device != SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK) wout = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+    }
     if (!wout) { hos_log("audio: no output device (%s)", SDL_GetError()); return; }
     SDL_ResumeAudioStreamDevice(wout);
     hos_log("audio: output on %s, 48 kHz stereo", SDL_GetAudioDeviceName(SDL_GetAudioStreamDevice(wout)));

@@ -11,12 +11,15 @@
 #include <cstring>
 #include <string>
 
+#include "../addresses.h"
 #include "../rt.h"
 #include "graphics_settings.h"
 
 namespace cheats {
 namespace {
-constexpr u64 Main = 0x800000000ull, Holder = Main + 0x4c7e180; // (Longshot's 0x84c9e180: its addresses are main + 0x80020000)
+constexpr u64 Main = 0x800000000ull;
+u64 HolderAddress() { return OOT_AT(0x4c7e180); }
+#define Holder HolderAddress() // (Longshot's 0x84c9e180: its addresses are main + 0x80020000)
 enum Kind { Bool, Int, Float, Enum, Text, UInt, Kinds };
 constexpr struct { u32 at, stride, value; } Layout[Kinds] = {{0x008, 0x18, 0x16}, {0x0c8, 0x28, 0x1c}, {0x188, 0x28, 0x1c}, {0x248, 0x38, 0x1c}, {0x608, 0x108, 0x68}, {0x788, 0x28, 0x1c}};
 bool Readable(u64 a) { return a >= Main && a < (1ull << 39) - 0x200; }
@@ -31,7 +34,7 @@ u32 Murmur(const char* s) {
     h ^= (u32)n; h ^= h >> 16; h *= 0x85ebca6bu; h ^= h >> 13; h *= 0xc2b2ae35u; h ^= h >> 16;
     return h;
 }
-u64 Manager() { const u64 holder = Load<u64>(Holder); return Readable(holder) ? Load<u64>(holder) : 0; }
+u64 Manager() { if (!Holder) return 0; const u64 holder = Load<u64>(Holder); return Readable(holder) ? Load<u64>(holder) : 0; }
 // The address of the value named by `hash` in the container `kind` (0: it has none).
 u64 Value(u64 manager, Kind kind, u32 hash) {
     if (!Readable(manager) || !hash) return 0;
@@ -68,11 +71,12 @@ void Probe(u64 manager) {
 void Tick() {
     const gfx::Settings& g = gfx::Current();
     static const bool probing = std::getenv("OOT_GAMEDATA_PROBE") != nullptr;
-    if (!g.cheat_health && !g.cheat_rupees && !g.cheat_magic && !probing) return;
+    const bool no_damage = g.damage_taken == 4 || g.cheat_health; // (Damage Taken at None: the life write is held where its hook is, and the hearts are filled here too)
+    if (!no_damage && !g.cheat_rupees && !g.cheat_magic && !probing) return;
     const u64 manager = Manager();
-    if (!manager) { static int n = 0; if (probing && n++ % 600 == 0 && n < 3000) RT_LOG("game data: no manager yet (holder %#llx)", (unsigned long long)Load<u64>(Holder)); return; }
+    if (!manager) { static int n = 0; if (probing && n++ % 600 == 0 && n < 3000) RT_LOG("game data: no manager yet (holder %#llx)", (unsigned long long)(Holder ? Load<u64>(Holder) : 0)); return; }
     if (probing) Probe(manager);
-    if (g.cheat_health) { // (quarter hearts)
+    if (no_damage) { // (quarter hearts)
         const u64 life = Value(manager, Int, 0x31ab5580u), most = Value(manager, Int, 0xfbe01da1u); // PlayerStatus.Life, .MaxLife
         if (life && most) { const s32 m = Load<s32>(most); if (m >= 4 && m <= 400 && Load<s32>(life) < m && Load<s32>(life) > 0) Store<s32>(life, m); }
     }

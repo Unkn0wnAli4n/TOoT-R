@@ -110,31 +110,36 @@ NATIVE("nvnDeviceGetProcAddress") { Ret(c, NvnProc(Ptr<const char>(c, 1))); }
 namespace {
 u64 graphics_alloc = 0, graphics_free = 0, graphics_realloc = 0, graphics_user = 0;
 }
-// Development aid: OOT_NVN_MAP=<names file> prints "<name> <sdk offset>" for every NVN function,
-// using the SDK driver's own name lookup, so native implementations can be checked against the
-// real driver. Runs once the SDK is initialized (here), then exits.
-static void MapNvnFunctions(Cpu* c, const char* names) {
+// The driver's function map: "<name> <sdk offset>" for every NVN function, asked of the SDK driver's own name lookup
+// (its exported nvnBootstrapLoader, then the nvnDeviceGetProcAddress it gives). The tested game version's map is
+// shipped; for another SDK the build leaves <data>/nvn_map.txt out and it is made here, once, when the SDK is
+// initialized (names: <data>/nvn.names). OOT_NVN_MAP=<names file> (development) prints it and exits.
+static void MapNvnFunctions(Cpu* c, const char* names, const char* out_path) {
     u64 sdk_base = 0;
     for (const auto& m : Modules())
         if (m.name == "sdk") sdk_base = m.base;
-    const u64 driver = *reinterpret_cast<u64*>(sdk_base + 0xe77fc0);
     const u64 buffer = ArenaAlloc(256);
-    const auto call = [&](u64 fn, const std::string& name) {
-        std::memcpy(reinterpret_cast<void*>(buffer), name.c_str(), name.size() + 1);
-        return CallGuest(c, fn, {0, buffer});
-    };
-    const u64 get_proc = call(driver, "nvnDeviceGetProcAddress");
+    const auto put = [&](const std::string& name) { std::memcpy(reinterpret_cast<void*>(buffer), name.c_str(), name.size() + 1); };
+    const auto loader = [&](const std::string& name) { put(name); return CallOriginal(c, "nvnBootstrapLoader", {buffer}); };
+    const u64 get_proc = loader("nvnDeviceGetProcAddress");
     FILE* in = std::fopen(names, "r");
-    char line[256];
-    while (in && std::fgets(line, sizeof line, in)) {
+    FILE* out = out_path ? std::fopen(out_path, "w") : stdout;
+    if (!in || !out) Fatal("the graphics functions of this game version cannot be mapped (%s, %s)", names, out_path ? out_path : "stdout");
+    char line[256]; unsigned found = 0, asked = 0;
+    while (std::fgets(line, sizeof line, in)) {
         std::string name{line};
         while (!name.empty() && (name.back() == '\n' || name.back() == '\r')) name.pop_back();
-        u64 fn = call(get_proc, name);
-        if (!fn) fn = call(driver, name);
-        std::printf("%s %llx\n", name.c_str(), (unsigned long long)(fn ? fn - sdk_base : 0));
+        if (name.empty()) continue;
+        u64 fn = 0;
+        if (get_proc) { put(name); fn = CallGuest(c, get_proc, {0, buffer}); }
+        if (!fn) fn = loader(name);
+        ++asked; found += fn != 0;
+        std::fprintf(out, "%s %llx\n", name.c_str(), (unsigned long long)(fn ? fn - sdk_base : 0));
     }
-    std::fflush(stdout);
-    std::_Exit(0);
+    std::fclose(in);
+    if (!out_path) { std::fflush(stdout); std::_Exit(0); }
+    std::fclose(out);
+    RT_LOG("graphics functions of this game version's SDK mapped: %u of %u (%s)", found, asked, out_path);
 }
 
 NATIVE("_ZN2nv20SetGraphicsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_") {
@@ -145,7 +150,12 @@ NATIVE("_ZN2nv20SetGraphicsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_") {
     // The driver's own allocator setup (its pure data functions allocate through it).
     CallOriginal(c, "_ZN2nv20SetGraphicsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_",
                  {graphics_alloc, graphics_free, graphics_realloc, graphics_user});
-    if (const char* names = std::getenv("OOT_NVN_MAP")) MapNvnFunctions(c, names);
+    if (const char* names = std::getenv("OOT_NVN_MAP")) MapNvnFunctions(c, names, nullptr);
+    else if (!std::getenv("OOT_RECOMP_NVN_MAP")) {
+        const std::string map = DataDir() + "/nvn_map.txt", names = DataDir() + "/nvn.names";
+        if (FILE* have = std::fopen(map.c_str(), "r")) std::fclose(have);
+        else MapNvnFunctions(c, names.c_str(), map.c_str());
+    }
     if (std::getenv("OOT_NVN_INFO")) {
         // Device info values from the driver's query switch with a zeroed and a patterned device:
         // equal results are constants, different ones depend on device state.

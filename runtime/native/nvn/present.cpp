@@ -4,6 +4,7 @@
 #include <unistd.h>
 #endif
 #include <cmath>
+#include "../../addresses.h"
 #include "upscale.h"
 #include "overlay.h"
 #include <cstring>
@@ -32,6 +33,7 @@ extern "C" volatile unsigned long long oot_dynres_context;
 #include <thread>
 #include "batch.h"
 #include "output.h"
+#include "latency.h"
 #include "longshot_upscale.h"
 #include "pipeline_list.h"
 
@@ -155,12 +157,14 @@ void Build() {
     info.clipped = VK_TRUE;
     info.oldSwapchain = sc.swapchain;
     VkSwapchainKHR next = VK_NULL_HANDLE;
+    info.pNext = latency::SwapchainInfo(info.pNext);
     const VkResult created = vkCreateSwapchainKHR(vk.device, &info, nullptr, &next);
     // ported from Hookshot 3e73435: a non-null oldSwapchain is retired even when creation fails, so it cannot be
     // used again. Let it go either way; with no swapchain the next present builds one again.
     if (sc.swapchain) { overlay::ReleaseSwapchainViews(); vkDestroySwapchainKHR(vk.device, sc.swapchain, nullptr); sc.swapchain = VK_NULL_HANDLE; sc.images.clear(); }
     if (created != VK_SUCCESS) { RT_LOG("swapchain creation failed (%d): retrying at the next present", (int)created); return; }
     sc.swapchain = next;
+    latency::SwapchainBuilt(next);
     u32 count = 0;
     vkGetSwapchainImagesKHR(vk.device, sc.swapchain, &count, nullptr);
     sc.images.resize(count);
@@ -227,7 +231,13 @@ void NoteFrameForLoading() { // (the game's thread, once a frame)
 }
 int EffectiveFrameCap() {
     static const bool uncapped = std::getenv("OOT_UNCAPPED") != nullptr;
-    if (uncapped || loading.load(std::memory_order_relaxed)) return 0;
+    if (loading.load(std::memory_order_relaxed)) return 0;
+    // (a game version in which the engine's frame rate was not found - time.cpp takes its graphics module at a place
+    // tools/signatures.py looks for - steps a 60th of a second every frame whatever the rate: held to 60, or the game
+    // would run fast)
+    if (!OOT_AT(0x346c770)) { static bool told = false; if (!told) { told = true; RT_LOG("frame rate: this game version's engine rate was not found: the game is held to 60 frames a second"); }
+        const int cap = gfx::Current().frame_cap; return cap && cap < 60 ? cap : 60; }
+    if (uncapped) return 0;
     int cap = gfx::Current().frame_cap;
     // (VSync at Adaptive: a variable refresh rate display follows the game only below its own top rate - past it the
     // display falls back to waiting for it, with the delay of plain vsync. Frames are held 3% under it.)
@@ -275,7 +285,7 @@ void RealtimeStep() {
         static const bool trace = std::getenv("OOT_SPEED_TRACE") != nullptr;
         static double game = 0, wall = 0; static int kept = 0, frames = 0, wrote = 0;
         if (trace) {
-            float step; std::memcpy(&step, reinterpret_cast<const void*>(0x804d41fc8ull), 4);
+            float step = 1.0f; if (OOT_AT(0x4d41fc8)) std::memcpy(&step, reinterpret_cast<const void*>(OOT_AT(0x4d41fc8)), 4);
             game += step / 60.0; wall += dt; ++frames; kept += *slot == wrote;
             if (wall >= 4.0) { RT_LOG("game speed %.3f (%.1f fps; the engine kept the rate in %d of %d frames, step now %.3f)", game / wall, frames / wall, kept, frames, step); game = wall = 0; kept = frames = 0; }
             wrote = fps;
@@ -441,7 +451,7 @@ bool PresentProgress(const overlay::Progress& progress) {
     {
         int pw = 0, ph = 0; SDL_GetWindowSizeInPixels(vk.window, &pw, &ph);
         const bool resized = pw > 0 && ph > 0 && ((u32)pw != sc.extent.width || (u32)ph != sc.extent.height);
-        if (built_vsync != gfx::Current().vsync || built_output != output::Signature() || resized) { std::lock_guard lock{vk.queue_mutex}; std::lock_guard copy{vk.copy_mutex}; vkDeviceWaitIdle(vk.device); Build(); }
+        if (built_vsync != gfx::Current().vsync || built_output != output::Signature() || latency::SwapchainStale() || resized) { std::lock_guard lock{vk.queue_mutex}; std::lock_guard copy{vk.copy_mutex}; vkDeviceWaitIdle(vk.device); Build(); }
     }
     u32 image_index;
     VkResult r = vkAcquireNextImageKHR(vk.device, sc.swapchain, 100'000'000, sc.acquired, VK_NULL_HANDLE, &image_index);
@@ -607,6 +617,8 @@ void FgPost(int slot, int made, double interval) {
 } // namespace
 
 float ShownFps() { return fgp.shown_fps.load(std::memory_order_relaxed); }
+std::atomic<float> cost_gpu{0}, cost_record{0}, cost_submits{0};
+FrameCosts LastFrameCosts() { return {cost_gpu.load(std::memory_order_relaxed), cost_record.load(std::memory_order_relaxed), cost_submits.load(std::memory_order_relaxed)}; }
 void PresentWindowTexture(u64 window, s32 index) {
     rt::CoreRelease release; // waits on the swapchain
     if (nvn::TimelineOn()) RT_LOG("T %.2f present", nvn::TimelineMs());
@@ -635,7 +647,7 @@ void PresentWindowTexture(u64 window, s32 index) {
     {   // Rebuild for a new VSync choice or window size (Wayland reports no out-of-date swapchain on resize).
         int pw = 0, ph = 0; SDL_GetWindowSizeInPixels(vk.window, &pw, &ph);
         const bool resized = pw > 0 && ph > 0 && ((u32)pw != sc.extent.width || (u32)ph != sc.extent.height);
-        if (built_vsync != gfx::Current().vsync || built_output != output::Signature() || resized || fgp.rebuild_wanted.load()) {
+        if (built_vsync != gfx::Current().vsync || built_output != output::Signature() || latency::SwapchainStale() || resized || fgp.rebuild_wanted.load()) {
             if (!swap_lock.owns_lock()) swap_lock.lock();
             fgp.rebuild_wanted = false;
             std::lock_guard lock{vk.queue_mutex}; std::lock_guard copy{vk.copy_mutex}; vkDeviceWaitIdle(vk.device); Build(); }
@@ -798,7 +810,9 @@ void PresentWindowTexture(u64 window, s32 index) {
     submit.pCommandBuffers = &sc.cmd;
     submit.signalSemaphoreCount = fg ? 0 : 1;
     submit.pSignalSemaphores = fg ? nullptr : &sc.rendered[image_index];
+    if (!fg) latency::FrameSubmitting();
     VK_CHECK(vkQueueSubmit(vk.queue, 1, &submit, sc.fence));
+    if (!fg) latency::Submitted();
     if (fg) FgPost(fg_slot, fg_made, fg_interval); // (shown by its thread, in the queue's order after this frame's recording)
     VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     present.waitSemaphoreCount = 1;
@@ -806,7 +820,9 @@ void PresentWindowTexture(u64 window, s32 index) {
     present.swapchainCount = 1;
     present.pSwapchains = &sc.swapchain;
     present.pImageIndices = &image_index;
+    if (!fg) { present.pNext = latency::PresentInfo(nullptr); latency::Presenting(true); }
     r = fg ? VK_SUCCESS : vkQueuePresentKHR(vk.queue, &present);
+    if (!fg) latency::Presenting(false);
     { const double _ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_pt).count(); if(_ms>30)RT_LOG("present step submit+present: %.1f ms",_ms); _pt=std::chrono::steady_clock::now(); }
 
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || (r == VK_SUCCESS && acquired_suboptimal)) {
@@ -910,8 +926,10 @@ void PresentWindowTexture(u64 window, s32 index) {
         static u64 last_gpu = GpuBusyNanoseconds(), last_wait = FenceWaitNanoseconds();
         const u64 gpu = GpuBusyNanoseconds(), wait = FenceWaitNanoseconds();
         extern std::atomic<u64> executor_busy_ns;
+        const double record_ms = executor_busy_ns.exchange(0) / 300e6;
+        cost_gpu = (float)((gpu - last_gpu) / 300e6); cost_record = (float)record_ms; cost_submits = (float)((flushes - last_flushes) / 300.0);
         RT_LOG("presented %llu frames (%.1f fps, %.1f GPU submissions, %.2f ms GPU busy, %.2f ms waiting, %.2f ms recording per frame; worst %.0f ms, %u over 25 ms, %u over 50 ms)", (unsigned long long)sc.frames,
-               300.0 / seconds, (flushes - last_flushes) / 300.0, (gpu - last_gpu) / 300e6, (wait - last_wait) / 300e6, executor_busy_ns.exchange(0) / 300e6, frame_worst_ms, frames_over_25, frames_over_50);
+               300.0 / seconds, (flushes - last_flushes) / 300.0, (gpu - last_gpu) / 300e6, (wait - last_wait) / 300e6, record_ms, frame_worst_ms, frames_over_25, frames_over_50);
         frame_worst_ms = 0; frames_over_25 = frames_over_50 = 0;
         last_gpu = gpu; last_wait = wait;
         last_report = now;

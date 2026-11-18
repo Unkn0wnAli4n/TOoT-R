@@ -17,7 +17,7 @@ struct Settings {
     int preset = PresetOriginal;
     int resolution = 0;      // window size: 0 unchanged, 1 1280x720, 2 1600x900, 3 1920x1080, 4 2560x1440, 5 3840x2160, 6 1280x800, 7 1920x1200, 8 2560x1600, 9 3440x1440
     int display_mode = 0;    // 0 windowed, 1 fullscreen
-    int render_scale = 0;    // the 3D scene's resolution: 0 the game's own dynamic one; else percent of the 1440p picture (35..100; 75 = 1080p), fixed
+    int render_scale = 0;    // the 3D scene's size: 0 the game's own dynamic one (67% with DLSS / FSR); else percent of the output picture (35..100), fixed. 100 with DLSS is DLAA
     int frame_cap = 60;      // frames per second: one of FrameCaps (0: no limit)
     int vsync = 0;           // 0 off, 1 on, 2 adaptive: for a variable refresh rate display (frames held just under its refresh rate)
     int filtering = 0;       // 0 original, 1 bilinear, 2 trilinear, 3..6 anisotropic 2x/4x/8x/16x
@@ -41,7 +41,7 @@ struct Settings {
     int skip_opening = 0;    // 1: a new game starts in Link's house, past the opening's movies (its state is set as the game sets it)
     int hud_edges = 1;       // on a picture wider than 16:9: 1 the HUD's side groups at the screen's edges, 0 in the middle 16:9
     int upscaler = 0;        // what makes the picture from the 3D scene: 0 the game's own network, 1 NVIDIA DLSS (DLAA at Upscaler Quality Native), 3 AMD FSR 3.1, 4 AMD FSR 4, 6 none (a plain stretch), 7 none + FXAA
-    int upscale_quality = 2; // with DLSS or FSR 3.1: the 3D's share of the picture: 0 the Render Resolution row's, 1 native (100%), 2 Quality (67%), 3 Balanced (58%), 4 Performance (50%), 5 Ultra Performance (35%)
+    int upscale_quality = 0; // (older files only: the step of the Upscaler Quality row, now a share on the Render Resolution row - Sanitized)
     int dlss_model = 0;      // DLSS's network: 0 the default (K), 1 K, 2 M, 3 L (Longshot's upscaler_rows.h)
     int frame_gen = 0;       // frames shown for each of the game's: 0 off, 2, 3, 4, 6, 7 dynamic (up to the display's refresh rate)
     int frame_gen_by = 0;    // who makes those frames: 0 auto (NVIDIA DLSS Frame Generation where it runs, else AMD FSR 3.1's), 1 AMD FSR 3.1
@@ -51,6 +51,16 @@ struct Settings {
     int hdr_paper = 200;     // the brightness of the game's white, nits
     int hdr_boost = 50;      // how far highlights are raised towards the peak, percent (0: the SDR picture as it is)
     int cheat_health = 0, cheat_rupees = 0, cheat_magic = 0; // the Cheats tab: hearts stay full; rupees never go down; magic stays full
+    int damage_taken = 1; // the Cheats tab: damage Link takes: 0 half, 1 normal, 2 double, 3 quadruple, 4 none
+    int autosave = 1; // 0: the game's autosaves at map changes are left out (saving by hand still works)
+    int move_speed = 100; // the Hacks tab: Link's walking, running and swimming speed, percent
+    int language = 0; // the game's language (the Game tab; read at start): an index into system.cpp's list, 0 English (US)
+    int fps_corner = 0; // the FPS counter's corner: 0 top left, 1 top right, 2 bottom left, 3 bottom right
+    int text_size = 100; // the Game tab: dialogue, Navi's and signs' text, percent (100 the game's)
+    int low_latency = 0; // the Display tab's Low Latency: 0 off, 1 on, 2 on + boost (NVIDIA Reflex / AMD Anti-Lag 2)
+    int gpu = 0; // the graphics card: 0 the best one found, n the n-th the system lists (read at start)
+    int output_height = 0; // the picture the game draws: 0 its own 2560x1440, else the height (1080, 1800, 2160); read at start
+    int audio_device = 0; // the sound output: 0 the system's default, n the n-th playback device listed (read at start)
     int game_speed = 100;    // the Hacks tab: the game's speed, percent (25..300)
     int occlusion = 0;       // the game's occlusion tests: 0 everything counts as visible (default), 1 counted on the GPU (at start; can flicker)
 };

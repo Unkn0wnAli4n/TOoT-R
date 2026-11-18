@@ -71,6 +71,8 @@ void MouseCamera(const input::Config& cfg, NpadState& state) {
     }
     if (gyro_test) { float gy = 0, gp = 0; std::sscanf(gyro_test, "%f,%f", &gy, &gp); input::GyroTurned(gy * (float)dt, gp * (float)dt); gyro_rate[1] = gy / 57.29578f; gyro_rate[0] = gp / 57.29578f; gyro_rate_ns = now; }
     input::stick_turning = state.rx != 0 || state.ry != 0;
+    input::pad_now[0] = state.lx; input::pad_now[1] = state.ly; input::pad_now[2] = state.rx; input::pad_now[3] = state.ry; input::pad_buttons = state.buttons;
+    if (input::swallow_sticks.load(std::memory_order_relaxed)) { state.lx = state.ly = state.rx = state.ry = 0; state.buttons &= ~(1ULL << input::Up | 1ULL << input::Down | 1ULL << input::B); }
     input::camera_free = !(state.buttons & (1ULL << input::ZR | 1ULL << input::L | 1ULL << input::R));
     const bool aiming = state.buttons & (1ULL << input::ZR | 1ULL << input::L | 1ULL << input::R | 1ULL << input::ZL);
     const bool camera_live = now - input::camera_live_ns.load(std::memory_order_relaxed) < 150'000'000;

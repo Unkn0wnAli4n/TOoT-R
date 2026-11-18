@@ -1,3 +1,5 @@
+#include <memory>
+#include <deque>
 #include <atomic>
 // CPU texel transfers and Vulkan image uploads, using the SDK's mip/layer layout.
 #include <pthread.h>
@@ -21,6 +23,7 @@
 
 using namespace rt;
 namespace nvn {
+std::atomic<u64> first_use_uploads{0}; // (every upload EnsureUploaded makes; UploadTexturesAhead's report takes its own off)
 namespace {
 u16 ToHalf(float value) {
     u32 bits; std::memcpy(&bits, &value, 4);
@@ -91,9 +94,12 @@ struct Staging {
     u64 size = 0;
     explicit Staging(u64 want) {
         auto& vk = Vk();
-        // (sizes rounded up to powers of two past 1 MiB, so blocks fit later requests)
-        size = want <= (1u << 20) ? want : u64(1) << (64 - __builtin_clzll(want - 1));
-        if (size > (1u << 20)) {
+        // (sizes rounded up to powers of two, so blocks fit later requests. Small ones too, since 2026-11-18: under 1 MiB
+        // each upload made a buffer, allocated and mapped its memory - half a millisecond a texture, a third of the time
+        // of the frames in which the game streams a hundred textures in. OOT_STAGING_POOL_MIN=<bytes>: pooled from there.)
+        static const u64 pool_from = std::getenv("OOT_STAGING_POOL_MIN") ? std::strtoull(std::getenv("OOT_STAGING_POOL_MIN"), nullptr, 0) : 0;
+        size = want <= 4096 ? 4096 : u64(1) << (64 - __builtin_clzll(want - 1));
+        if (size > pool_from) {
             std::lock_guard lock{staging_pool_mutex};
             auto it = staging_pool.find(size);
             if (it != staging_pool.end()) {
@@ -118,7 +124,8 @@ struct Staging {
         // Batched copies may still read it: kept or released once the recorded work completes.
         AfterFlush([buffer = buffer, memory = memory, mapped = mapped, size = size] {
             static const u64 cap = (std::getenv("OOT_STAGING_POOL_MB") ? std::strtoull(std::getenv("OOT_STAGING_POOL_MB"), nullptr, 10) : 256) << 20;
-            if (size > (1u << 20)) {
+            static const u64 pool_from = std::getenv("OOT_STAGING_POOL_MIN") ? std::strtoull(std::getenv("OOT_STAGING_POOL_MIN"), nullptr, 0) : 0;
+            if (size > pool_from) {
                 std::lock_guard lock{staging_pool_mutex};
                 if (staging_pooled + size <= cap) { staging_pool.insert({size, StagingBlock{buffer, memory, mapped, size}}); staging_pooled += size; return; }
             }
@@ -486,9 +493,12 @@ void EnsureUploaded(Texture& t) {
         const u32 now = TextureWriteSequence();
         if (now != t.checked_sequence) {
             t.checked_sequence = now;
-            if (TextureMemoryWritten(t.storage, t.storage_size, t.upload_sequence)) { t.uploaded = false; ++cpu_reuploads; }
+            if (TextureMemoryWritten(t.storage, t.storage_size, t.upload_sequence)) { t.uploaded = false; ++cpu_reuploads;
+                static const bool log = std::getenv("OOT_REUPLOAD_LOG") != nullptr; static std::atomic<u32> shown{0};
+                if (log && shown++ < 60) RT_LOG("re-upload (the game wrote it): %ux%u fmt %u levels %u layers %u, %.1f MiB at %#llx, frame %llu", t.width, t.height, t.format, t.levels, t.layers, t.storage_size / 1048576.0, (unsigned long long)t.storage, (unsigned long long)CurrentFrameNumber()); }
         }
     }
+    if (!t.uploaded && !t.gpu_written && t.lost_gpu_image && t.storage_size >= (1ull << 20)) { t.uploaded = true; return; } // (see ReuseOverlapping)
     if (t.uploaded || t.gpu_written) return;
     t.upload_frame = CurrentFrameNumber();
     // Protect first, then read: writes from here on are seen by the next check.
@@ -502,8 +512,63 @@ void EnsureUploaded(Texture& t) {
     }
     const auto t0 = std::chrono::steady_clock::now();
     UploadTexels(t);
+    ++first_use_uploads; // (the report takes the ones made ahead off)
+    {static const bool log = std::getenv("OOT_UPLOAD_AGES") != nullptr; // (diagnostic: how long before its first draw each texture was registered)
+     if (log && t.registered_frame) { static std::atomic<u64> ages[6]; static std::atomic<u64> n{0}; const u64 age = CurrentFrameNumber() - t.registered_frame;
+        ++ages[age == 0 ? 0 : age == 1 ? 1 : age < 4 ? 2 : age < 8 ? 3 : age < 60 ? 4 : 5];
+        if (++n % 200 == 0) RT_LOG("first uploads by frames since registration: same frame %llu, 1: %llu, 2-3: %llu, 4-7: %llu, 8-59: %llu, 60+: %llu", (unsigned long long)ages[0].load(), (unsigned long long)ages[1].load(), (unsigned long long)ages[2].load(), (unsigned long long)ages[3].load(), (unsigned long long)ages[4].load(), (unsigned long long)ages[5].load()); }}
     upload_ns_frame += (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
     ++uploads_frame;
+}
+// ---- textures brought to the GPU ahead of their first draw --------------------------------------------------------------
+// A texture is uploaded when a draw first uses it. The game loads an area's textures well before most of them are seen:
+// turn the camera fast and a hundred or two become visible in one frame, each read from the game's memory, deswizzled
+// and copied - 70 to 340 ms in that frame (the hitches while spinning the camera). The textures the game registers for
+// sampling are now queued, and after each present a few are uploaded within a small time budget, oldest first, a few
+// frames after their registration (the game fills some after it). A draw then finds its texture there. One written by
+// the game after that is uploaded again at its use, as any texture is; with video memory short nothing is done ahead.
+// OOT_PREUPLOAD_MS=<ms a frame> (0: off, the default - see UploadTexturesAhead).
+namespace {
+struct Ahead { std::weak_ptr<Texture> texture; u64 frame; };
+std::mutex ahead_mutex; std::deque<Ahead> ahead_queue; // (the game's threads add, the executor takes)
+std::atomic<u64> ahead_done{0}, ahead_ns{0};
+}
+void QueueUploadAhead(const std::shared_ptr<Texture>& t) {
+    static const bool wanted = std::getenv("OOT_PREUPLOAD_MS") != nullptr || std::getenv("OOT_UPLOAD_AGES") != nullptr;
+    if (!wanted || !t || t->uploaded || t->gpu_written || t->ahead_queued) return;
+    t->ahead_queued = true;
+    t->registered_frame = CurrentFrameNumber();
+    std::lock_guard lock{ahead_mutex};
+    if (ahead_queue.size() < 20000) ahead_queue.push_back({t, CurrentFrameNumber()});
+}
+bool VideoMemoryRoomy();
+void UploadTexturesAhead() {
+    // (OFF unless asked for: measured 2026-11-18 on a 12 GB card in Castle Town it made things worse - the textures brought
+    // early pushed video memory to its limit, where the driver stalls on allocations: slow frames 4-17 -> 28-47)
+    static const double budget_ms = std::getenv("OOT_PREUPLOAD_MS") ? std::atof(std::getenv("OOT_PREUPLOAD_MS")) : 0.0;
+    if (budget_ms <= 0) return;
+    const u64 now = CurrentFrameNumber();
+    {static u64 reported = 0; if (now - reported >= 300) { reported = now; const u64 n = ahead_done.exchange(0), ns = ahead_ns.exchange(0), first = first_use_uploads.exchange(0);
+        if (n || first) { size_t waiting; { std::lock_guard lock{ahead_mutex}; waiting = ahead_queue.size(); }
+            RT_LOG("texture uploads: %llu ahead of their first draw (%.2f ms a frame), %llu at their first draw; %zu waiting", (unsigned long long)n, ns / 300e6, (unsigned long long)(first - std::min(first, n)), waiting); } }}
+    if (!VideoMemoryRoomy()) return; // (only with video memory to spare: a texture brought early is one more held)
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int taken = 0; taken < 64; ++taken) {
+        std::shared_ptr<Texture> t;
+        {
+            std::lock_guard lock{ahead_mutex};
+            if (ahead_queue.empty() || now < ahead_queue.front().frame + 4) break;
+            t = ahead_queue.front().texture.lock(); ahead_queue.pop_front();
+        }
+        // (only what a draw's upload would take: the game's own data, a plain texture with its memory there)
+        if (!t || t->uploaded || t->gpu_written || t->owner_finalized || !t->storage || !t->storage_size || t->samples != 1) continue;
+        const auto range = LookupAddressCpu(t->storage);
+        if (!range.pool || range.available < t->storage_size) continue;
+        EnsureUploaded(*t);
+        ++ahead_done;
+        if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() >= budget_ms) break;
+    }
+    ahead_ns += (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
 }
 void UploadTexelsNow(Texture& t);
 // (large uploads are reported with their time: a 288 MB texture uploaded on first use stalled the executor)
@@ -511,10 +576,12 @@ void UploadTexels(Texture& t) {
     const auto t0 = std::chrono::steady_clock::now();
     UploadTexelsNow(t);
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    if (ms > 30 || t.storage_size > (32ull << 20)) {
+    static const double slow_ms = std::getenv("OOT_UPLOAD_LOG_MS") ? std::atof(std::getenv("OOT_UPLOAD_LOG_MS")) : 30.0;
+    if (ms > slow_ms || t.storage_size > (32ull << 20)) {
         static std::atomic<u32> shown{0};
-        if (shown++ < 40) RT_LOG("texture upload: %ux%u fmt %u levels %u layers %u, %.0f MiB at %#llx, %.0f ms%s", t.width, t.height, t.format, t.levels, t.layers,
-                                 t.storage_size / 1048576.0, (unsigned long long)t.storage, ms, t.gpu_written ? " (GPU-written)" : "");
+        const auto range = LookupAddressCpu(t.storage);
+        if (shown++ < 40) RT_LOG("texture upload: %ux%u fmt %u levels %u layers %u, %.0f MiB at %#llx, %.0f ms%s (texture flags %#x, pool flags %#x)", t.width, t.height, t.format, t.levels, t.layers,
+                                 t.storage_size / 1048576.0, (unsigned long long)t.storage, ms, t.gpu_written ? " (GPU-written)" : "", t.flags, range.pool ? range.pool->flags : 0u);
     }
 }
 void UploadTexelsNow(Texture& t) {
@@ -549,6 +616,34 @@ void UploadTexelsNow(Texture& t) {
     }
     if (BatchTraceOn()) { char note[160]; std::snprintf(note, sizeof note, "[upload %ux%ux%u f%u L%u l%u astc%d bc3%d vk%d]", t.width, t.height, t.depth, t.format, t.levels, t.layers, (int)t.decoded_astc, (int)t.bc3, (int)t.info.vk); BatchTraceNote(note); }
     if (GpuAstc(t)) { UploadAstcOnGpu(t); return; }
+    // A large texture whose memory holds nothing yet (a screen-sized target the game makes and samples before anything
+    // drew into it: 3840x2160, 32 MiB, in Castle Town every few seconds) is cleared, not read, deswizzled and copied:
+    // 22 ms each as an upload. The look for a first non-zero byte ends at once on a texture with contents.
+    if (t.storage && t.storage_size >= (4ull << 20) && t.info.block_w == 1 && !t.decoded_astc) {
+        const auto range = LookupAddressCpu(t.storage);
+        if (range.pool && range.available >= t.storage_size) {
+            const u64* w = reinterpret_cast<const u64*>(range.cpu_address); const u64 n = t.storage_size / 8;
+            // (a render target - the texture's and its memory pool's COMPRESSIBLE flags - is never written by the game's
+            // CPU code: what its memory holds here is not a picture. In Castle Town a 3840x2160 one was "uploaded" 10 to
+            // 30 times in 20 s of turning, 22 ms each: most of the hitches left there. OOT_UPLOAD_TARGETS=1: as before.)
+            static const bool upload_targets = std::getenv("OOT_UPLOAD_TARGETS") != nullptr;
+            const bool target = !upload_targets && (t.flags & 0x8) && (range.pool->flags & 0x80);
+            const bool depth = t.info.depth || t.info.stencil; // (a depth target: only as a target, never by its memory's look)
+            u64 i = 0; if (!target && !depth) while (i < n && !w[i]) ++i;
+            if (target || (!depth && i == n)) {
+                Immediate([&](VkCommandBuffer cmd) {
+                    Transition(cmd, t, VK_IMAGE_LAYOUT_GENERAL);
+                    const VkImageSubresourceRange all{AspectOf(t), 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+                    if (depth) { const VkClearDepthStencilValue none{0.f, 0}; vkCmdClearDepthStencilImage(cmd, t.image, t.layout, &none, 1, &all); return; }
+                    VkClearColorValue zero{}; if (t.decoded_rgb9e5) zero.float32[3] = 1.0f; // (RGB9E5 kept as RGBA16F: its alpha reads 1)
+                    vkCmdClearColorImage(cmd, t.image, t.layout, &zero, 1, &all);
+                });
+                t.uploaded = true;
+                static std::atomic<u32> told{0}; if (told++ < 5) RT_LOG("texture %ux%u fmt %u (%.0f MiB): %s, cleared instead of uploaded", t.width, t.height, t.format, t.storage_size / 1048576.0, target ? "a render target the GPU has not drawn yet" : "its memory is empty");
+                return;
+            }
+        }
+    }
     std::vector<VkBufferImageCopy> copies;
     u64 linear_size = 0;
     for (u32 level = 0; level < t.levels; ++level) {

@@ -66,6 +66,7 @@ void AudioStubLog(const char* name) {
 } // namespace
 static int master_volume_percent() { return gfx::Current().mute_background && !gfx::window_focused.load(std::memory_order_relaxed) ? 0 : gfx::Current().volume; } // (the settings window's Volume; used by output_frame)
 
+static int oot_audio_device_choice() { return gfx::Current().audio_device; }
 #include "audio_hookshot.inc"
 #include "audio_stubs.inc"
 

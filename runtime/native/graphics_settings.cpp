@@ -28,7 +28,7 @@ constexpr Field fields[] = {
     {"show_fps", &Settings::show_fps}, {"ai_upscaler", &Settings::ai_upscaler}, {"volume", &Settings::volume},
     {"anti_aliasing", &Settings::anti_aliasing}, {"aspect", &Settings::aspect}, {"shadow_quality", &Settings::shadow_quality},
     {"foliage_shadows", &Settings::foliage_shadows}, {"fov", &Settings::fov}, {"text_speed", &Settings::text_speed},
-    {"camera_speed", &Settings::camera_speed}, {"mute_background", &Settings::mute_background}, {"occlusion", &Settings::occlusion}, {"probe_rate", &Settings::probe_rate}, {"skip_opening", &Settings::skip_opening}, {"hud_edges", &Settings::hud_edges}, {"hdr", &Settings::hdr}, {"upscaler", &Settings::upscaler}, {"dlss_model", &Settings::dlss_model}, {"upscale_quality", &Settings::upscale_quality}, {"cheat_health", &Settings::cheat_health}, {"cheat_rupees", &Settings::cheat_rupees}, {"cheat_magic", &Settings::cheat_magic}, {"game_speed", &Settings::game_speed}, {"frame_gen", &Settings::frame_gen}, {"frame_gen_by", &Settings::frame_gen_by}, {"smooth_motion", &Settings::smooth_motion}, {"hdr_peak", &Settings::hdr_peak}, {"hdr_paper", &Settings::hdr_paper}, {"hdr_boost", &Settings::hdr_boost},
+    {"camera_speed", &Settings::camera_speed}, {"mute_background", &Settings::mute_background}, {"occlusion", &Settings::occlusion}, {"probe_rate", &Settings::probe_rate}, {"skip_opening", &Settings::skip_opening}, {"hud_edges", &Settings::hud_edges}, {"hdr", &Settings::hdr}, {"upscaler", &Settings::upscaler}, {"dlss_model", &Settings::dlss_model}, {"upscale_quality", &Settings::upscale_quality}, {"cheat_health", &Settings::cheat_health}, {"cheat_rupees", &Settings::cheat_rupees}, {"cheat_magic", &Settings::cheat_magic}, {"game_speed", &Settings::game_speed}, {"audio_device", &Settings::audio_device}, {"output_height", &Settings::output_height}, {"gpu", &Settings::gpu}, {"low_latency", &Settings::low_latency}, {"text_size", &Settings::text_size}, {"fps_corner", &Settings::fps_corner}, {"language", &Settings::language}, {"move_speed", &Settings::move_speed}, {"autosave", &Settings::autosave}, {"damage_taken", &Settings::damage_taken}, {"frame_gen", &Settings::frame_gen}, {"frame_gen_by", &Settings::frame_gen_by}, {"smooth_motion", &Settings::smooth_motion}, {"hdr_peak", &Settings::hdr_peak}, {"hdr_paper", &Settings::hdr_paper}, {"hdr_boost", &Settings::hdr_boost},
 };
 
 void Save(const Settings& s) {
@@ -53,7 +53,7 @@ Settings Sanitized(Settings s) {
     s.handheld = s.handheld ? 1 : 0;
     s.upscaling = std::clamp(s.upscaling, 0, 3);
     s.sharpness = std::clamp(s.sharpness / 25 * 25, 0, 200);
-    s.show_fps = s.show_fps ? 1 : 0;
+    s.show_fps = std::clamp(s.show_fps, 0, 3);
     s.ai_upscaler = std::clamp(s.ai_upscaler, 0, 2);
     s.volume = std::clamp((s.volume + 5) / 10 * 10, 0, 100);
     // (one Upscaler row since 2026-11-17: 0 the game's own, 1 NVIDIA DLSS, 3 AMD FSR 3.1, 4 AMD FSR 4, 6 none (a plain
@@ -63,6 +63,12 @@ Settings Sanitized(Settings s) {
     s.anti_aliasing = 0;
     if (s.upscaler == 2) { s.upscaler = 1; s.upscale_quality = 1; }
     if (s.upscaler == 5) { s.upscaler = 4; s.upscale_quality = 1; }
+    // (one Render Resolution row since 2026-11-18: Upscaler Quality's steps are shares of it - Native 100, Quality 67,
+    // Balanced 58, Performance 50, Ultra Performance 35. An older file's step becomes that share where DLSS or FSR is
+    // the upscaler; with the game's own upscaler the Render Resolution it had stays.)
+    if (s.upscale_quality > 0 && (s.upscaler == 1 || s.upscaler == 3 || s.upscaler == 4)) { static constexpr int share[] = {0, 100, 67, 58, 50, 35}; s.render_scale = share[std::clamp(s.upscale_quality, 1, 5)]; }
+    s.upscale_quality = 0;
+
     s.smooth_motion = 0; // (the row is gone: Frame Generation is the one way)
     s.aspect = std::clamp(s.aspect, 0, 6);
     if (s.shadow_quality) s.shadow_quality = std::clamp(s.shadow_quality / 8 * 8, 512, 3072);
@@ -75,7 +81,7 @@ Settings Sanitized(Settings s) {
     s.skip_opening = s.skip_opening ? 1 : 0;
     s.hud_edges = s.hud_edges ? 1 : 0;
     s.frame_gen = s.frame_gen == 2 || s.frame_gen == 3 || s.frame_gen == 4 || s.frame_gen == 6 || s.frame_gen == 7 ? s.frame_gen : 0; s.smooth_motion = s.smooth_motion ? 1 : 0;
-    s.cheat_health = !!s.cheat_health; s.cheat_rupees = !!s.cheat_rupees; s.cheat_magic = !!s.cheat_magic; s.game_speed = std::clamp(s.game_speed, 25, 300);
+    s.cheat_health = !!s.cheat_health; s.cheat_rupees = !!s.cheat_rupees; s.cheat_magic = !!s.cheat_magic; s.game_speed = std::clamp(s.game_speed, 25, 300); s.audio_device = std::clamp(s.audio_device, 0, 16); s.output_height = std::clamp(s.output_height, 0, 4320); s.gpu = std::clamp(s.gpu, 0, 8); s.low_latency = std::clamp(s.low_latency, 0, 2); s.text_size = std::clamp(s.text_size, 100, 175); s.fps_corner = std::clamp(s.fps_corner, 0, 3); s.language = std::clamp(s.language, 0, 15); s.move_speed = std::clamp(s.move_speed, 100, 400); s.autosave = std::clamp(s.autosave, 0, 1); s.damage_taken = std::clamp(s.damage_taken, 0, 4);
     s.upscaler = std::clamp(s.upscaler, 0, 7); s.dlss_model = std::clamp(s.dlss_model, 0, 3); s.upscale_quality = std::clamp(s.upscale_quality, 0, 5);
     s.hdr = s.hdr ? 1 : 0; s.hdr_peak = std::clamp(s.hdr_peak, 300, 4000); s.hdr_paper = std::clamp(s.hdr_paper, 80, 500); s.hdr_boost = std::clamp(s.hdr_boost, 0, 100);
     s.probe_rate = s.probe_rate >= 4 ? 4 : s.probe_rate >= 2 ? 2 : 1;
@@ -101,7 +107,7 @@ Settings PresetValues(int preset) {
     s.upscaling = current.upscaling; s.sharpness = current.sharpness; // (and how it is filled)
     s.display_mode = current.display_mode;
     s.show_fps = current.show_fps; s.ai_upscaler = current.ai_upscaler; s.volume = current.volume; // (and what is not about quality)
-    s.aspect = current.aspect; s.fov = current.fov; s.text_speed = current.text_speed; s.camera_speed = current.camera_speed; s.mute_background = current.mute_background; s.occlusion = current.occlusion; s.skip_opening = current.skip_opening; s.hud_edges = current.hud_edges; s.hdr = current.hdr; s.upscaler = current.upscaler; s.dlss_model = current.dlss_model; s.upscale_quality = current.upscale_quality; s.cheat_health = current.cheat_health; s.cheat_rupees = current.cheat_rupees; s.cheat_magic = current.cheat_magic; s.game_speed = current.game_speed; s.frame_gen = current.frame_gen; s.frame_gen_by = current.frame_gen_by; s.smooth_motion = current.smooth_motion; s.hdr_peak = current.hdr_peak; s.hdr_paper = current.hdr_paper; s.hdr_boost = current.hdr_boost;
+    s.aspect = current.aspect; s.fov = current.fov; s.text_speed = current.text_speed; s.camera_speed = current.camera_speed; s.mute_background = current.mute_background; s.occlusion = current.occlusion; s.skip_opening = current.skip_opening; s.hud_edges = current.hud_edges; s.hdr = current.hdr; s.upscaler = current.upscaler; s.dlss_model = current.dlss_model; s.upscale_quality = current.upscale_quality; s.cheat_health = current.cheat_health; s.cheat_rupees = current.cheat_rupees; s.cheat_magic = current.cheat_magic; s.game_speed = current.game_speed; s.audio_device = current.audio_device; s.output_height = current.output_height; s.gpu = current.gpu; s.low_latency = current.low_latency; s.text_size = current.text_size; s.fps_corner = current.fps_corner; s.language = current.language; s.move_speed = current.move_speed; s.autosave = current.autosave; s.damage_taken = current.damage_taken; s.frame_gen = current.frame_gen; s.frame_gen_by = current.frame_gen_by; s.smooth_motion = current.smooth_motion; s.hdr_peak = current.hdr_peak; s.hdr_paper = current.hdr_paper; s.hdr_boost = current.hdr_boost;
     switch (preset) {
     case PresetLow:    s.handheld = 1; s.frame_cap = 30; s.filtering = 1; s.texture_detail = 1; s.texture_memory = 1; s.render_scale = 50; s.upscaler = 7; s.shadow_quality = 1024; s.foliage_shadows = 0; break;
     case PresetMedium: s.handheld = 1; s.frame_cap = 60; s.filtering = 2; s.texture_detail = 2; s.texture_memory = 1; break;
@@ -150,8 +156,8 @@ void Load() {
 
 bool TemporalUpscaler() { return current.upscaler == 1 || current.upscaler == 3 || current.upscaler == 4; }
 int EffectiveRenderScale() {
-    static constexpr int share[] = {0, 100, 67, 58, 50, 35};
-    if (TemporalUpscaler() && current.upscale_quality > 0) return share[current.upscale_quality];
+    // (DLSS and FSR draw from a fixed size: the game's own dynamic resolution is not theirs to follow - Quality's 67%)
+    if (TemporalUpscaler() && !current.render_scale) return 67;
     return current.render_scale;
 }
 float LodBias() {

@@ -8,6 +8,7 @@ namespace nvn::ls {
 void Start();                               // once the device exists: Longshot's `dev` filled in
 mkwvk::Texture* Texture(nvn::Texture& t);   // the chain's view of one of this renderer's textures (as it is now)
 void TextureGone(const nvn::Texture* t);    // (texture.cpp, when one is destroyed)
+void SceneDepth(const nvn::Texture* depth); // the depth texture the chain now holds (the last scene draw's)
 void SyncOptions();
 // Frames between the picture before and this one (color: RGBA8, GENERAL, w x h) into out[0..count): NVIDIA DLSS Frame
 // Generation where it runs, AMD FSR 3.1's frame interpolation otherwise. How many were made (0: none).

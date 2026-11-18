@@ -18,8 +18,10 @@
 
 #include "../ops.h"
 #include "../rt.h"
+#include "../addresses.h"
 #include "graphics_settings.h"
 #include "input_settings.h"
+#include "debug_tools.h"
 #include "dlss_math.h"   // (third_party/longshot-upscale)
 #include "vk_temporal.h"
 namespace nvn { u64 CurrentFrameNumber(); }
@@ -59,7 +61,7 @@ void ScaleApply(Cpu* c) {
 // w23: the cascades' size this frame, rounded to a multiple of 8 (1600 as shipped); x19: the shadow object.
 void ShadowSize(Cpu* c) {
     const int choice = gfx::Current().shadow_quality;
-    if (!choice || !Readable(c->x[19]) || Load<u64>(c->x[19]) != Main + 0x4b8a0a8) return; // (the sun's shadow object only)
+    if (!choice || !Readable(c->x[19]) || Load<u64>(c->x[19]) != OOT_AT(0x4b8a0a8)) return; // (the sun's shadow object only)
     const u32 size = (u32)c->x[23];
     if (size < 64) return;
     const u32 game = 1600; // (the game's own level: smaller choices lower it, larger ones raise it)
@@ -77,13 +79,14 @@ void FieldOfView(Cpu* c) {
     if (percent == 100 || !Readable(camera)) return;
     const u64 views = Load<u64>(camera + 0x18);
     const u64 view = Readable(views) ? Load<u64>(views + 8) : 0;
-    if (!Readable(view) || Load<u64>(view) != Main + 0x4bf8a88) return; // sead::LookAtCamera
-    const u64 singleton = Load<u64>(Main + 0x4c86bc0);
+    if (!Readable(view) || Load<u64>(view) != OOT_AT(0x4bf8a88)) return; // sead::LookAtCamera
+    if (!OOT_AT(0x4c86bc0) || !OOT_AT(0x4c7e090)) return;
+    const u64 singleton = Load<u64>(OOT_AT(0x4c86bc0));
     const u64 manager = Readable(singleton) ? Load<u64>(singleton) : 0;
     const u64 cameras = Readable(manager) && Load<u32>(manager + 32) ? Load<u64>(manager + 40) : 0;
     const u64 main_camera = Readable(cameras) ? Load<u64>(cameras) : 0;
     if (!Readable(main_camera) || Load<u64>(main_camera + 120) != view) return;
-    const u64 event_singleton = Load<u64>(Main + 0x4c7e090);
+    const u64 event_singleton = Load<u64>(OOT_AT(0x4c7e090));
     const u64 events = Readable(event_singleton) ? Load<u64>(event_singleton) : 0;
     if (Readable(events) && Load<u64>(events + 104)) return;
     float angle = LowFloat(c->v[0]);
@@ -113,9 +116,15 @@ const Wide& WideValues() {
         else if (choice == 2) { oot_ensure_window(); r = gfx::display_ratio.load(); }
         else if (choice == 3) r = 16.0 / 10.0; else if (choice == 4) r = 43.0 / 18.0; else if (choice == 5) r = 32.0 / 9.0; else if (choice == 6) r = 4.0 / 3.0;
         const double game = 16.0 / 9.0;
-        if (!(r > 1.2) || (r < game * 1.01 && r > game * 0.99)) return w;
+        // (the Output Resolution row: the picture's height, 1440 as the game ships; OOT_OUTPUT_HEIGHT for a run)
+        const char* he = std::getenv("OOT_OUTPUT_HEIGHT");
+        int height = he && *he ? std::atoi(he) : gfx::Current().output_height;
+        if (height < 720 || height > 4320) height = 1440;
+        const bool own_shape = !(r > 1.2) || (r < game * 1.01 && r > game * 0.99);
+        if (own_shape && height == 1440) return w;
+        if (own_shape) r = game;
         r = std::min(r, 48.0 / 9.0);
-        unsigned oh = 1440, ow = (unsigned)(oh * r / 8 + 0.5) * 8;
+        unsigned oh = (unsigned)height / 8 * 8, ow = (unsigned)(oh * r / 8 + 0.5) * 8;
         const unsigned sh = oh * 3 / 4, sw = (unsigned)(ow * 0.75 / 8 + 0.5) * 8;
         w.out = (u64)oh << 32 | ow; w.scene = (u64)sh << 32 | sw; w.ratio = (float)ow / (float)oh;
         w.squeeze = (float)std::min(1.0, game / ((double)ow / oh)); w.margin = (1.0f - w.squeeze) / 2.0f;
@@ -124,6 +133,44 @@ const Wide& WideValues() {
         RT_LOG("widescreen: picture %ux%u, scene %ux%u, camera ratio %.4f, HUD scale %.3f x %.3f", ow, oh, sw, sh, w.ratio, w.qx, w.qy);
         return w; }();
     return wide;
+}
+// ---- the Output Resolution row (a picture of another height than the game's 1440) ----------------------------------------
+// What has to follow the picture's size, as Longshot found (nx2/oot_patches.py OUT_EDITS, host/nn_applet.c
+// hos_rt_pool_size): the 3D's largest size (above it the game takes a smaller upscale network: 1280 x 720 at 4K), the
+// render targets' pool (0x13100000 bytes, sized for 2560 x 1440: a 4K picture ran out of it and the next target came
+// back null) with the Graphics heap that holds it, the module budget that heap is counted against, and the heap made
+// of the Graphics heap's rest, which keeps its shipped size.
+u32 OutW() { const u64 o = WideValues().out; return o ? (u32)o : 2560; }
+u32 OutH() { const u64 o = WideValues().out; return o ? (u32)(o >> 32) : 1440; }
+u64 PoolSize() { // (the render targets' pool for this picture: by its pixels, never under 512 MiB once it is grown)
+    constexpr u64 game = 0x13100000;
+    const u64 px = (u64)OutW() * OutH();
+    if (px <= 2560ull * 1440) return game;
+    static const u64 size = [px] {
+        const char* e = std::getenv("OOT_RT_POOL_MB");
+        u64 v = e ? std::strtoull(e, nullptr, 0) << 20 : std::max<u64>((game * px / (2560 * 1440) + 0xfffff) & ~0xfffffull, 512ull << 20);
+        if (!e && px > 3840ull * 2160) v = std::min<u64>(v, 900ull << 20);
+        RT_LOG("output resolution: render target pool %llu MiB (the game's %llu MiB)", (unsigned long long)(v >> 20), (unsigned long long)(game >> 20));
+        return v; }();
+    return size;
+}
+u64 PoolGrowth() { return PoolSize() - 0x13100000ull; }
+void OutputSite(Cpu* c, int id) {
+    if (OutH() == 1440 && id != 104 && id != 105) return;
+    switch (id) {
+    case 101: c->x[24] = (u32)((u64)(u32)c->x[24] * OutW() / 2560); c->x[25] = (u32)((u64)(u32)c->x[25] * OutH() / 1440); break;
+    case 102: { const float f = (float)(OutW() * 3 / 4); u32 b; std::memcpy(&b, &f, 4); c->x[8] = b; break; }
+    case 103: { const float f = (float)(OutH() * 3 / 4); u32 b; std::memcpy(&b, &f, 4); c->x[8] = b; break; }
+    case 104: if (PoolGrowth() && Readable(c->x[19]) && Load<u64>(c->x[19] + 1464) == 0x13100000ull) Store<u64>(c->x[19] + 1464, PoolSize()); break;
+    case 105: if (const u64 g = PoolGrowth()) { const u64 budget = Readable(c->x[21]) ? Load<u64>(c->x[21] + (c->x[22] << 3)) : 0;
+                  if ((budget == 0x34900000ull || budget == 0x348ffe20ull) && c->x[0] > g) c->x[0] -= g; } break;
+    case 106: if (Readable(c->x[20]) && Load<u32>(c->x[20] + 8) == 2560) { Store<u32>(c->x[20] + 8, OutW()); Store<u32>(c->x[20] + 12, OutH()); } break;
+    }
+}
+void OutputHeap(Cpu* c, u64 target, bool graphics) {
+    const u64 g = PoolGrowth();
+    if (g) { if (graphics) { if (c->x[0] == 0x34900000ull || c->x[0] == 0x348ffe20ull) c->x[0] += g; } else if (c->x[0] > g) c->x[0] -= g; }
+    (rt_call)(c, target);
 }
 void WideRatio(Cpu* c, int vreg, int base) { // (a ratio just loaded: 16:9 becomes the picture's; with base, stored back at +0xb0)
     const Wide& w = WideValues();
@@ -140,7 +187,7 @@ void WideHud(Cpu* c) { // (the 2D canvas's projection rows in q1 and q4; the can
     if (row0[0] != 2.0f / 3840.0f || row1[1] != 2.0f / 2160.0f || !Readable(c->x[0] - 0x1b8)) return;
     const u64 table = Load<u64>(c->x[0] - 0x1b8);
     // (screens that cover the whole picture: the item wheel's and the pause menu's backgrounds, the event and loading fades)
-    const u32 bit = table == Main + 0x4bed098 ? 1u : table == Main + 0x4be4fb0 ? 2u : table == Main + 0x4be61c8 ? 4u : table == Main + 0x4be7b30 ? 8u : table == Main + 0x4bef4a0 ? 1u : 0u;
+    const u32 bit = table == OOT_AT(0x4bed098) ? 1u : table == OOT_AT(0x4be4fb0) ? 2u : table == OOT_AT(0x4be61c8) ? 4u : table == OOT_AT(0x4be7b30) ? 8u : table == OOT_AT(0x4bef4a0) ? 1u : 0u;
     if (bit & w.keep) return;
     for (float& v : row0) v *= w.qx;
     for (float& v : row1) v *= w.qy;
@@ -388,6 +435,136 @@ void VoiceWritten(Cpu* c, u64 target) {
     if (have && now != seen && !(c->x[0] & 1)) { c->x[0] |= 1; RT_LOG("voice language: the saved option is applied"); }
     seen = now; have = true;
 }
+
+// ---- text size (the Game tab's Text Size) -----------------------------------------------------------------------------------
+// x19 at site 5: a LetterAnimControl (the text panes that reveal their letters: dialogue, Navi, signs). Its +0x28 is the
+// game's pane wrapper, whose +0x28 and +0x38 are the diagonal of the text's 2D scale (0.8 each for dialogue). Each keeps
+// the game's own value, taken again whenever the game writes it, and gets that value times the row's scale; at 100% a
+// field never scaled is left alone and one scaled before gets the game's value back. (Longshot's host/oot_text_size.c.)
+void TextSize(u64 control) {
+    const float scale = gfx::Current().text_size / 100.0f;
+    const u64 wrapper = Readable(control) ? Load<u64>(control + 0x28) : 0;
+    if (!Readable(wrapper) || !Load<u64>(wrapper + 8)) return;
+    struct Field { u64 at; u32 game, written, seen; };
+    static Field kept[64]; static u32 tick = 0; static std::mutex mutex;
+    std::lock_guard lock{mutex};
+    ++tick;
+    for (const u32 offset : {0x28u, 0x38u}) {
+        const u64 at = wrapper + offset;
+        const u32 now = Load<u32>(at);
+        Field* f = nullptr; Field* oldest = &kept[0];
+        for (Field& k : kept) { if (k.at == at) { f = &k; break; } if (k.seen < oldest->seen) oldest = &k; }
+        if (!f) { if (scale == 1.0f) continue; f = oldest; f->at = at; f->game = f->written = now; }
+        f->seen = tick;
+        if (now != f->written) f->game = now; // (the game wrote it since)
+        float own; std::memcpy(&own, &f->game, 4);
+        const float v = own * scale; std::memcpy(&f->written, &v, 4);
+        if (f->written != now) Store<u32>(at, f->written);
+    }
+}
+
+// ---- above 60 frames a second ----------------------------------------------------------------------------------------------
+// The engine steps by 60 / its frame rate (present.cpp writes the measured rate): 0.42 of a frame at 144 fps. Most of the
+// game follows the step; these places need whole 60 Hz frames. What each is and why was found by Longshot (nx2/
+// oot_patches.py patch_whole_frames, patch_sound_job, patch_bgm_time, patch_bgm_flags, patch_solver_steps,
+// patch_turn_rate, patch_movie_frames; host/oot_high_fps.h, frame_whole.h); the code is this runtime's.
+namespace highfps {
+std::mutex mutex;
+float StepNow() { if (!OOT_AT(0x4d41fc8)) return 1.0f; const float s = Load<float>(OOT_AT(0x4d41fc8)); return std::isfinite(s) ? s : 1.0f; } // (the engine's global step)
+bool Partial(float step) { return step > 0.0f && step < 0.999f; }
+
+// Counters that add the step (or the step times a whole number) cut to whole frames: (int)0.42 is 0 every frame, and the
+// counter never moves: the rupee count above Link's head stays, water rings stand still, the day's clock stops above 120
+// fps (and runs slow below), the Scarecrow's Song waits on one note, the Deku Tree's web stays rigid. Each counter keeps
+// the part the cut dropped, so it moves at the game's rate at every frame rate. At a step of 1 this changes nothing.
+struct Carry { u64 at; float rest; u32 used; };
+Carry carries[64]; u32 calls = 0;
+u32 Whole(u64 at, float amount) {
+    if (!(amount > 0.0f)) return 0;
+    if (amount >= 2147483648.0f) return 0x7fffffffu;
+    std::lock_guard lock{mutex};
+    ++calls;
+    Carry* slot = nullptr; Carry* oldest = &carries[0];
+    for (Carry& k : carries) { if (k.at == at) { slot = &k; break; } if (k.used < oldest->used) oldest = &k; }
+    if (!slot) { slot = oldest; slot->at = at; slot->rest = 0.0f; }
+    slot->used = calls;
+    const float sum = slot->rest + amount;
+    const u32 whole = (u32)sum;
+    slot->rest = sum - (float)whole;
+    return whole;
+}
+void WholeSite(Cpu* c, int reg, u64 at) { c->x[reg] = Whole(at, LowFloat(c->v[0])); }
+
+// The physics solver's steps, (int)(step * the steps of a 60 Hz frame + 0.001): rounded up while the step is a part of a
+// frame, at least 1, never under the game's own: a solver step then never covers more time than at 60 fps, and Link stays
+// on moving platforms.
+void SolverSteps(Cpu* c) {
+    const float scaled = LowFloat(c->v[0]) - 0.001f, per_frame = LowFloat(c->v[1]);
+    if (!(scaled > 0.0f) || !(per_frame > 0.0f) || !(scaled < per_frame) || per_frame > 1000.0f) return;
+    const s32 game = (s32)(u32)c->x[1];
+    const s32 steps = std::max(1, (s32)std::ceil(scaled - 0.1f));
+    if (steps > game) c->x[1] = (u32)steps;
+}
+
+// The sound manager's job (its phase in w2; phase 0 hands the step to the sound engine, whose fades, delays and ramps
+// count updates of at least one whole step). Fed parts of a step, sounds are not released when an area unloads, the voices
+// in use climb until the budget is full, and new sounds, then the music, stop until a restart. While the step is a part
+// of a frame the job runs at 60 Hz: phase 0 adds the step up and runs once a whole one is there, with a step of 1; the
+// other phases follow that frame's choice.
+float part = 0.0f; bool run = true;
+u64 flags_at = 0; u8 held = 0, flags_run = 0;
+bool SoundGate(Cpu* c) { // true: the job returns at once
+    const u32 phase = (u32)c->x[2];
+    float step = 1.0f;
+    if (phase == 0) {
+        const u64 object = OOT_AT(0x4c7e890) ? Load<u64>(OOT_AT(0x4c7e890)) : 0;
+        const u64 time = Readable(object) ? Load<u64>(object) : 0;
+        if (Readable(time)) step = Load<float>(time + 0x10);
+    }
+    std::lock_guard lock{mutex};
+    if (phase == 0) {
+        if (!(step > 0.0f)) { part = 0.0f; run = true; }
+        else if (step >= 0.999f) run = true;
+        else { part += step; run = part >= 1.0f; if (run) part -= 1.0f; }
+        static u64 n = 0, ran = 0; ran += run;
+        if (++n % 3600 == 0) { RT_LOG("sound job: ran in %llu of the last 3600 frames (step %.3f)", (unsigned long long)ran, step); ran = 0; }
+    }
+    // (the music manager's change flags of a frame the job is held: what its update would have read now)
+    if (!run && flags_at && Readable(flags_at)) held |= Load<u8>(flags_at);
+    return !run;
+}
+void SoundStep(V128& v) { if (Partial(LowFloat(v))) SetLowFloat(v, 1.0f); }
+// The music manager (run by that job, so at 60 Hz too) reads the step and the frame's seconds itself: a whole step and
+// that step's seconds while the job is held to whole steps (handed the part, its clock ran at 60 / fps of the real one).
+void MusicTime(Cpu* c) {
+    const float step = LowFloat(c->v[8]);
+    if (!Partial(step)) return;
+    SetLowFloat(c->v[9], LowFloat(c->v[9]) / step);
+    SetLowFloat(c->v[8], 1.0f);
+}
+// It also reads a byte of change flags the battle manager sets for one frame; the frames the job was held are kept
+// (SoundGate) and read with the next run's: the battle music ends after a fight at every frame rate.
+void MusicBegin() { std::lock_guard lock{mutex}; flags_run = held; held = 0; }
+void MusicFlags(Cpu* c) { { std::lock_guard lock{mutex}; flags_at = c->x[26] + 2200; } c->x[8] |= flags_run; }
+
+// The steering update clamps the saved turn rate to the turn's size times the step, but the turn is scaled by the step
+// already: a rate-limited update keeps rate * step * step, and above 60 fps Gohma circles the ceiling without reaching
+// her next point. While the step is a part of a frame both bounds are the turn back as a rate (divided, not multiplied).
+// Here s1 = turn * b and s0 = turn * step were just computed (the step in s8).
+void TurnRate(Cpu* c) {
+    const float step = LowFloat(c->v[8]);
+    if (!(step > 0.0f) || !(step < 1.0f)) return;
+    const float turn = LowFloat(c->v[0]) / step;
+    if (!std::isfinite(turn) || turn == 0.0f) return;
+    const float b = LowFloat(c->v[1]) / turn;
+    if (std::isfinite(b) && b != 0.0f) SetLowFloat(c->v[1], turn / b);
+    SetLowFloat(c->v[0], turn / step);
+}
+
+// The movie player counts its updates, and a cutscene with a movie places its narration, rumble and end by that count:
+// above 60 fps they ran ahead of the picture. The count grows by the frames' time. (w8: the count plus one.)
+void MovieFrames(Cpu* c) { c->x[8] = (u32)((u32)c->x[8] - 1 + Whole(c->x[20] + 760, StepNow())); }
+} // namespace highfps
 } // namespace
 
 extern "C" void oot_site(Cpu* c, int id) {
@@ -396,7 +573,7 @@ extern "C" void oot_site(Cpu* c, int id) {
     case 2: if (oot_fixed_resolution) c->x[8] &= ~0x18ull; break;
     case 3: ShadowSize(c); break;
     case 4: FieldOfView(c); break;
-    case 5: ScaleLowFloat(c, gfx::Current().text_speed); break;
+    case 5: ScaleLowFloat(c, gfx::Current().text_speed); TextSize(c->x[19]); break;
     case 40: case 41: case 42: case 43: ScaleLowFloat(c, gfx::Current().camera_speed); break;
     case 6: case 7: if (const u64 size = WideValues().out) c->x[8] = size; break;
     case 8: if (const u64 size = WideValues().scene) c->x[8] = size; break;
@@ -417,6 +594,28 @@ extern "C" void oot_site(Cpu* c, int id) {
     case 62: UpscalerJitter(c, 19, 20); break;
     case 63: UpscalerJitter(c, 26, -1); break;
     case 64: UpscalerJitter(c, -1, 6); break;
+    case 70: highfps::WholeSite(c, 12, c->x[19] + 864); break;
+    case 71: highfps::WholeSite(c, 9, c->x[21]); break;
+    case 72: highfps::WholeSite(c, 8, c->x[19] + 60); break;
+    case 73: case 75: highfps::WholeSite(c, 8, c->x[19] + 0x265fc); break;
+    case 74: highfps::WholeSite(c, 8, c->x[9]); break;
+    case 76: highfps::WholeSite(c, 22, c->x[19] + 2296); break;
+    case 77: case 78: highfps::SolverSteps(c); break;
+    case 79: highfps::SoundStep(c->v[0]); break;
+    case 80: highfps::MusicTime(c); break;
+    case 81: case 82: case 83: case 84: highfps::MusicFlags(c); break;
+    case 85: highfps::TurnRate(c); break;
+    case 86: highfps::MovieFrames(c); break;
+    case 87: tools::Life(c, true); break;
+    case 88: tools::Life(c, false); break;
+    case 89: case 90: tools::Speed(c, c->x[0], false); break;
+    case 91: tools::Speed(c, c->x[0], true); break;
+    case 95: tools::PlayerUpdate(c, c->x[19]); break;
+    case 96: tools::FlightPose(c, c->x[19], c->x[25]); break;
+    case 97: tools::FlightRotation(c, c->x[0], c->x[1]); break;
+    case 98: tools::FreeView(c, c->x[20]); break;
+    case 101: case 102: case 103: case 104: case 105: case 106: OutputSite(c, id); break;
+    case 100: break; // (the scene buffer's format: for a native HDR picture, not used yet)
     default: break;
     }
 }
@@ -425,6 +624,8 @@ extern "C" void oot_call(Cpu* c, unsigned long long target, int id) {
     case 30: case 31: CpuAlloc(c, target); break;
     case 32: case 33: GpuAlloc(c, target); break;
     case 34: VoiceWritten(c, target); break;
+    case 35: OutputHeap(c, target, true); break;
+    case 36: OutputHeap(c, target, false); break;
     default: (rt_call)(c, target); break;
     }
 }
@@ -564,7 +765,7 @@ void Find(Hit& h, float x, float y) {
     }
 }
 bool SetFocus(Cpu* c, u64 screen, u64 button) {
-    static const GuestFn fn = rt::LookupFunction(Main + 0x86ffc0);
+    static const GuestFn fn = rt::LookupFunction(OOT_AT(0x86ffc0));
     if (!fn) { static bool told = false; if (!told) { told = true; RT_LOG("menus: the focus setter is not in this build: the mouse only clicks"); } return false; }
     const Cpu saved = *c;
     c->x[0] = screen; c->x[1] = button; c->x[2] = 0; c->x[30] = 0;
@@ -772,6 +973,10 @@ extern "C" bool oot_fn(Cpu* c, int id) {
     case 50: MouseCameraHook(c->x[0]); return false;
     case 60: menu::Focused(c->x[0], c->x[1]); return false;
     case 61: menu::Tick(c, c->x[0]); return false;
+    case 92: tools::Speed(c, c->x[0], true); return false;
+    case 99: return tools::SaveRequest(c);
+    case 93: return highfps::SoundGate(c);
+    case 94: highfps::MusicBegin(); return false;
     // Site 56: the camera's turn back behind Link as he walks (its follow state's movement path) is left out when the
     // Auto-centre Camera row is Off: x25 gets the parameter base that path would restore, and the game goes on where
     // the camera's other yaw paths meet (Longshot's patch_camera_centering). Pitch, collision and Z-targeting stay.

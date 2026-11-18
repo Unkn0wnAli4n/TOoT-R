@@ -17,6 +17,8 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "program.h"
+#include "latency.h"
 #include "../../native.h"
 #include "commands.h"
 #include "batch.h"
@@ -656,7 +658,7 @@ Step ExecuteFrom(const CommandList& list, size_t& index, size_t end, std::vector
             wait = w; ++index;
             return Step::Wait;
         }
-        case Op::QueuePresent: PresentWindowTexture(x[0], (s32)x[1]); break;
+        case Op::QueuePresent: PresentWindowTexture(x[0], (s32)x[1]); UploadTexturesAhead(); latency::FrameDone(); break; // (the driver's low latency pacing: no lock held here)
         case Op::ResetCounter: if (FrameLogged()) RT_LOG("counter reset %llu", (unsigned long long)x[0]); ResetRenderCounter((u32)x[0]); break;
         // CPU-visible signals land once the GPU work recorded before them has completed.
         case Op::FenceSync: {
@@ -801,7 +803,14 @@ NVN_COMMAND(DrawArraysIndirect)
 NVN_COMMAND(DrawElementsIndirect)
 NVN_COMMAND(DispatchCompute)
 NVN_COMMAND(DispatchComputeIndirect)
-NVN_COMMAND(BindProgram)
+// (the host's program is taken now, on the game's thread: the executor runs this later, when the game may have ended the
+// program object or made another in its place - a map change ends hundreds. program.cpp keeps ended programs.)
+NATIVE("nvnCommandBufferBindProgram") {
+    const u64 object = c->x[1];
+    c->x[1] = object ? reinterpret_cast<u64>(HostProgram(object)) : 0;
+    Record(c, Op::BindProgram);
+    c->x[1] = object;
+}
 NVN_COMMAND(BindUniformBuffer)
 NVN_COMMAND(BindStorageBuffer)
 NVN_COMMAND(BindVertexBuffer)

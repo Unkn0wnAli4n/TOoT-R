@@ -109,6 +109,7 @@ NATIVE("nvnTexturePoolRegisterTexture") {
     const u32 id = (u32)c->x[1];
     if (id >= pool->entries.size()) Fatal("texture id %u outside pool of %zu", id, pool->entries.size());
     pool->entries[id] = TextureBinding{c->x[2], c->x[3] ? ReadView(c->x[3]) : TextureView{}, false,TextureReference(c->x[2])};
+    nvn::QueueUploadAhead(pool->entries[id].host);
 }
 NATIVE("nvnTexturePoolRegisterImage") {
     nvn::binding_generation.fetch_add(1, std::memory_order_relaxed);

@@ -4,6 +4,7 @@
 // replaced at the nn:: level (see native/), so SendSyncRequest reaching here is a missing override.
 
 #ifdef __linux__
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -1164,7 +1165,17 @@ void rt_svc(Cpu* c, u32 imm) {
             ++seen[{c->x[30], ns < 1000000 ? ns : ns / 100000 * 100000}];
             if (++n % 3000 == 0) { for (auto& [k, v] : seen) if (v > 20) RT_LOG("sleep %.4f ms from %s: %llu", k.second / 1e6, DescribeAddress(k.first).c_str(), (unsigned long long)v); seen.clear(); } }
         if (ns <= 0) std::this_thread::yield();
-        else std::this_thread::sleep_for(std::chrono::nanoseconds(ns));
+        else {
+#ifdef __linux__
+            // (the game's job system waits for its workers in a loop of two yields and a 20 microsecond sleep, main +
+            // 0x7a478; Linux rounds a sleep up by the thread's timer slack, 50 microseconds, so a turn takes 75. Making
+            // the sleeps exact - OOT_TIMER_SLACK_NS=1000 - changed no frame rate (measured 2026-11-18: the main thread
+            // only waits there, for the renderer), and wakes the thread three times as often: left as the system has it)
+            static thread_local bool set = false;
+            if (!set) { set = true; if (const char* e = std::getenv("OOT_TIMER_SLACK_NS")) prctl(PR_SET_TIMERSLACK, std::strtoul(e, nullptr, 10), 0, 0, 0); }
+#endif
+            std::this_thread::sleep_for(std::chrono::nanoseconds(ns));
+        }
         return;
     }
     case 0x0C: { // GetThreadPriority

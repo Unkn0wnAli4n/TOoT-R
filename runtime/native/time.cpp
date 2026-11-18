@@ -7,6 +7,7 @@
 #include <chrono>
 #include <ctime>
 
+#include "../addresses.h"
 #include "../native.h"
 
 using namespace rt;
@@ -146,6 +147,6 @@ NATIVE("_ZN2nn4time48CalculateStandardUserSystemClockDifferenceByUserERKNS0_13Cl
 u64 rt_cntpct();
 namespace nvn { extern std::atomic<u64> graphics_module; }
 NATIVE("_ZN2nn2os13GetSystemTickEv") {
-    if (c->x[30] == 0x80346c770ULL) nvn::graphics_module.store(c->x[19], std::memory_order_relaxed);
+    if (c->x[30] == OOT_AT(0x346c770)) nvn::graphics_module.store(c->x[19], std::memory_order_relaxed);
     Ret(c, rt_cntpct());
 }

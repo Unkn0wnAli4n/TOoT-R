@@ -12,10 +12,13 @@
 #include <SDL3/SDL_vulkan.h>
 
 #include "vk.h"
+#include "latency.h"
 #include "vk_dlss.h" // (third_party/longshot-upscale)
 #include "shader_compiler.h"
 
 namespace nvn {
+std::vector<std::string> gpu_names;
+const std::vector<std::string>& GpuNames() { return gpu_names; } // (for the settings window)
 namespace {
 
 void CreateInstance(VulkanContext& vk) {
@@ -79,10 +82,17 @@ void PickDevice(VulkanContext& vk) {
     std::vector<VkPhysicalDevice> devices(count);
     vkEnumeratePhysicalDevices(vk.instance, &count, devices.data());
     int best_score = -1;
+    // (the Display tab's Graphics Card row: the n-th device the system lists; OOT_GPU=<n> for a run. Otherwise a card of
+    // its own before a processor's graphics before a software renderer.)
+    const char* env = std::getenv("OOT_GPU");
+    const int chosen = env && *env ? std::atoi(env) : gfx::Current().gpu;
+    int index = 0;
     for (VkPhysicalDevice d : devices) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(d, &p);
-        const int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 1 : 0;
+        gpu_names.push_back(p.deviceName);
+        int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 1 : 0;
+        if (++index == chosen) score = 100;
         if (score > best_score) {
             best_score = score;
             vk.physical = d;
@@ -366,6 +376,7 @@ void CreateDevice(VulkanContext& vk) {
     }
     if (vk.placed_maps) { placed.pNext = features.pNext; features.pNext = &placed; }
     if (vk.cooperative_matrix) { coop.pNext = features.pNext; features.pNext = &coop; }
+    latency::DeviceExtensions(vk.physical, extensions, available, features);
     VkDeviceCreateInfo info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     info.pNext = &features;
     info.queueCreateInfoCount = 1;

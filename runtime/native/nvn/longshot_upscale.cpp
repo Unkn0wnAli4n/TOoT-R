@@ -199,21 +199,23 @@ mkwvk::Texture* Texture(nvn::Texture& t) {
     slot->samples = (VkSampleCountFlagBits)std::max(1u, t.samples); slot->usage = t.usage; slot->owner = &t;
     return slot.get();
 }
+// The chain keeps one texture between frames' steps: the scene's depth, from the draw that named it to the upscale
+// (render.cpp LsNoteDraw tells which). Only that one's end makes it skip the frame. Every depth texture's end used to:
+// the game ends two dozen render targets a frame, depth targets among them, and each end between the scene's draws and
+// the upscale made the chain skip, which the game's own upscale then drew - a one-frame change of the whole picture,
+// 143 to 202 times in 35 s of turning in Castle Town.
+static const nvn::Texture* held_depth = nullptr; // (texture_mutex)
+void SceneDepth(const nvn::Texture* depth) { std::lock_guard lock{texture_mutex}; held_depth = depth; }
 void TextureGone(const nvn::Texture* t) {
-    // (the chain keeps the scene's depth texture between the draw that named it and the upscale: only a texture it was
-    // handed counts. Any depth texture's end used to - shadow maps come and go - and each made the chain skip a frame,
-    // which the game's own upscale drew: a one-frame change of the whole picture now and then.)
     std::lock_guard lock{texture_mutex};
-    const auto it = textures.find(t);
-    if (it == textures.end()) return;
-    if (it->second->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) mkwvk::destroy_generation.fetch_add(1, std::memory_order_relaxed);
-    textures.erase(it);
+    if (t == held_depth) { held_depth = nullptr; mkwvk::destroy_generation.fetch_add(1, std::memory_order_relaxed); }
+    textures.erase(t);
 }
 void SyncOptions() {
     const gfx::Settings& g = gfx::Current();
     // (Longshot's Upscaler row: 0 game, 1 DLSS, 2 DLAA, 3 FSR 3.1, 4 FSR 4, 5 FSR 4 Native AA. Here DLAA and the native AA are
     // DLSS and FSR 4 at Upscaler Quality's Native)
-    const bool native = g.upscale_quality == 1;
+    const bool native = gfx::EffectiveRenderScale() >= 100; // (the Render Resolution row at 100%)
     mkwvk::opts.dlss = g.upscaler == 1 ? (native ? 2 : 1) : g.upscaler == 3 ? 3 : g.upscaler == 4 ? (native ? 5 : 4) : 0;
     mkwvk::opts.dlss_model = g.dlss_model;
     // (Longshot's rows: Frame generation 0 off, 2.. a multiplier; Frame generation by 0 DLSS FG, 1 built-in, 2 FSR 3.1 FG)

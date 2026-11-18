@@ -1,4 +1,6 @@
 #ifdef __linux__
+#include <string>
+#include <algorithm>
 #include <cstdio>
 #include <sys/mman.h>
 #endif
@@ -60,8 +62,17 @@ NATIVE("_ZN2nn2oe17GetDisplayVersionEPNS0_14DisplayVersionE") {
     std::strcpy(out, "1.0.1");
 }
 NATIVE("_ZN2nn2oe18GetDesiredLanguageEv") {
+    // (settings::LanguageCode is the string packed in a u64. The Game tab's Game Language row, read once: the game
+    // asks at start. The order is that row's; OOT_LANGUAGE=<code> for a run.)
+    static const char* const codes[] = {"en-US", "en-GB", "fr", "fr-CA", "de", "it", "es", "es-419", "pt-BR", "nl", "pl", "ru", "ja", "ko", "zh-Hans", "zh-Hant"};
+    static const std::string chosen = [] {
+        const char* env = std::getenv("OOT_LANGUAGE");
+        std::string code = env && *env && std::strlen(env) < 8 ? env : codes[std::clamp(gfx::Current().language, 0, 15)];
+        RT_LOG("game language: %s", code.c_str());
+        return code;
+    }();
     u64 code = 0;
-    std::memcpy(&code, "en-US", 5); // settings::LanguageCode is the string packed in a u64
+    std::memcpy(&code, chosen.data(), chosen.size());
     Ret(c, code);
 }
 NATIVE("_ZN2nn2oe20GetCurrentFocusStateEv") { Ret(c, 1); } // in focus

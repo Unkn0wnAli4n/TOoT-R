@@ -42,6 +42,9 @@ struct Texture : std::enable_shared_from_this<Texture> {
     VkImageUsageFlags usage = 0;
     bool gpu_written = false; // rendered to: contents live on the host GPU
     bool uploaded = false;
+    bool lost_gpu_image = false; // (its image, drawn by the GPU, was let go while idle: a new one has nothing to upload)
+    bool ahead_queued = false; // (texture_data.cpp: queued once for an upload ahead of its first draw)
+    u64 registered_frame = 0;  // (when the game registered it for sampling)
     u64 upload_frame = 0; // (OOT_REUPLOAD_TEXTURES diagnostic)
     u64 used_frame = 0; // (the frame EnsureImage last ran for it)
     u32 upload_sequence = 0, checked_sequence = 0; // CPU-write tracking (ArmTextureMemory)
@@ -61,6 +64,8 @@ struct Texture : std::enable_shared_from_this<Texture> {
 Texture* HostTexture(u64 object);
 void InstallTexture(u64 object,Texture* texture); // transfers ownership to the guest object
 std::shared_ptr<Texture> TextureReference(u64 object);
+void QueueUploadAhead(const std::shared_ptr<Texture>& t); // (texture_data.cpp) a texture the game registered for sampling
+void UploadTexturesAhead();                              // (the executor, after each present)
 void FinalizeTexture(u64 object);
 VkImageAspectFlags AspectOf(const Texture& t);
 // Records a layout transition of the whole texture.

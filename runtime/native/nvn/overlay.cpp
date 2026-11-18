@@ -19,11 +19,14 @@
 #include "imgui_impl_sdl3.h"
 #include "imgui_impl_vulkan.h"
 
+#include "../../platform.h"
+#include "../debug_tools.h"
 #include "../graphics_settings.h"
 #include "../input_settings.h"
 
 bool ReadRomFile(const std::string& path, std::vector<unsigned char>& out); // fs.cpp
 
+namespace nvn { void VideoMemoryNow(u64* used, u64* budget); const std::vector<std::string>& GpuNames(); }
 namespace nvn::overlay {
 namespace {
 
@@ -90,6 +93,12 @@ std::vector<u8> GameFont(const char* file) {
 // Each row is one member of gfx::Settings and the values it can take; `quality`: changing it makes the preset Custom.
 struct Choice { const char* name; int value; };
 struct Row { const char* section; const char* label; int gfx::Settings::*member; std::vector<Choice> choices; const char* help; bool quality; bool restart; };
+std::vector<Choice> GpuChoices() { static std::deque<std::string> names; std::vector<Choice> c{{"Automatic", 0}};
+    int n = 0; for (const std::string& name : nvn::GpuNames()) { names.push_back(name); c.push_back({names.back().c_str(), ++n}); if (n == 8) break; } return c; }
+std::vector<Choice> AudioChoices() { static std::deque<std::string> names; std::vector<Choice> c{{"System default", 0}};
+    int count = 0; SDL_AudioDeviceID* list = SDL_WasInit(SDL_INIT_AUDIO) ? SDL_GetAudioPlaybackDevices(&count) : nullptr;
+    for (int i = 0; list && i < count && i < 16; ++i) { const char* n = SDL_GetAudioDeviceName(list[i]); names.push_back(n ? n : "Device"); c.push_back({names.back().c_str(), i + 1}); }
+    SDL_free(list); return c; }
 std::vector<Choice> Percents(std::initializer_list<int> values) { static std::deque<std::string> names; std::vector<Choice> c;
     for (int v : values) { names.push_back(std::to_string(v) + "%"); c.push_back({names.back().c_str(), v}); } return c; }
 const std::vector<Row>& Rows() {
@@ -109,6 +118,8 @@ const std::vector<Row>& Rows() {
         {"Display", "VSync", &S::vsync, {{"Off", 0}, {"On", 1}, {"Adaptive (VRR)", 2}}, "On waits for the display: no tearing, a little more input delay. Adaptive is for a variable refresh rate display (G-Sync, FreeSync) with VRR switched on in the system: every frame is shown whole the moment it is ready, and the frame rate is held just under the display's top rate so it never has to wait.", false, false},
         {"Display", "Frame Generation", &S::frame_gen, {{"Off", 0}, {"2x", 2}, {"3x", 3}, {"4x", 4}, {"6x", 6}, {"Dynamic", 7}},
          "Shows frames made between the game's own: 2x shows two for each frame the game draws, and so on; Dynamic makes as many as reach your display's refresh rate. NVIDIA DLSS Frame Generation makes them where it runs (an RTX 40 or newer card with DLSS as the Upscaler), AMD FSR 3.1's everywhere else. They are made from the scene's depth and motion, so it works in play and pauses in menus and movies. Never more frames than your display shows. Motion looks smoother at the price of one frame of extra delay. Best with the game at a steady 30 or more.", false, false},
+        {"Display", "Graphics Card", &S::gpu, GpuChoices(), "The graphics card the game draws with, on a PC with more than one. Automatic takes a card of its own before a processor's built-in graphics. Takes effect after a restart.", false, true},
+        {"Display", "Low Latency", &S::low_latency, {{"Off", 0}, {"On", 1}, {"On + Boost", 2}}, "NVIDIA Reflex on NVIDIA cards, AMD Anti-Lag 2 on AMD cards whose driver has it: the driver starts each frame's work as late as it can, so less time passes between a button and the picture - most while the GPU is the limit. Boost (Reflex only) also keeps the GPU at full speed. Not with Frame Generation. Does nothing on other GPUs.", false, false},
         {"Display", "HDR", &S::hdr, {{"Off", 0}, {"On", 1}},
          "Shows the picture in high dynamic range on a display and system with HDR switched on: the game's picture at the Paper White brightness, its highlights raised towards the display's peak. The game itself draws a standard picture; this widens it. Without an HDR display nothing changes.", false, false},
         {"Display", "HDR Peak Brightness", &S::hdr_peak, {{"400 nits", 400}, {"600 nits", 600}, {"800 nits", 800}, {"1000 nits", 1000}, {"1500 nits", 1500}, {"2000 nits", 2000}}, "The brightest your display can show. Too high a value clips the brightest highlights.", false, false},
@@ -116,17 +127,18 @@ const std::vector<Row>& Rows() {
         {"Display", "HDR Highlights", &S::hdr_boost, {{"Off", 0}, {"25%", 25}, {"50%", 50}, {"75%", 75}, {"100%", 100}}, "How strongly the brightest parts of the picture are raised above paper white. Off shows the game's picture unchanged, only in the HDR signal.", false, false},
         {"Display", "Frame Rate Cap", &S::frame_cap, {{"15", 15}, {"20", 20}, {"30", 30}, {"40", 40}, {"45", 45}, {"60", 60}, {"90", 90}, {"120", 120}, {"144", 144}, {"165", 165}, {"240", 240}, {"Uncapped", 0}},
          "The most frames shown per second. The game keeps its normal speed at every cap. 40 suits a Steam Deck set to 40 Hz or 80 Hz.", true, false},
-        {"Display", "FPS Counter", &S::show_fps, {{"Off", 0}, {"On", 1}}, "Shows the frame rate and frame time in the top left corner.", false, false},
+        {"Display", "FPS Counter", &S::show_fps, {{"Off", 0}, {"On", 1}, {"With Graph", 2}, {"With Details", 3}}, "Shows the frame rate and frame time. With Graph adds the last frames' times as a plot (a flat line is a smooth game); With Details adds what a frame costs the GPU and the renderer, and the video memory in use.", false, false},
+        {"Display", "FPS Counter Position", &S::fps_corner, {{"Top Left", 0}, {"Top Right", 1}, {"Bottom Left", 2}, {"Bottom Right", 3}}, "The corner the FPS counter sits in.", false, false},
 
         {"Resolution and anti-aliasing", "Quality Profile", &S::handheld, {{"Console", 0}, {"Handheld", 1}}, "Handheld is the game's own lower-detail profile, as the console uses undocked. Takes effect after a restart.", true, true},
+        {"Resolution and anti-aliasing", "Output Resolution", &S::output_height, {{"1080p", 1080}, {"1440p (game's own)", 0}, {"1800p", 1800}, {"4K (2160p)", 2160}},
+         "The size of the picture the game draws, before it is fitted to the window. 4K is sharper on a 4K display and costs the GPU about twice as much as 1440p; 1080p costs about half. The 3D scene follows it (Render Resolution is a share of this size). Takes effect after a restart.", true, true},
         {"Resolution and anti-aliasing", "Upscaler", &S::upscaler, {{"Game's own (neural)", 0}, {"NVIDIA DLSS", 1}, {"AMD FSR 3.1", 3}, {"AMD FSR 4", 4}, {"None (plain stretch)", 6}, {"None + FXAA", 7}},
-         "What makes the full picture from the 3D scene, and smooths its edges. Game's own is the game's neural network. NVIDIA DLSS needs an RTX card and an installation with NVIDIA DLSS added; AMD FSR 3.1 runs on any GPU; AMD FSR 4 needs AMD's FSR 4 library for Vulkan on this PC. None leaves the network out for the fastest picture, with jagged edges, or with the fast FXAA filter. Where the chosen one cannot run, the game's own is used. Upscaler Quality's Native step turns DLSS into DLAA.", false, false},
-        {"Resolution and anti-aliasing", "Upscaler Quality", &S::upscale_quality, {{"Native (100%)", 1}, {"Quality (67%)", 2}, {"Balanced (58%)", 3}, {"Performance (50%)", 4}, {"Ultra Performance (35%)", 5}, {"Custom (Render Resolution)", 0}},
-         "With DLSS or FSR 3.1: how large the 3D scene is drawn before the upscaler fills the picture from it. Quality looks closest to native; Performance and Ultra Performance are much lighter on the GPU. Native is DLAA with DLSS (or FSR's native anti-aliasing): the sharpest. Custom uses the Render Resolution row.", false, false},
+         "What makes the full picture from the 3D scene, and smooths its edges. Game's own is the game's neural network. NVIDIA DLSS needs an RTX card and an installation with NVIDIA DLSS added; AMD FSR 3.1 runs on any GPU; AMD FSR 4 needs AMD's FSR 4 library for Vulkan on this PC. None leaves the network out for the fastest picture, with jagged edges, or with the fast FXAA filter. Where the chosen one cannot run, the game's own is used. Render Resolution at 100% turns DLSS into DLAA.", false, false},
         {"Resolution and anti-aliasing", "DLSS Model", &S::dlss_model, {{"Transformer (K)", 0}, {"Transformer 2 (M)", 1}, {"Transformer 2 (L)", 2}, {"NVIDIA default", 3}},
          "The network DLSS and DLAA run. K is DLSS 4's; M and L are DLSS 4.5's second-generation transformer (L the heavier one).", false, false},
-        {"Resolution and anti-aliasing", "Render Resolution", &S::render_scale, {{"Game's dynamic", 0}, {"1440p (native)", 100}, {"1080p", 75}, {"900p", 62}, {"810p", 56}, {"720p", 50}, {"630p", 44}, {"540p", 38}},
-         "With the game's own upscaler or None (or Upscaler Quality at Custom): the 3D scene's resolution before it is upscaled to the 1440p picture; the HUD and text stay sharp. The game's own setting moves between these by the GPU's load, up to 1080p. A fixed lower value is the largest single saving on a slow GPU; 1440p is sharper than the game ever draws.", true, false},
+        {"Resolution and anti-aliasing", "Render Resolution", &S::render_scale, {{"Game's dynamic", 0}, {"100% (Native / DLAA)", 100}, {"75%", 75}, {"67% (Quality)", 67}, {"58% (Balanced)", 58}, {"50% (Performance)", 50}, {"44%", 44}, {"35% (Ultra Performance)", 35}},
+         "How large the 3D scene is drawn, as a share of the Output Resolution, before the Upscaler fills the picture from it; the HUD and text stay sharp. With DLSS or FSR these are their quality steps, and 100% is DLAA (or FSR's native anti-aliasing): the sharpest. Lower values are the largest single saving on a slow GPU. Game's dynamic lets the game move the size by the GPU's load, up to 75%, with its own upscaler; DLSS and FSR draw at 67% there.", true, false},
         {"Resolution and anti-aliasing", "Sharpness", &S::sharpness, {{"Off", 0}, {"25%", 25}, {"50%", 50}, {"75%", 75}, {"100%", 100}, {"125%", 125}, {"150%", 150}, {"200%", 200}}, "Sharpens the finished picture. DLSS, DLAA and FSR give a softer picture than the game's own upscaler: 75% to 125% suits them. Above 100% edges may show light halos.", false, false},
 
         {"Detail", "Shadow Quality", &S::shadow_quality, {{"Game's (1600)", 0}, {"Lowest (512)", 512}, {"Low (768)", 768}, {"Medium (1024)", 1024}, {"High (2200)", 2200}, {"Highest (3072)", 3072}},
@@ -144,12 +156,19 @@ const std::vector<Row>& Rows() {
         {"Game", "Camera Speed", &S::camera_speed, Percents({50, 75, 100, 125, 150, 200, 250, 300}), "How fast the right stick turns the camera.", false, false},
         {"Game", "Text Speed", &S::text_speed, {{"Normal", 100}, {"Fast", 200}, {"Faster", 400}, {"Instant", 1000}}, "How fast dialogue text appears.", false, false},
 
+        {"Game", "Text Size", &S::text_size, Percents({100, 110, 125, 150, 175}), "How large dialogue, Navi's and signs' text is drawn.", false, false},
+        {"Game", "Game Language", &S::language, {{"English (US)", 0}, {"English (UK)", 1}, {"French (France)", 2}, {"French (Canada)", 3}, {"German", 4}, {"Italian", 5}, {"Spanish (Spain)", 6}, {"Spanish (Latin America)", 7}, {"Portuguese (Brazil)", 8}, {"Dutch", 9}, {"Polish", 10}, {"Russian", 11}, {"Japanese", 12}, {"Korean", 13}, {"Chinese (Simplified)", 14}, {"Chinese (Traditional)", 15}},
+         "The language of the game's text. The voices' language is the game's own option. Takes effect after a restart.", false, true},
         {"Game", "Skip Opening", &S::skip_opening, {{"Off", 0}, {"On", 1}}, "A new game starts with Link awake in his house: the opening's two movies are not played. Everything the opening sets is still set. Later cutscenes are not affected.", false, false},
 
-        {"Cheats", "Infinite Health", &S::cheat_health, {{"Off", 0}, {"On", 1}}, "Link's hearts are filled again every frame. A hit that would take all of them at once still does.", false, false},
+        {"Cheats", "Infinite Health", &S::cheat_health, {{"Off", 0}, {"On", 1}}, "Link's hearts stay full: no hit takes any of them.", false, false},
         {"Cheats", "Infinite Rupees", &S::cheat_rupees, {{"Off", 0}, {"On", 1}}, "Rupees never go down: spending them gives them back.", false, false},
         {"Cheats", "Infinite Magic", &S::cheat_magic, {{"Off", 0}, {"On", 1}}, "The magic meter stays full.", false, false},
+        {"Cheats", "Damage Taken", &S::damage_taken, {{"None", 4}, {"Half", 0}, {"Normal", 1}, {"Double", 2}, {"Quadruple", 3}}, "How much of Link's life a hit takes. None: no hit takes any, and his hearts stay full. Half rounds up, so the smallest hit still hurts. Healing is never changed.", false, false},
+        {"Cheats", "Autosave", &S::autosave, {{"Off", 0}, {"On", 1}}, "Off leaves out the saves the game makes by itself when Link changes maps. Saving from the game's menu still works.", false, false},
+        {"Hacks", "Movement Speed", &S::move_speed, Percents({100, 125, 150, 200, 300, 400}), "How fast Link walks, runs and swims while you steer him. Scenes that walk him keep their pace.", false, false},
         {"Hacks", "Game Speed", &S::game_speed, Percents({25, 50, 75, 100, 125, 150, 200, 300}), "How fast the game itself runs: slow motion below 100%, fast forward above. Sound keeps its own speed.", false, false},
+        {"Audio", "Sound Output", &S::audio_device, AudioChoices(), "The playback device the game's sound goes to. Takes effect after a restart.", false, true},
         {"Audio", "Volume", &S::volume, Percents({0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100}), "The game's master volume.", false, false},
         {"Audio", "Mute in Background", &S::mute_background, {{"Off", 0}, {"On", 1}}, "No sound while another window has the focus.", false, false},
     };
@@ -427,6 +446,90 @@ template <typename Wanted> void SettingRows(Wanted&& wanted, const char*& help) 
     end_table();
 }
 
+// The Cheats tab's tools (debug_tools.cpp): each button leaves a request the game's own thread carries out at Link's
+// next update, so they work only in play.
+void ToolRows(const char*& help) {
+    if (!tools::Available()) { ImGui::TextDisabled("Teleport, time, age, inventory, flight and the free camera are not available for this version of the game."); return; }
+    const bool playing = tools::InGame();
+    const auto hint = [&](const char* text) { if (ImGui::IsItemHovered() || ImGui::IsItemFocused()) help = text; };
+    if (ImGui::CollapsingHeader("World", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (!playing) ImGui::TextDisabled("These work while Link can move (a save loaded, no menu or cutscene).");
+        ImGui::BeginDisabled(!playing);
+        const std::string map = tools::Map(); const int age = tools::Age();
+        ImGui::Text("Map: %s   Link: %s", map.empty() ? "-" : map.c_str(), age < 0 ? "-" : age ? "adult" : "child");
+        static int destination = 0, hour = 12;
+        const auto& places = tools::Destinations();
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.6f);
+        if (ImGui::BeginCombo("##destination", places[destination])) {
+            for (int i = 0; i < (int)places.size(); ++i) if (ImGui::Selectable(places[i], i == destination)) destination = i;
+            ImGui::EndCombo();
+        }
+        hint("Where Teleport takes Link: the map's usual entrance, for the age he is now.");
+        ImGui::SameLine();
+        if (ImGui::Button("Teleport", ImVec2(-FLT_MIN, 0))) tools::AskTeleport(destination);
+        hint("Loads the chosen map the way an entrance does. One teleport every 8 seconds; not while a cutscene or a map change runs.");
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.6f);
+        ImGui::SliderInt("##hour", &hour, 0, 23, "%02d:00");
+        hint("The hour Set Time moves the world's clock to.");
+        ImGui::SameLine();
+        if (ImGui::Button("Set Time", ImVec2(-FLT_MIN, 0))) tools::AskTime(hour);
+        hint("Sets the time of day.");
+        if (ImGui::Button(age == 1 ? "Become the Child" : "Become the Adult", ImVec2(-FLT_MIN, 0))) tools::AskAge();
+        hint("Switches Link's age, as the Temple of Time does, and loads the map he is in for that age (the Market where the map has none). Items of the other age stay in the inventory.");
+        ImGui::EndDisabled();
+    }
+    if (ImGui::CollapsingHeader("Movement", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::BeginDisabled(!playing);
+        ImGui::Checkbox("Flight (no clip)", &tools::flight);
+        hint("Link flies through everything: the left stick moves him, D-pad up and down change his height, B is faster. Off at every start.");
+        ImGui::SameLine();
+        ImGui::Checkbox("Free Camera", &tools::free_camera);
+        hint("The camera leaves Link: the left stick moves it, the right stick turns it, D-pad up and down change its height, B is faster. Link stands still meanwhile.");
+        const float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+        if (ImGui::Button("Mark This Place", ImVec2(half, 0))) tools::AskMark();
+        hint("Remembers where Link stands, for Return to the Mark (in this map, until it is left).");
+        ImGui::SameLine();
+        if (ImGui::Button("Return to the Mark", ImVec2(half, 0))) tools::AskReturn();
+        hint("Puts Link back at the marked place.");
+        ImGui::EndDisabled();
+    }
+    if (ImGui::CollapsingHeader("Inventory")) {
+        ImGui::BeginDisabled(!playing);
+        const auto& items = tools::Items();
+        const char* section = nullptr; bool table = false;
+        for (int i = 0; i < (int)items.size(); ++i) {
+            if (!section || std::strcmp(section, items[i].section)) {
+                if (table) { ImGui::EndTable(); table = false; }
+                section = items[i].section;
+                ImGui::SeparatorText(section);
+                table = ImGui::BeginTable(section, 2, ImGuiTableFlags_SizingStretchSame);
+            }
+            if (!table) continue;
+            ImGui::TableNextColumn();
+            ImGui::PushID(i);
+            const int count = tools::ItemCount(i);
+            if (items[i].kind) {
+                ImGui::AlignTextToFramePadding();
+                ImGui::Text("%s: %s", items[i].label, count < 0 ? "-" : std::to_string(count).c_str());
+                ImGui::SameLine();
+                if (ImGui::SmallButton("-10")) tools::AskItem(i, -10);
+                ImGui::SameLine(); if (ImGui::SmallButton("-1")) tools::AskItem(i, -1);
+                ImGui::SameLine(); if (ImGui::SmallButton("+1")) tools::AskItem(i, 1);
+                ImGui::SameLine(); if (ImGui::SmallButton("+10")) tools::AskItem(i, 10);
+            } else {
+                bool have = count > 0;
+                if (ImGui::Checkbox(items[i].label, &have)) tools::AskItem(i, 0);
+            }
+            hint("Gives or takes away an item through the game's own inventory, so the game's limits apply (a bag's size, one mask at a time).");
+            ImGui::PopID();
+        }
+        if (table) ImGui::EndTable();
+        ImGui::EndDisabled();
+    }
+    const std::string said = tools::LastMessage();
+    if (!said.empty()) ImGui::TextWrapped("%s", said.c_str());
+}
+
 void Window(bool appeared) {
     const float scale = ImGui::GetStyle().FramePadding.y / 3.0f;
     const ImVec2 display = ImGui::GetIO().DisplaySize;
@@ -446,9 +549,14 @@ void Window(bool appeared) {
             ImGui::EndChild();
             ImGui::EndTabItem();
         };
+        // (a game version other than the tested one: what the build did not find in it - <data>/missing-features.txt)
+        static const std::string lacking = [] { std::string all; if (FILE* f = std::fopen((rt::DataDir() + "/missing-features.txt").c_str(), "r")) {
+            char line[160]; while (std::fgets(line, sizeof line, f)) { std::string l = line; while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back(); if (!l.empty()) all += (all.empty() ? "" : "; ") + l; }
+            std::fclose(f); } return all; }();
+        if (!lacking.empty()) ImGui::TextWrapped("This version of the game is not the tested one. Not available in it: %s.", lacking.c_str());
         page("Graphics", [&] { SettingRows([](const char* section) { return std::strcmp(section, "Game") && std::strcmp(section, "Audio") && std::strcmp(section, "Cheats") && std::strcmp(section, "Hacks"); }, help); });
         page("Game", [&] { SettingRows([](const char* section) { return !std::strcmp(section, "Game") || !std::strcmp(section, "Audio"); }, help); });
-        page("Cheats", [&] { SettingRows([](const char* section) { return !std::strcmp(section, "Cheats"); }, help); });
+        page("Cheats", [&] { SettingRows([](const char* section) { return !std::strcmp(section, "Cheats"); }, help); ToolRows(help); });
         page("Hacks", [&] { SettingRows([](const char* section) { return !std::strcmp(section, "Hacks"); }, help); });
         page("Controller", [&] { ControllerTab(help); });
         page("Keyboard & Mouse", [&] { KeyboardTab(help); });
@@ -464,16 +572,37 @@ void Window(bool appeared) {
 }
 
 // The FPS counter: a corner of the picture, no input. (ImGui's own average of the last frames.)
+// The FPS counter (the Display rows FPS Counter and FPS Counter Position): the rate and frame time; with Graph the last
+// 240 frame times as a plot; with Details also what a frame costs and the video memory in use.
 void Counter() {
     const float scale = ImGui::GetStyle().FramePadding.y / 3.0f;
-    ImGui::SetNextWindowPos(ImVec2(12 * scale, 12 * scale));
+    const int level = gfx::Current().show_fps, corner = gfx::Current().fps_corner;
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const float pad = 12 * scale;
+    ImGui::SetNextWindowPos(ImVec2(corner & 1 ? display.x - pad : pad, corner & 2 ? display.y - pad : pad), ImGuiCond_Always, ImVec2(corner & 1 ? 1.0f : 0.0f, corner & 2 ? 1.0f : 0.0f));
     ImGui::SetNextWindowBgAlpha(0.45f);
+    static float times[240]; static int at = 0;
+    const float dt_ms = ImGui::GetIO().DeltaTime * 1000.0f;
+    times[at] = dt_ms; at = (at + 1) % 240;
     if (ImGui::Begin("##fps", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
                                           ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs)) {
         const float fps = ImGui::GetIO().Framerate;
         // (with frame generation: the rate shown on the display first, then the game's own)
         if (const float shown = nvn::ShownFps(); shown > fps * 1.2f) ImGui::Text("%.0f fps  (game %.0f, %.1f ms)", shown, fps, fps > 0 ? 1000.0f / fps : 0.0f);
         else ImGui::Text("%.0f fps  %.1f ms", fps, fps > 0 ? 1000.0f / fps : 0.0f);
+        if (level >= 2) {
+            float worst = 0; for (float t : times) worst = std::max(worst, t);
+            const float top = std::max(20.0f, std::ceil(worst / 10.0f) * 10.0f);
+            char label[32]; std::snprintf(label, sizeof label, "worst %.1f ms", worst);
+            ImGui::PlotLines("##times", times, 240, at, label, 0.0f, top, ImVec2(220 * scale, 48 * scale));
+        }
+        if (level >= 3) {
+            const nvn::FrameCosts costs = nvn::LastFrameCosts();
+            ImGui::Text("GPU %.1f ms   renderer %.1f ms", costs.gpu_ms, costs.record_ms);
+            u64 used = 0, budget = 0; nvn::VideoMemoryNow(&used, &budget);
+            if (budget) ImGui::Text("video memory %.1f of %.1f GiB", used / 1073741824.0, budget / 1073741824.0);
+            ImGui::Text("%.0f x %.0f", display.x, display.y);
+        }
     }
     ImGui::End();
 }

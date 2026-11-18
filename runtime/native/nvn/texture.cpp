@@ -29,6 +29,7 @@ using namespace rt;
 using namespace nvn;
 
 namespace nvn {
+std::atomic<u64> image_make_ns_frame{0}; // (the slow frame report's: image creation this frame)
 namespace {
 std::atomic<u64> image_live_bytes{0},image_cached_bytes{0};
 // Video memory as the system sees it (VK_EXT_memory_budget: other programs' share is taken off the budget): tight from
@@ -400,8 +401,10 @@ u64 SpareBudget() {
         // took the turn from 41 to 45 fps and its p99 frame from 40 to 33 ms)
         if (vk.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU || local < (6ull << 30)) return 256ull << 20;
         return local >= (10ull << 30) ? 1536ull << 20 : 768ull << 20; }();
-    // (short of video memory: spares are for speed only)
-    if (VideoMemoryTight() && !std::getenv("OOT_SPARE_IMAGE_MB")) return std::min<u64>(budget, 192ull << 20);
+    // (short of video memory the budget stays: what the tight-memory relief lets go is what nothing took for a few
+    // frames, DropSpareImages. Cut to 192 MiB, the two dozen render targets the game ends and makes again every frame
+    // were made by the driver each frame - no memory saved, and an allocation at the limit takes it 60-130 ms: the
+    // stutters while turning in Castle Town.)
     return budget;
 }
 std::atomic<u64> stat_spare_hits{0}, stat_images_created{0}, stat_targets_created{0}, stat_spare_kept{0}, stat_spare_dropped{0}, stat_spare_refused{0};
@@ -445,6 +448,8 @@ void DestroyOffThread(std::function<void()> destroy) {
         for (;;) {
             std::vector<std::function<void()>> work;
             { std::unique_lock lock{m}; cv.wait(lock, [] { return !queue.empty(); }); work.swap(queue); }
+            // (pacing a burst of frees - 300 us between them - was tried 2026-11-18: memory then stays at its limit longer
+            // and the driver stalls the allocations waiting for it, 400-600 ms frames: frees run as fast as they can)
             for (auto& f : work) f();
         }
     }).detach(); });
@@ -492,11 +497,34 @@ void DestroySpare(const SpareImage& s) { // (spare_mutex held)
         vkDestroyImage(Vk().device, image, nullptr);
         if (memory) vkFreeMemory(Vk().device, memory, nullptr); });
 }
-void DropSpareImages() { // (low on memory)
+// Low on memory: the spares go. keep_frames > 0: all but what was put back within that many frames - the targets the game
+// ends and makes again each frame, which would only be allocated again at once.
+void DropSpareImages(u64 keep_frames = 0, u64 most_bytes = ~0ull) {
+    // (most_bytes: no more than that much let go in one call, the longest idle first. The driver frees under a lock the
+    // renderer's own calls wait for: a gigabyte of spares freed at once held it ~110 ms, a visible hitch each time video
+    // memory got tight; the relief runs again every half second while it stays so.)
     std::lock_guard lock{spare_mutex};
-    for (auto& [k, kind] : spare_images) for (auto& s : kind.images) { vkDestroyImage(Vk().device, s.image, nullptr); attachment_memory_types.erase(s.memory); vkFreeMemory(Vk().device, s.memory, nullptr); }
-    spare_images.clear(); spare_bytes = 0;
-    while (!spare_memory.empty()) FreeSpareMemoryLocked(spare_memory.begin());
+    const u64 now = CurrentFrameNumber();
+    struct Idle { u64 frame; SpareKey key; VkImage image; };
+    std::vector<Idle> idle;
+    for (auto& [key, kind] : spare_images) for (auto& s : kind.images) if (!keep_frames || now - s.frame > keep_frames) idle.push_back({s.frame, key, s.image});
+    std::sort(idle.begin(), idle.end(), [](const Idle& a, const Idle& b) { return a.frame < b.frame; });
+    u64 freed = 0;
+    for (const Idle& victim : idle) {
+        if (freed >= most_bytes) break;
+        auto kind = spare_images.find(victim.key);
+        if (kind == spare_images.end()) continue;
+        auto& images = kind->second.images;
+        for (auto s = images.begin(); s != images.end(); ++s) if (s->image == victim.image) {
+            spare_bytes -= s->size; kind->second.bytes -= s->size; freed += s->size;
+            attachment_memory_types.erase(s->memory); // (its memory goes too: this is about memory)
+            DestroyOffThread([image = s->image, memory = s->memory] { vkDestroyImage(Vk().device, image, nullptr); vkFreeMemory(Vk().device, memory, nullptr); });
+            images.erase(s);
+            break;
+        }
+        if (images.empty()) spare_images.erase(kind);
+    }
+    for (auto it = spare_memory.begin(); it != spare_memory.end() && freed < most_bytes;) { auto m = it++; if (!keep_frames || now - m->second.frame > keep_frames) { freed += m->first; FreeSpareMemoryLocked(m); } }
 }
 // (spare_mutex held) The oldest spare of a description goes.
 void DropOldestSpare(std::map<SpareKey, SpareKind>::iterator kind) {
@@ -552,7 +580,14 @@ void RelieveVideoMemory() {
     const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     s64 before = last_ms.load(std::memory_order_relaxed);
     if (now - before < 500 || !last_ms.compare_exchange_strong(before, now)) return;
-    TrimImageCache(256ull << 20, false); DropSpareImages();
+    const auto relief_t0 = std::chrono::steady_clock::now();
+    // (a part at a time: the whole cache let go at once - 750 MiB of images freed in one frame - held the renderer ~110 ms
+    // behind the driver's frees; this runs again every half second while memory stays tight)
+    TrimImageCache(std::max<u64>(256ull << 20, image_cached_bytes.load() > (160ull << 20) ? image_cached_bytes.load() - (160ull << 20) : 0), false);
+    const double trim_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - relief_t0).count();
+    DropSpareImages(8, 128ull << 20);
+    {const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - relief_t0).count(); static u32 shown = 0;
+     if (ms > 5 && shown++ < 20) RT_LOG("video memory relief took %.1f ms (cache trim %.1f ms)", ms, trim_ms);}
     static u32 told = 0; if (told++ < 6) { u64 used = 0, budget = 0; VideoMemoryTight(&used, &budget); RT_LOG("video memory tight (%llu of %llu MiB): spare and cached images released", (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20)); }
 }
 void CreateImage(Texture& t) {
@@ -707,6 +742,7 @@ void EnsureImage(Texture& t) {
         const bool created=!t.image;
         if(created){const auto t0=std::chrono::steady_clock::now();CreateImage(t);
             const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
+            image_make_ns_frame.fetch_add((u64)(ms*1e6),std::memory_order_relaxed);
             if(ms>20){static std::atomic<u32> shown{0};if(shown++<40)RT_LOG("image %ux%u fmt %u levels %u layers %u (%.0f MiB) at %#llx made in %.0f ms",t.width,t.height,t.format,t.levels,t.layers,
                 t.allocation_size/1048576.0,(unsigned long long)t.storage,ms);}}
         NoteHolder(t);
@@ -754,9 +790,13 @@ struct CachedImage {
 std::map<ImageKey,CachedImage> image_cache;
 
 void DestroyLater(Texture* t) {
-    ls::TextureGone(t); // (the vendored upscalers' view of it)
     ForgetImageHolder(t); // (on its way out: no other object takes its image now)
     AfterFlush([t] {
+        // (the upscalers' view of it ends here, when the texture really goes: the game ends its render targets a frame
+        // ahead of the work that still draws into them, and told at that moment the temporal chain took the scene's depth
+        // for gone in the middle of its frame - it skipped that frame's upscale, which the game's own then drew: the
+        // one-frame change of the picture with DLSS / FSR, 143 times in 35 s of turning in Castle Town)
+        ls::TextureGone(t);
         std::vector<VkImageView> views;
         if (t->view) views.push_back(t->view);
         for (auto& [key, view] : t->views) views.push_back(view);
@@ -890,7 +930,14 @@ void ReuseOverlapping(Texture& t, bool take) {
         for (Texture* h : candidates->second) {
             // (taken after 10 frames unused, destroyed after 60: objects touched every few frames keep theirs)
             static const u64 take_after = std::getenv("OOT_IMAGE_TAKE_FRAMES") ? std::strtoull(std::getenv("OOT_IMAGE_TAKE_FRAMES"), nullptr, 10) : 60;
-            if (h == &t || !h->image || now - h->used_frame < (take ? take_after : 60u) || !h->storage_size) continue;
+            // An image at ANOTHER place that overlaps this one's memory cannot hold its contents once this one is drawn:
+            // the game lays its passing render targets over one another in one pool (108 half-size RGBA16F targets
+            // overlapped in Castle Town, 81 of them idle: 2 GiB of video memory on dead pictures, a 12 GB card at its
+            // limit and the driver taking 100 ms for an allocation). Those go after 3 idle frames; one at the same
+            // place (the same picture under another object) after 60, as before. OOT_IMAGE_IDLE_FRAMES=<n>: the 3.
+            static const u64 idle_after = std::getenv("OOT_IMAGE_IDLE_FRAMES") ? std::strtoull(std::getenv("OOT_IMAGE_IDLE_FRAMES"), nullptr, 10) : 3;
+            const u64 wait = take ? take_after : h->storage != t.storage ? idle_after : 60u;
+            if (h == &t || !h->image || now - h->used_frame < wait || !h->storage_size) continue;
             if (h->storage >= t.storage + t.storage_size || t.storage >= h->storage + h->storage_size) continue;
             if (h->format != t.format || h->width != t.width || h->height != t.height || h->depth != t.depth || h->levels != t.levels ||
                 h->layers != t.layers || h->samples != t.samples || h->target != t.target) continue;
@@ -917,6 +964,9 @@ void ReuseOverlapping(Texture& t, bool take) {
     for (Texture* h : dead) { // (the image goes after the GPU is done with it; the object stays, without one)
         auto* image = new Texture(*h);
         h->image = VK_NULL_HANDLE; h->memory = VK_NULL_HANDLE; h->block = nullptr; h->view = VK_NULL_HANDLE; h->views.clear(); h->allocation_size = 0;
+        // (what the GPU drew into it is gone with the image, and the game's memory never held it: used again, it starts
+        // as a new target does, not with 32 MiB of that memory read, deswizzled and copied - 22 ms for a 4K one)
+        if (h->gpu_written) h->lost_gpu_image = true;
         h->layout = VK_IMAGE_LAYOUT_UNDEFINED; h->uploaded = h->gpu_written = false;
         image->object = 0;
         DestroyLater(image);
@@ -939,14 +989,16 @@ void ReportImageAges() {
     std::sort(top.rbegin(), top.rend());
     for (size_t i = 0; i < top.size() && i < 10; ++i) RT_LOG("  held %s", top[i].second.c_str());
     std::vector<std::pair<u64, u64>> spans; // (960x540 format 41: where they are)
-    for (Texture* t : with_images) if (t->image && t->width == 960 && t->height == 540 && t->format == 41) spans.push_back({t->storage, t->storage_size});
+    static u32 sw = 960, sh = 540, sf = 41; static const bool spans_set = [] { if (const char* e = std::getenv("OOT_IMAGE_SPANS")) std::sscanf(e, "%ux%ux%u", &sw, &sh, &sf); return true; }(); (void)spans_set;
+    u64 finalized = 0, idle = 0;
+    for (Texture* t : with_images) if (t->image && t->width == sw && t->height == sh && t->format == sf) { spans.push_back({t->storage, t->storage_size}); finalized += t->owner_finalized; idle += now - t->used_frame >= 10; }
     std::sort(spans.begin(), spans.end());
     std::string list; u64 overlapping = 0;
     for (size_t i = 0; i < spans.size(); ++i) {
         if (i && spans[i].first < spans[i - 1].first + spans[i - 1].second) ++overlapping;
         if (i < 24) { char b[48]; std::snprintf(b, sizeof b, " %#llx+%#llx", (unsigned long long)spans[i].first, (unsigned long long)spans[i].second); list += b; }
     }
-    RT_LOG("  960x540/41 storage (%zu, %llu overlapping the previous):%s", spans.size(), (unsigned long long)overlapping, list.c_str());
+    RT_LOG("  %ux%u/%u storage (%zu, %llu overlapping the previous, %llu finalized, %llu idle):%s", sw, sh, sf, spans.size(), (unsigned long long)overlapping, (unsigned long long)finalized, (unsigned long long)idle, list.c_str());
 }
 bool StealLiveImage(Texture& t) {
     static const bool off = std::getenv("OOT_NO_IMAGE_SHARING") != nullptr;
@@ -994,7 +1046,7 @@ void ReportImageCache() {
     AgeSpareImages();
     {u64 used=0,budget=0;const bool tight=VideoMemoryTight(&used,&budget);
      // (short of video memory: what is only kept for speed goes before an allocation fails and the picture stalls)
-     if(tight){DropSpareImages();static u32 told=0;if(told++<8)RT_LOG("video memory tight: %llu of %llu MiB the system allows in use; spare render targets released",(unsigned long long)(used>>20),(unsigned long long)(budget>>20));}
+     if(tight){DropSpareImages(8, 128ull << 20);static u32 told=0;if(told++<8)RT_LOG("video memory tight: %llu of %llu MiB the system allows in use; spare render targets released",(unsigned long long)(used>>20),(unsigned long long)(budget>>20));}
      if(budget)RT_LOG("video memory: %llu MiB in use of %llu MiB allowed",(unsigned long long)(used>>20),(unsigned long long)(budget>>20));}
     RT_LOG("render target memory: %.1f per frame from spares, %.0f MiB spare", stat_memory_reused.exchange(0) / 300.0, spare_memory_bytes / 1048576.0);
     RT_LOG("images per frame: %.1f created (%.1f render targets), %.1f from spares; spares: %.1f kept, %.1f dropped over the budget, %.1f not kept; %.0f MiB spare",
@@ -1127,3 +1179,7 @@ NATIVE("nvnTextureGetDebugID") { Ret(c, c->x[0] & 0xffffffff); }
 NATIVE("nvnTextureCompare") { Ret(c, std::memcmp(Ptr(c, 0), Ptr(c, 1), TextureBuilderSize) == 0); }
 NATIVE("nvnTextureFlushTexels") {}
 NATIVE("nvnTextureInvalidateTexels") {}
+namespace nvn { void VideoMemoryNow(u64* used, u64* budget) { VideoMemoryTight(used, budget); } } // (the FPS counter's details)
+// (texture_data.cpp's uploads ahead: under 72% of what the system allows in use - well clear of the 85% from which
+// spares and caches are let go; without the budget extension: never)
+namespace nvn { bool VideoMemoryRoomy() { u64 used = 0, budget = 0; VideoMemoryTight(&used, &budget); static const u64 percent = std::getenv("OOT_PREUPLOAD_VRAM_PERCENT") ? std::strtoull(std::getenv("OOT_PREUPLOAD_VRAM_PERCENT"), nullptr, 10) : 72; return budget && used < budget / 100 * percent; } }

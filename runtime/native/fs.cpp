@@ -36,6 +36,7 @@ struct RomEntry {
     bool directory;
     u64 offset = 0, size = 0;
     u64 stored = 0; u8 codec = 0; // (a file the package keeps compressed: its bytes in the package, 1 zstd)
+    std::string host;             // (a mod's file: read from this path in place of the package's)
     std::map<std::string, std::string> children; // name -> full path (directories)
 };
 
@@ -126,6 +127,56 @@ struct NupRomFs {
         // opened, Contents below. An uncompressed package is read in place and loads faster.)
         if (compressed) RT_LOG("RomFS: %zu of the package's files are compressed (zstd): each is unpacked when the game opens it", compressed);
         RT_LOG("RomFS: %zu entries from %s", entries.size(), path.c_str());
+        AddMods();
+    }
+
+    // Mods, in the layout emulators use, so RomFS mods made for them work as they are: <data>/mods/<name>/romfs/...
+    // replaces (or adds to) the game's files. A mod may sit deeper (mods/contents/<title id>/<name>/romfs): any folder
+    // named romfs is a mod's. Folders whose names start with '-' or '_' are off. Where two mods have the same file the
+    // one whose path sorts last wins (01-..., 02-... orders them). OOT_MODS=<folder> names another folder; code patches
+    // (exefs: .pchtxt, .ips) cannot apply to a recompiled game and are left out.
+    void AddMods() {
+        namespace sfs = std::filesystem;
+        const char* env = std::getenv("OOT_MODS");
+        const sfs::path root = env && *env ? sfs::path(env) : sfs::path(DataDir()) / "mods";
+        std::error_code ec;
+        if (!sfs::is_directory(root, ec)) return;
+        std::vector<sfs::path> mods;
+        const auto find = [&](auto&& self, const sfs::path& dir, int depth) -> void {
+            std::vector<sfs::path> subs;
+            for (const auto& e : sfs::directory_iterator(dir, sfs::directory_options::skip_permission_denied, ec)) if (e.is_directory(ec)) subs.push_back(e.path());
+            std::sort(subs.begin(), subs.end());
+            for (const sfs::path& sub : subs) {
+                const std::string name = sub.filename().string();
+                if (name.empty() || name[0] == '-' || name[0] == '_') continue;
+                if (name == "romfs") mods.push_back(sub);
+                else if (name == "exefs") RT_LOG("mods: %s is left out (code patches cannot apply to the recompiled game)", sub.string().c_str());
+                else if (depth < 5) self(self, sub, depth + 1);
+            }
+        };
+        find(find, root, 0);
+        size_t replaced = 0, added = 0;
+        for (const sfs::path& mod : mods) {
+            size_t files = 0;
+            for (auto it = sfs::recursive_directory_iterator(mod, sfs::directory_options::skip_permission_denied, ec); it != sfs::recursive_directory_iterator(); it.increment(ec)) {
+                if (ec) break;
+                const std::string rel = "/" + sfs::relative(it->path(), mod, ec).generic_string();
+                const std::string parent = rel.rfind('/') == 0 ? "/" : rel.substr(0, rel.rfind('/'));
+                const std::string name = rel.substr(rel.rfind('/') + 1);
+                if (!entries.count(parent)) continue; // (its folder was not taken: not reached in practice, parents come first)
+                if (it->is_directory(ec)) {
+                    if (!entries.count(rel)) { entries[rel] = RomEntry{true}; entries[parent].children[name] = rel; }
+                } else if (it->is_regular_file(ec)) {
+                    const auto have = entries.find(rel);
+                    if (have != entries.end() && have->second.directory) continue;
+                    have != entries.end() ? ++replaced : ++added;
+                    RomEntry e{false, 0, (u64)it->file_size(ec)}; e.host = it->path().string();
+                    entries[rel] = e; entries[parent].children[name] = rel; ++files;
+                }
+            }
+            RT_LOG("mods: %s (%zu files)", mod.parent_path().filename().string().c_str(), files);
+        }
+        if (!mods.empty()) RT_LOG("mods: %zu mods from %s: %zu of the game's files replaced, %zu added", mods.size(), root.string().c_str(), replaced, added);
     }
 
     const RomEntry* Find(const std::string& path) const {
@@ -277,6 +328,11 @@ NATIVE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci") {
         if (!e || e->directory) {
             if (trace) RT_LOG("fs missing %s", path.c_str());
             return Ret(c, ResultPathNotFound);
+        }
+        if (!e->host.empty()) { // (a mod's file)
+            f.rom = false;
+            f.host_fd = ::open(e->host.c_str(), O_RDONLY | O_CLOEXEC);
+            if (f.host_fd < 0) return Ret(c, ResultPathNotFound);
         }
         f.rom_offset = e->offset;
         f.rom_size = e->size;
@@ -499,6 +555,14 @@ NATIVE("_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE") {
 bool ReadRomFile(const std::string& path, std::vector<unsigned char>& out) {
     const RomEntry* e = Rom().Find(path);
     if (!e || e->directory) return false;
+    if (!e->host.empty()) {
+        const int fd = ::open(e->host.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return false;
+        out.resize(e->size);
+        const bool ok = pread(fd, out.data(), e->size, 0) == (ssize_t)e->size;
+        ::close(fd);
+        return ok;
+    }
     if (e->codec == 1) { const auto data = Rom().Contents(*e); out.assign(data->begin(), data->end()); return true; }
     out.resize(e->size);
     return pread(Rom().fd, out.data(), e->size, (off_t)e->offset) == (ssize_t)e->size;

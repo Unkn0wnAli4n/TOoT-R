@@ -22,6 +22,7 @@
 #include <map>
 #include <set>
 
+#include "../../logfile.h"
 #include "../../native.h"
 #include "trace_compat.h"
 #include "memory.h"
@@ -522,7 +523,15 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* e) {
     const int n = std::snprintf(line, sizeof line, "[rt] access violation at %#llx, host pc %#llx\n",
                                 (unsigned long long)address, (unsigned long long)e->ContextRecord->Rip);
     std::fwrite(line, 1, (size_t)n, stderr);
+    {   // (where, as offsets in tootr.exe: what a log sent with a report is read by)
+        const u64 base = (u64)GetModuleHandleW(nullptr);
+        void* frames[24]; const USHORT count = CaptureStackBackTrace(0, 24, frames, nullptr);
+        std::fprintf(stderr, "[rt]   tootr.exe at %#llx; pc +%#llx; stack:", (unsigned long long)base, (unsigned long long)((u64)e->ContextRecord->Rip - base));
+        for (USHORT i = 0; i < count; ++i) std::fprintf(stderr, " +%#llx", (unsigned long long)((u64)frames[i] - base));
+        std::fprintf(stderr, "\n");
+    }
     std::fflush(stderr);
+    rt::ShowFatal("The game stopped on an error it could not recover from (an access violation).");
     return EXCEPTION_CONTINUE_SEARCH;
 }
 void InstallHandler() {
