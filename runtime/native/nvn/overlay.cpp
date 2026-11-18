@@ -176,8 +176,8 @@ const std::vector<Row>& Rows() {
 }
 int ValueIndex(const gfx::Settings& s, int r) {
     const Row& row = Rows()[r]; const int value = s.*row.member;
-    int best = 0; long distance = 1L << 40;
-    for (int i = 0; i < (int)row.choices.size(); ++i) { const long d = std::labs((long)row.choices[i].value - value); if (d < distance) { distance = d; best = i; } }
+    int best = 0; long long distance = 1LL << 40; // (long long: a long is 32 bits on Windows, where the shift came out 0 and every row showed its first choice)
+    for (int i = 0; i < (int)row.choices.size(); ++i) { const long long d = std::llabs((long long)row.choices[i].value - value); if (d < distance) { distance = d; best = i; } }
     return best;
 }
 void Change(int r, int index) { // (the row's choice `index`)
@@ -316,8 +316,8 @@ template <typename Changed> void ComboRow(int id, const char* label, const std::
     ImGui::TableSetColumnIndex(1);
     ImGui::PushID(id);
     ImGui::SetNextItemWidth(-FLT_MIN);
-    int at = 0; long distance = 1L << 40;
-    for (int i = 0; i < (int)choices.size(); ++i) { const long d = std::labs((long)choices[i].value - value); if (d < distance) { distance = d; at = i; } }
+    int at = 0; long long distance = 1LL << 40; // (long long: a long is 32 bits on Windows, where the shift came out 0 and every row showed its first choice)
+    for (int i = 0; i < (int)choices.size(); ++i) { const long long d = std::llabs((long long)choices[i].value - value); if (d < distance) { distance = d; at = i; } }
     if (ImGui::BeginCombo("##value", choices[at].name)) {
         for (int v = 0; v < (int)choices.size(); ++v) {
             if (ImGui::Selectable(choices[v].name, v == at) && v != at) changed(choices[v].value);
