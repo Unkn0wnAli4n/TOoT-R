@@ -13,5 +13,6 @@ void SyncOptions();
 // Frames between the picture before and this one (color: RGBA8, GENERAL, w x h) into out[0..count): NVIDIA DLSS Frame
 // Generation where it runs, AMD FSR 3.1's frame interpolation otherwise. How many were made (0: none).
 int MakeFrames(VkCommandBuffer cmd, VkImage color, VkImageView view, uint32_t w, uint32_t h, int count, const VkImage* out, const VkImageView* out_views, bool blend, uint64_t sequence);
+bool FramesHeld(); // frame generation is on and has made nothing for some frames: a menu or a movie
 const char* FrameMaker(); // who made the last frames: "DLSS FG", "FSR 3.1 FG" or ""                         // the settings window's rows into Longshot's `opts`
 }

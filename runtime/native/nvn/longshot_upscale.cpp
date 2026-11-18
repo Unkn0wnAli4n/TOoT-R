@@ -226,7 +226,19 @@ void SyncOptions() {
 }
 namespace { const char* maker = ""; }
 const char* FrameMaker() { return maker; }
+// Frames in a row for which frame generation was on and made nothing: a menu or a movie, which have no 3D scene to
+// make frames from. The presenter lifts a frame cap under 60 meanwhile (FramesHeld): with a cap of 30 and generated
+// frames the game showed 60 in play and its movies at 30, which read as stutter.
+namespace { std::atomic<int> held_frames{0}; int MakeFramesNow(VkCommandBuffer cmd, VkImage color, VkImageView view, uint32_t w, uint32_t h, int count, const VkImage* out, const VkImageView* out_views, bool blend, uint64_t sequence); }
+bool FramesHeld() { return held_frames.load(std::memory_order_relaxed) >= 4; }
 int MakeFrames(VkCommandBuffer cmd, VkImage color, VkImageView view, uint32_t w, uint32_t h, int count, const VkImage* out, const VkImageView* out_views, bool blend, uint64_t sequence) {
+    const int made = MakeFramesNow(cmd, color, view, w, h, count, out, out_views, blend, sequence);
+    if (made > 0 || count <= 0 || !mkwvk::opts.framegen) held_frames.store(0, std::memory_order_relaxed);
+    else held_frames.fetch_add(1, std::memory_order_relaxed);
+    return made;
+}
+namespace {
+int MakeFramesNow(VkCommandBuffer cmd, VkImage color, VkImageView view, uint32_t w, uint32_t h, int count, const VkImage* out, const VkImageView* out_views, bool blend, uint64_t sequence) {
     using namespace mkwvk;
     maker = "";
     if (count <= 0 || !mkwvk::opts.framegen) { dlss_fg_idle(); return 0; }
@@ -253,6 +265,7 @@ int MakeFrames(VkCommandBuffer cmd, VkImage color, VkImageView view, uint32_t w,
     maker = "FSR 3.1 FG";
     return count;
 }
+} // namespace
 } // namespace nvn::ls
 
 // Extension entry points the vendored files call by name (Longshot's own loader provides them there; the system's

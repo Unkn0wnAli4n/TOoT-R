@@ -239,6 +239,10 @@ int EffectiveFrameCap() {
         const int cap = gfx::Current().frame_cap; return cap && cap < 60 ? cap : 60; }
     if (uncapped) return 0;
     int cap = gfx::Current().frame_cap;
+    // (with generated frames a cap is on the game's own frames - 30 shows as 60 - but menus and movies have no 3D scene
+    // to make frames from and were shown at the bare cap: a title movie at 30. They get 60. OOT_CAP_MOVIES=1: the cap.)
+    {static const bool keep = std::getenv("OOT_CAP_MOVIES") != nullptr;
+     if (!keep && cap > 0 && cap < 60 && gfx::Current().frame_gen > 1 && ls::FramesHeld()) cap = 60;}
     // (VSync at Adaptive: a variable refresh rate display follows the game only below its own top rate - past it the
     // display falls back to waiting for it, with the delay of plain vsync. Frames are held 3% under it.)
     if (gfx::Current().vsync == 2) if (const double hz = gfx::display_refresh.load(std::memory_order_relaxed); hz > 30) {
