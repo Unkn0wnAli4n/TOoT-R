@@ -60,6 +60,7 @@ bool ExecuteRenderCommand(const Command& command);
 // False once a command since the last full draw may change what a draw resolves (render.cpp).
 bool CurrentFrameSkipped(); // frame skip: this frame is neither rendered nor shown
 bool FrameSkipEnabled();
+inline thread_local bool fast_pipeline_stale = false; // (state that only chooses the pipeline changed: the fast path looks the pipeline up again and keeps the draw's descriptors)
 inline thread_local bool fast_draw_allowed = false; // (per thread: draws are resolved on several, see batch.h resolve_worker)
 inline u64 fast_draw_breakers[128]{}; // (OOT_SET_STATS) commands that ended a run of fast-path draws
 inline u64 fast_draw_fails[8]{};

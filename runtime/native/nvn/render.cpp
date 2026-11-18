@@ -143,6 +143,21 @@ bool PredicateOperandsFinal(){
 // Values of reports whose value is known when recorded (counters other than samples passed
 // report 0): predicates over them are decided on the CPU, even while the write is in flight.
 std::unordered_map<u64,u64> known_reports;
+// What the map holds for the addresses written last (executor only): a report that reads the same as the frame before
+// - nearly all of them, thousands a frame - is then one comparison instead of a walk through the map (0.9 ms a
+// frame in a heavy view). OOT_REPORT_MEMO=1 turns it on.
+struct KnownMemo{u64 address=~0ull,value=0;};
+KnownMemo known_memo[8192];
+inline void SetKnownReport(u64 address,u64 value){
+    static const bool memo=std::getenv("OOT_REPORT_MEMO")!=nullptr; // (off unless asked for: nothing measured)
+    auto& m=known_memo[(address>>3)&8191];
+    if(memo&&m.address==address&&m.value==value)return;
+    known_reports[address]=value;m.address=address;m.value=value;
+}
+inline void EraseKnownReport(u64 address){
+    auto& m=known_memo[(address>>3)&8191];if(m.address==address)m.address=~0ull;
+    known_reports.erase(address);
+}
 bool EvaluatePredicateOnCpu(){
     const auto* operands=static_cast<const u8*>(ResolveAddress((*tls_state).render_condition,24));
     u64 initial,current;
@@ -275,9 +290,10 @@ u64 frame_number = 0;
 // OOT_DRAW_CPU_PROFILE: sample host-side draw recording without changing command
 // submission or synchronization. Timings are diagnostic, not a benchmark mode.
 struct DrawCpuProfile {
-    std::atomic<u64> draws{0}, total_ns{0}, lookup_ns{0}, descriptors_ns{0}, pass_ns{0};
+    std::atomic<u64> draws{0}, total_ns{0}, lookup_ns{0}, descriptors_ns{0}, pass_ns{0}, fast_draws{0}, fast_ns{0};
     std::map<u64, std::pair<u64, u64>> shaders; // shader address -> host ns, draws (executor thread)
 } draw_cpu_profile;
+thread_local bool draw_was_fast = false; // (profiling: the draw being timed took the fast path)
 bool DrawCpuProfiling() { static const bool on = std::getenv("OOT_DRAW_CPU_PROFILE") != nullptr; return on; }
 void ReportDrawCpuProfile() {
     if (!DrawCpuProfiling()) return;
@@ -286,6 +302,9 @@ void ReportDrawCpuProfile() {
     const u64 lookup = draw_cpu_profile.lookup_ns.exchange(0, std::memory_order_relaxed);
     const u64 descriptors = draw_cpu_profile.descriptors_ns.exchange(0, std::memory_order_relaxed);
     const u64 pass = draw_cpu_profile.pass_ns.exchange(0, std::memory_order_relaxed);
+    {const u64 fd = draw_cpu_profile.fast_draws.exchange(0, std::memory_order_relaxed), fn = draw_cpu_profile.fast_ns.exchange(0, std::memory_order_relaxed);
+     RT_LOG("draw CPU by path: fast %.0f draws/frame at %.2f us each (%.2f ms/frame); full %.0f at %.2f us each (%.2f ms/frame)", fd / 300.0, fd ? fn / 1000.0 / fd : 0.0, fn / 300e6,
+            (draws - fd) / 300.0, draws > fd ? (total - fn) / 1000.0 / (draws - fd) : 0.0, (total - fn) / 300e6);}
     RT_LOG("draw CPU profile: %.2f draws/frame, %.2f ms/frame total (%.2f us/draw), geometry lookup %.2f, descriptors %.2f, pass recording %.2f, other %.2f ms/frame",
            draws / 300.0, total / 300e6, draws ? (double)total / draws / 1000.0 : 0.0,
            lookup / 300e6, descriptors / 300e6, pass / 300e6,
@@ -705,12 +724,22 @@ VkDescriptorBufferInfo DriverBankDescriptor(StageState& stage, u32 bank) {
         static thread_local LocalRing local;
         constexpr u64 Piece = 256u << 10;
         if (local.generation != ring_generation) { local.banks.clear(); local.used = local.size = 0; local.generation = ring_generation; }
+        // The bank this thread made last for the same stage and bank number is the likeliest match (consecutive draws
+        // mostly share their banks): compared directly, before anything is hashed. OOT_BANK_MEMO=1 turns it on.
+        struct Last { u64 generation = ~0ull, at = 0; u32 used = 0; const State* state = nullptr; std::vector<u8> data; };
+        static thread_local Last last[9][4];
+        static const bool memo = std::getenv("OOT_BANK_MEMO") != nullptr; // (off unless asked for: nothing measured)
+        const u32 stage_index = (u32)(&stage - &(*tls_state).stages[0]);
+        Last* const mine = memo && stage_index < 9 && bank < 4 ? &last[stage_index][bank] : nullptr;
+        if (mine && mine->generation == ring_generation && mine->used == used && std::memcmp(mine->data.data(), bank_data, used) == 0)
+            return {ring.buffer, mine->at, used};
+        const auto remember = [&](u64 at) { if (mine) { mine->generation = ring_generation; mine->at = at; mine->used = used; mine->data.assign(bank_data, bank_data + used); } };
         const u64* words = reinterpret_cast<const u64*>(bank_data);
         for (u32 i = 0; i < used / 8; ++i) hash = (hash ^ words[i]) * 0x100000001b3ull;
         const auto found = local.banks.find(hash);
         // (Compared against a CPU shadow: reading the host-visible ring itself is very slow.)
-        if (found != local.banks.end() && std::memcmp(ring_shadow.data() + found->second, bank_data, used) == 0)
-            return {ring.buffer, found->second, used};
+        if (found != local.banks.end() && std::memcmp(ring_shadow.data() + found->second, bank_data, used) == 0) {
+            remember(found->second); return {ring.buffer, found->second, used}; }
         local.used = (local.used + align - 1) & ~(align - 1);
         if (local.used + DriverBankSize > local.size) {
             std::lock_guard ring_lock{ring_mutex};
@@ -722,6 +751,7 @@ VkDescriptorBufferInfo DriverBankDescriptor(StageState& stage, u32 bank) {
         std::memcpy(ring.mapped + at, bank_data, used);
         std::memcpy(ring_shadow.data() + at, bank_data, used);
         local.banks[hash] = at; local.used += used;
+        remember(at);
         return {ring.buffer, at, used};
     }
     std::lock_guard ring_lock{ring_mutex};
@@ -1807,13 +1837,13 @@ void LogDraw(const Command& command) {
 }
 // A 64 KiB zero-filled buffer bound in place of unbound uniform/storage slots.
 VkDescriptorBufferInfo ZeroBuffer(){
-    static VkBuffer buffer=VK_NULL_HANDLE;
-    if(!buffer){auto& vk=Vk();
+    // (made once, by whichever thread asks first: draws are resolved on several)
+    static const VkBuffer buffer=[]{VkBuffer buffer=VK_NULL_HANDLE;auto& vk=Vk();
         VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};bi.size=0x10000;bi.usage=VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
         VK_CHECK(TracedCreateBuffer(&bi,&buffer,__FILE__,__LINE__));VkMemoryRequirements req;vkGetBufferMemoryRequirements(vk.device,buffer,&req);
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ai.allocationSize=req.size;ai.memoryTypeIndex=FindMemoryType(req.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         VkDeviceMemory memory;VK_CHECK(vkAllocateMemory(vk.device,&ai,nullptr,&memory));VK_CHECK(vkBindBufferMemory(vk.device,buffer,memory,0));
-        void* p;VK_CHECK(vkMapMemory(vk.device,memory,0,0x10000,0,&p));std::memset(p,0,0x10000);}
+        void* p;VK_CHECK(vkMapMemory(vk.device,memory,0,0x10000,0,&p));std::memset(p,0,0x10000);return buffer;}();
     return {buffer,0,0x10000};
 }
 // Whether CPU-side evaluation of this pipeline's memory-resident handles and pointers could read
@@ -1894,6 +1924,27 @@ thread_local std::vector<VkWriteDescriptorSet> descriptor_write_list;
 // them), and whether the last resolution depends only on bindings the fast path tracks.
 struct UniformSlot { u32 write; StageState* stage; u32 bank; };
 thread_local std::vector<UniformSlot> uniform_write_slots;
+// Writes that are one texture whose handle a small program computes from the draw's constants (most of the game's
+// material textures): the fast path evaluates the handle again and patches the write when it names another texture.
+// OOT_FAST_TEXTURES=1 turns it on (off by default).
+struct TextureSlot { u32 write, read; ShaderVariant* shader; const nvshader::Resource* resource; u32 handle; VkImage image; };
+thread_local std::vector<TextureSlot> texture_write_slots;
+// State that only chooses the pipeline (vertex format, blending, depth and stencil, polygon state): the fast path
+// looks the pipeline up again and keeps the descriptors where its programs are the same. OOT_FAST_STATE=1 turns this on;
+// by default such a change ends the fast path.
+bool FastState(){static const bool on=std::getenv("OOT_FAST_STATE")!=nullptr;return on;} // (off unless asked for, as FastTextures)
+inline void PipelineStateChanged(){if(FastState())fast_pipeline_stale=true;else fast_draw_allowed=false;}
+// Writes that are a driver bank (what the shader reads of the draw's own parameters and bindings).
+struct DriverSlot { u32 write; StageState* stage; u32 bank; };
+thread_local std::vector<DriverSlot> driver_write_slots;
+// Writes that are one storage buffer the draw only reads, bound the plain way (its address and size in the stage's
+// own bank): kept with the words it was resolved from and the memory it reads.
+struct StorageSlot { u32 write; StageState* stage; const nvshader::Resource* resource; u32 words[3]; u64 cpu_address, extent; };
+thread_local std::vector<StorageSlot> storage_write_slots;
+// Whether the last resolution holds nothing but uniform buffers, driver banks and single textures: what a later draw
+// of the same pipeline can take over whole (ResolveCache below).
+thread_local bool descriptor_cacheable = false;
+bool FastTextures(){static const bool on=std::getenv("OOT_FAST_TEXTURES")!=nullptr;return on;} // (off unless asked for: no frame rate gained on an 8-core CPU, ~2% with two helper threads)
 thread_local bool descriptor_fast_eligible = false;
 // Guest ranges [start, end) of the buffers bound by the last WriteDescriptors, and the images it
 // writes: compute dispatches use them to skip barriers between independent dispatches.
@@ -1981,7 +2032,7 @@ bool WriteDescriptors(Pipeline& pipeline){
     std::map<Texture*,std::shared_ptr<Texture>> attachment_snapshots;
     descriptor_reads.clear();descriptor_writes=false;
     descriptor_buffer_reads.clear();descriptor_buffer_writes.clear();descriptor_image_writes.clear();
-    uniform_write_slots.clear();descriptor_fast_eligible=true;
+    uniform_write_slots.clear();texture_write_slots.clear();driver_write_slots.clear();storage_write_slots.clear();descriptor_fast_eligible=true;descriptor_cacheable=true;
     // The set is allocated once its contents are known: a draw binding the same resources as the
     // pipeline's previous draw in this batch reuses that set.
     const VkDescriptorSet set=VK_NULL_HANDLE;
@@ -2000,10 +2051,20 @@ bool WriteDescriptors(Pipeline& pipeline){
         for(const auto& r:shader->compiled.resources){
             std::vector<VkDescriptorBufferInfo> buffers;std::vector<VkDescriptorImageInfo> images;
             // (Fast path: handles or pointers read through memory, and root-bank uniforms, are not tracked.)
-            if(!r.handle_program.empty()||r.storage_index!=~0u||r.indirect_offset!=~0u||r.bank==RootBank||
+            const bool texture_slot=FastTextures()&&r.kind==nvshader::ResourceKind::Texture&&r.count==1&&r.storage_index==~0u&&r.indirect_offset==~0u&&r.bank!=RootBank;
+            u32 slot_handle=0,slot_read=~0u; // (set where the texture resolved the ordinary way)
+            if(r.kind==nvshader::ResourceKind::Texture&&r.count!=1&&FastTextures())descriptor_fast_eligible=false; // (an array's handles are not followed)
+            const bool storage_slot=r.kind==nvshader::ResourceKind::StorageBuffer&&!r.written&&r.count==1&&r.indirect_offset==~0u&&r.storage_index==~0u&&r.bank<UniformBankBase;
+            if(r.kind!=nvshader::ResourceKind::UniformBuffer&&!texture_slot&&!storage_slot)descriptor_cacheable=false;
+            bool driver_slot=false,storage_resolved=false;u64 storage_cpu=0,storage_extent=0;
+            if((!r.handle_program.empty()&&!texture_slot)||r.storage_index!=~0u||r.indirect_offset!=~0u||r.bank==RootBank||
                (r.kind==nvshader::ResourceKind::StorageBuffer&&r.bank>=UniformBankBase))descriptor_fast_eligible=false;
+            {static const bool why=std::getenv("OOT_SET_STATS")!=nullptr;if(why&&!resolve_worker){static u64 n[6]{},at=0;
+                if(!r.handle_program.empty())++n[0];if(r.storage_index!=~0u)++n[1];if(r.indirect_offset!=~0u)++n[2];if(r.bank==RootBank)++n[3];
+                if(r.kind==nvshader::ResourceKind::StorageBuffer&&r.bank>=UniformBankBase)++n[4];if(r.kind==nvshader::ResourceKind::StorageBuffer&&r.count>1)++n[5];
+                if(at!=frame_number&&frame_number%300==0){at=frame_number;RT_LOG("ineligible resources a frame: handle program %.0f, storage index %.0f, indirect %.0f, root bank %.0f, storage in uniform bank %.0f, storage table %.0f",n[0]/300.0,n[1]/300.0,n[2]/300.0,n[3]/300.0,n[4]/300.0,n[5]/300.0);std::memset(n,0,sizeof n);}}}
             const bool uniform_slot=r.kind==nvshader::ResourceKind::UniformBuffer&&r.bank>=UniformBankBase&&r.bank!=RootBank;
-                if(r.kind==nvshader::ResourceKind::UniformBuffer&&(r.bank<UniformBankBase||(r.bank==RootBank&&!stage.uniforms[RootBank-UniformBankBase].address))){buffers.push_back(DriverBankDescriptor(stage,r.bank));}
+                if(r.kind==nvshader::ResourceKind::UniformBuffer&&(r.bank<UniformBankBase||(r.bank==RootBank&&!stage.uniforms[RootBank-UniformBankBase].address))){buffers.push_back(DriverBankDescriptor(stage,r.bank));driver_slot=true;}
                 else if(r.kind==nvshader::ResourceKind::StorageBuffer&&r.count>1){
                     // A storage buffer table (Longshot's translator): NVN descriptors {address, size} at offset + 16k of
                     // the constant buffer, which the program's global accesses choose between at run time.
@@ -2019,7 +2080,7 @@ bool WriteDescriptors(Pipeline& pipeline){
                         const u64 size=word(r.offset+16*k+8);
                         const auto range=address?GpuLookupAddress(address):BufferRange{};
                         if(resolve_worker&&(resolve_bail||(address&&!range.pool)||r.written)){RESOLVE_BAIL();return false;}
-                        if(!range.pool){if(resolve_worker){RESOLVE_BAIL();return false;}buffers.push_back(ZeroBuffer());continue;}
+                        if(!range.pool){buffers.push_back(ZeroBuffer());continue;} // (an empty entry of the table)
                         if(size>(256ull<<20)){buffers.push_back(ZeroBuffer());continue;} // (past the table's end: whatever the constants hold)
                         // An entry without a size is a bare pointer into a pool the program reads anywhere in: bound as far
                         // as a binding reaches (1 MiB if written). What the GPU writes through a bare one is only known to
@@ -2103,6 +2164,7 @@ bool WriteDescriptors(Pipeline& pipeline){
                         if(uniform_slot)uniform_write_slots.push_back({(u32)writes.size()-1,&stage,r.bank});continue;}
                 }else if(UniformOverlayEnabled()){if(resolve_worker&&UnwrittenUniformOverlap(range.cpu_address,extent)){RESOLVE_BAIL();return false;}WriteUniformUpdatesOverlapping(range.cpu_address,extent);} // (read as storage: memory must have them)
                 buffers.push_back({range.buffer,range.offset-delta,std::min(b.size,range.available)+delta});
+                storage_resolved=true;storage_cpu=range.cpu_address;storage_extent=extent;
             }else if(r.kind==nvshader::ResourceKind::Texture||r.kind==nvshader::ResourceKind::Image){
                 u32 array_valid=0;
                 for(u32 element=0;element<r.count;++element){const u32 handle=ResourceHandle(r,*shader,element);
@@ -2151,7 +2213,7 @@ bool WriteDescriptors(Pipeline& pipeline){
                     if(resolve_worker){if(resolve_texture_unready||t.layout!=VK_IMAGE_LAYOUT_GENERAL)resolve_to_general.push_back(&t);resolve_texture_unready=false;} // (uploaded and brought to the layout when the draw is committed)
                     else if(t.layout!=VK_IMAGE_LAYOUT_GENERAL)
                         Immediate([&](VkCommandBuffer cmd){Transition(cmd,t,VK_IMAGE_LAYOUT_GENERAL);});
-                    descriptor_reads.push_back(&t);if(r.kind==nvshader::ResourceKind::Image&&r.written){descriptor_writes=true;descriptor_image_writes.push_back(&t);}
+                    descriptor_reads.push_back(&t);slot_handle=handle;slot_read=(u32)descriptor_reads.size()-1;if(r.kind==nvshader::ResourceKind::Image&&r.written){descriptor_writes=true;descriptor_image_writes.push_back(&t);}
                     if(LogThisFrame()&&t.format==1&&t.storage&&t.storage_size){std::vector<u8> bytes(t.storage_size);std::memcpy(bytes.data(),ResolveAddress(t.storage,bytes.size()),bytes.size());u64 nz=0;for(u8 b:bytes)nz+=b!=0;RT_LOG("  (R8 texture %#llx: %llu/%zu nonzero guest bytes, uploaded frame %llu, upload seq %u)",(unsigned long long)binding.texture,(unsigned long long)nz,bytes.size(),(unsigned long long)t.upload_frame,t.upload_sequence);}
                     if(LogThisFrame()){const u32* sw=t.swizzle;RT_LOG("  stage %u texture resource bank %u offset %#x element %u: handle %#x -> texture %#llx %ux%u fmt %u written %d storage %#llx swizzle %u %u %u %u view %d (%u %u %u %u)",shader->source->stage,r.bank,r.offset,element,handle,(unsigned long long)binding.texture,t.width,t.height,t.format,(int)t.gpu_written,(unsigned long long)t.storage,sw[0],sw[1],sw[2],sw[3],binding.view.present,binding.view.swizzle[0],binding.view.swizzle[1],binding.view.swizzle[2],binding.view.swizzle[3]);}
                     if(r.kind==nvshader::ResourceKind::Image&&!resolve_worker){static std::map<std::pair<u64,u32>,bool> seen;if(!seen[{shader->source->address,t.format}]){seen[{shader->source->address,t.format}]=true;
@@ -2175,6 +2237,11 @@ bool WriteDescriptors(Pipeline& pipeline){
             }else Fatal("texel buffer descriptor pending");
             queue_write(r,std::move(buffers),std::move(images));
             if(uniform_slot)uniform_write_slots.push_back({(u32)writes.size()-1,&stage,r.bank});
+            if(driver_slot)driver_write_slots.push_back({(u32)writes.size()-1,&stage,r.bank});
+            if(storage_slot){if(!storage_resolved)descriptor_cacheable=false;
+                else storage_write_slots.push_back({(u32)writes.size()-1,&stage,&r,{Cbuf(&stage,r.bank,r.offset),Cbuf(&stage,r.bank,r.offset+4),Cbuf(&stage,r.bank,r.offset+8)},storage_cpu,storage_extent});}
+            if(texture_slot){if(slot_read==~0u)descriptor_fast_eligible=false; // (a null texture: the full path's)
+                else texture_write_slots.push_back({(u32)writes.size()-1,slot_read,shader,&r,slot_handle,descriptor_reads[slot_read]->image});}
         }
     }
     // One update for the whole set (unless uploads above flushed: then the loop writes a new set).
@@ -2274,21 +2341,63 @@ bool SkipDraw(){
     return false;
 }
 std::unordered_map<u64,u64> mesh_preclamped; // guest address of a mesh draw's arguments -> their converted slot (within a group of resolved draws)
-u64 mesh_indirect_slot=0; // nonzero while Draw records a DrawMeshTasksIndirect (slot + 1)
+thread_local u64 mesh_indirect_slot=0; // nonzero while Draw records a DrawMeshTasksIndirect (slot + 1)
+// Indirect mesh draws whose arguments were converted for the whole group are resolved on the helper threads like
+// other draws (they were ~100 draws a frame run by the executor itself, 1.1 ms in a heavy view).
+// OOT_NO_MESH_AHEAD=1: the executor runs each in its place, as before.
+std::atomic<u64> mesh_ahead_stats[4]{}; // (resolved ahead, tried and left to the executor, direct mesh draws, indirect ones not tried)
+bool MeshAhead(){static const bool on=std::getenv("OOT_NO_MESH_AHEAD")==nullptr;return on;}
 struct FastDraw {
     bool valid=false; Pipeline* pipeline=nullptr; std::array<Texture*,8> colors{}; Texture* depth=nullptr; VkExtent2D extent{};
     std::array<VkRenderingAttachmentInfo,8> attachments{}; VkRenderingAttachmentInfo da{}; std::vector<u64> key; u64 flushes=0, pools=0; u32 texture_writes=0;
+    bool feedback=false; // (the draw samples one of its own attachments: what the pass does then depends on the depth state)
 };
 thread_local FastDraw fast_draw;
-u64 fast_draw_count=0;
-bool TryFastDraw(FastDraw& fd){
-    if(FlushCount()!=fd.flushes){++fast_draw_fails[0];return false;}
-    if(PoolGeneration()!=fd.pools||TextureWriteSequence()!=fd.texture_writes){++fast_draw_fails[1];return false;} // (texture writes: re-upload via the full path)
-    if(!PassOpenWithKey(fd.key)){++fast_draw_fails[2];return false;}
+u64 fast_draw_count=0;std::atomic<u64> fast_texture_patches{0},fast_pipeline_swaps{0};
+// Brings the current resolution (descriptor_write_list and its slots, made for `pipeline` by an earlier draw of
+// this batch) up to the state of the draw at hand: the uniform buffers bound now, the textures its handles name
+// now and, where `all` (the resolution comes from the cache, with other draws in between), its driver banks and a
+// check of every texture. False: the draw resolves the usual way.
+bool PatchResolved(Pipeline& pipeline,const std::array<Texture*,8>& colors,Texture* depth,bool all){
     // The variants still apply (their specialization constants may live in the rebound buffers).
-    for(auto* shader:fd.pipeline->shaders){auto& stage=(*tls_state).stages[ShaderPublicStage[shader->source->stage]];
+    for(auto* shader:pipeline.shaders){auto& stage=(*tls_state).stages[ShaderPublicStage[shader->source->stage]];
         if(stage.shader!=shader->source){++fast_draw_fails[3];return false;}
         for(const auto& d:shader->compiled.dependencies)if(CurrentDependencyValue(stage,d)!=d.value){++fast_draw_fails[4];return false;}}
+    bool banks=all;
+    if(!texture_write_slots.empty()){ // as WriteDescriptors resolves a texture, where nothing is left to bring or record
+        if(HandleMemoryPending(pipeline)){++fast_draw_fails[5];return false;}
+        for(auto& slot:texture_write_slots){
+            const auto& r=*slot.resource;const u32 handle=ResourceHandle(r,*slot.shader,0);
+            if(handle==slot.handle&&!all)continue;
+            if(!handle||!HandleRegistered(handle)){++fast_draw_fails[5];return false;}
+            auto& binding=Binding(handle);auto& t=*binding.host.get();
+            // (one of the draw's own targets: a copy to make, or a pass to end. Between draws that follow each other
+            // the depth target counts too: what the pass does about it was decided for the first of them.)
+            if(!TextureReadyNow(t)||t.layout!=VK_IMAGE_LAYOUT_GENERAL||(!all&&&t==depth)){++fast_draw_fails[6];return false;}
+            for(auto* c:colors)if(c==&t){++fast_draw_fails[6];return false;}
+            descriptor_reads[slot.read]=&t;
+            if(handle==slot.handle&&t.image==slot.image)continue; // (the same texture with the image it had)
+            TextureView view=binding.view;view.target=ShaderViewTarget(r.texture_type,t)+1;
+            const VkDescriptorImageInfo info{Sampler(handle),ImageView(t,view),VK_IMAGE_LAYOUT_GENERAL};
+            if(resolve_bail)return false;
+            *const_cast<VkDescriptorImageInfo*>(descriptor_write_list[slot.write].pImageInfo)=info;
+            descriptor_reads[slot.read]=&t;slot.handle=handle;slot.image=t.image;++fast_texture_patches;
+            banks|=r.bank<UniformBankBase; // (a texture bound directly: its handle is in a driver bank)
+        }
+    }
+    if(all)for(const auto& slot:storage_write_slots){ // (between draws that follow each other a storage binding that changes ends the fast path)
+        const auto& r=*slot.resource;
+        if(Cbuf(slot.stage,r.bank,r.offset)!=slot.words[0]||Cbuf(slot.stage,r.bank,r.offset+4)!=slot.words[1]||Cbuf(slot.stage,r.bank,r.offset+8)!=slot.words[2]){++fast_draw_fails[7];return false;}
+        const auto range=GpuLookupAddress(slot.words[0]|(u64)slot.words[1]<<32);if(resolve_bail)return false;
+        const auto& info=*descriptor_write_list[slot.write].pBufferInfo;
+        const u64 delta=range.offset&(Vk().properties.limits.minStorageBufferOffsetAlignment-1);
+        if(!range.pool||range.buffer!=info.buffer||range.offset-delta!=info.offset||range.cpu_address!=slot.cpu_address){++fast_draw_fails[7];return false;}
+        if(UniformOverlayEnabled()){if(resolve_worker&&UnwrittenUniformOverlap(slot.cpu_address,slot.extent))return false;WriteUniformUpdatesOverlapping(slot.cpu_address,slot.extent);} // (read as storage: memory must have them)
+    }
+    if(banks&&!driver_write_slots.empty()){
+        if(!ring.buffer||ring.head+32*DriverBankSize+(4u<<20)>ring.size)return false; // (the ring starts over: the full path's)
+        for(const auto& slot:driver_write_slots)*const_cast<VkDescriptorBufferInfo*>(descriptor_write_list[slot.write].pBufferInfo)=DriverBankDescriptor(*slot.stage,slot.bank);
+    }
     const u64 alignment=Vk().properties.limits.minUniformBufferOffsetAlignment;
     for(const auto& slot:uniform_write_slots){ // as WriteDescriptors resolves a uniform binding
         Buffer b=slot.stage->uniforms.at(slot.bank-UniformBankBase);
@@ -2302,6 +2411,66 @@ bool TryFastDraw(FastDraw& fd){
             *const_cast<VkDescriptorBufferInfo*>(descriptor_write_list[slot.write].pBufferInfo)=o;continue;}
         *const_cast<VkDescriptorBufferInfo*>(descriptor_write_list[slot.write].pBufferInfo)={range.buffer,range.offset-delta,std::min(b.size,range.available)+delta};
     }
+    return true;
+}
+bool TryFastDraw(FastDraw& fd){
+    if(FlushCount()!=fd.flushes){++fast_draw_fails[0];return false;}
+    if(PoolGeneration()!=fd.pools||TextureWriteSequence()!=fd.texture_writes){++fast_draw_fails[1];return false;} // (texture writes: re-upload via the full path)
+    if(!PassOpenWithKey(fd.key)){++fast_draw_fails[2];return false;}
+    return PatchResolved(*fd.pipeline,fd.colors,fd.depth,false);
+}
+// ---- resolutions kept per pipeline ---------------------------------------------------------------------------
+// The game draws its objects material by material, so most draws follow a draw of another program and resolved
+// all their descriptors anew (~6 us each, against under 1 us for a draw that follows one of its own program). The
+// resolution a pipeline's last draw made is kept for the batch, on the thread that made it: a later draw of that
+// pipeline takes it back and patches it as the fast path does, with its driver banks made again and every texture
+// checked. Only resolutions of uniform buffers, driver banks and single textures are kept.
+// OOT_RESOLVE_CACHE=1 turns it on (off by default: every such draw resolves anew).
+struct ResolveCache {
+    u64 pools=~0ull;
+    std::vector<VkWriteDescriptorSet> writes;std::vector<VkDescriptorBufferInfo> buffers;std::vector<VkDescriptorImageInfo> images;
+    struct Slot{u32 write,stage,bank;};std::vector<Slot> uniforms,drivers;std::vector<TextureSlot> textures;std::vector<StorageSlot> storage;std::vector<u32> storage_stage;
+    std::vector<Texture*> reads;std::vector<std::pair<u64,u64>> buffer_reads;
+};
+thread_local std::unordered_map<const Pipeline*,ResolveCache> resolve_cache;
+std::atomic<u64> resolve_cache_hits{0},resolve_cache_misses{0},resolve_cache_why[6]{};
+bool ResolveCacheOn(){static const bool on=std::getenv("OOT_RESOLVE_CACHE")!=nullptr;return on;} // (off unless asked for, as FastTextures)
+// (the writes' arrays are the cache's own from here on: the lists WriteDescriptors filled are reused by the next draw)
+void KeepResolved(const Pipeline& pipeline){
+    auto& c=resolve_cache[&pipeline];
+    c.pools=PoolGeneration();
+    c.writes=descriptor_write_list;c.buffers.clear();c.images.clear();
+    for(const auto& w:c.writes){if(w.pBufferInfo)c.buffers.insert(c.buffers.end(),w.pBufferInfo,w.pBufferInfo+w.descriptorCount);
+        else c.images.insert(c.images.end(),w.pImageInfo,w.pImageInfo+w.descriptorCount);}
+    State& st=*tls_state;const auto index=[&](const StageState* stage){return (u32)(stage-&st.stages[0]);};
+    c.uniforms.clear();for(const auto& u:uniform_write_slots)c.uniforms.push_back({u.write,index(u.stage),u.bank});
+    c.drivers.clear();for(const auto& d:driver_write_slots)c.drivers.push_back({d.write,index(d.stage),d.bank});
+    c.textures=texture_write_slots;c.reads=descriptor_reads;c.buffer_reads.assign(descriptor_buffer_reads.begin(),descriptor_buffer_reads.end());
+    c.storage=storage_write_slots;c.storage_stage.clear();for(const auto& q:storage_write_slots)c.storage_stage.push_back(index(q.stage));
+}
+// The pipeline's kept resolution as the current one, patched for this draw; false: none that holds.
+bool TakeResolved(Pipeline& pipeline,const std::array<Texture*,8>& colors,Texture* depth){
+    const auto it=resolve_cache.find(&pipeline);if(it==resolve_cache.end()){++resolve_cache_why[1];return false;}
+    auto& c=it->second;
+    // (kept across batches and frames: every texture is looked up and checked again, the buffers are resolved again.
+    // A pool that changed may have another texture or sampler behind a handle.)
+    if(c.pools!=PoolGeneration()){++resolve_cache_why[2];return false;}
+    // (held in lists of this thread's own: the draw's packet reads them after this returns)
+    static thread_local std::vector<VkDescriptorBufferInfo> buffers;static thread_local std::vector<VkDescriptorImageInfo> images;
+    buffers=c.buffers;images=c.images;descriptor_write_list=c.writes;
+    {size_t b=0,i=0;for(auto& w:descriptor_write_list){if(w.pBufferInfo){w.pBufferInfo=buffers.data()+b;b+=w.descriptorCount;}else{w.pImageInfo=images.data()+i;i+=w.descriptorCount;}}}
+    State& st=*tls_state;
+    uniform_write_slots.clear();for(const auto& u:c.uniforms)uniform_write_slots.push_back({u.write,&st.stages[u.stage],u.bank});
+    driver_write_slots.clear();for(const auto& d:c.drivers)driver_write_slots.push_back({d.write,&st.stages[d.stage],d.bank});
+    texture_write_slots=c.textures;descriptor_reads=c.reads;
+    storage_write_slots=c.storage;for(size_t k=0;k<storage_write_slots.size();++k)storage_write_slots[k].stage=&st.stages[c.storage_stage[k]];
+    descriptor_buffer_reads.assign(c.buffer_reads.begin(),c.buffer_reads.end());descriptor_buffer_writes.clear();descriptor_image_writes.clear();
+    descriptor_writes=false;resolve_to_general.clear();descriptor_fast_eligible=true;descriptor_cacheable=true;
+    if(!PatchResolved(pipeline,colors,depth,true)){++resolve_cache_why[3];descriptor_fast_eligible=false;descriptor_cacheable=false;return false;}
+    pipeline.descriptor_set=VK_NULL_HANDLE; // (a pipeline that pushes its descriptors: as WriteDescriptors leaves it)
+    // (what the patch changed is what the next draw of the pipeline starts from)
+    c.textures=texture_write_slots;c.reads=descriptor_reads;
+    {size_t n=0;for(const auto& w:descriptor_write_list)if(w.pImageInfo)for(u32 k=0;k<w.descriptorCount;++k)c.images[n++]=w.pImageInfo[k];}
     return true;
 }
 // OOT_SKIP_SHADER_FILE=<path> (diagnostic): draws and dispatches using the programs listed there (hex
@@ -2425,7 +2594,7 @@ bool ProbeFrameSkipped(){
     if(!t||t->width!=128||t->height!=128||t->format!=63)return false;
     return CurrentFrameNumber()%(u64)every!=0;
 }
-u64 mesh_indirect_source=0; // (with mesh_indirect_slot) the device address of the guest's {task count, first task}
+thread_local u64 mesh_indirect_source=0; // (with mesh_indirect_slot) the device address of the guest's {task count, first task}
 std::atomic<u64> mesh_fallback_draws{0};
 // The fallback's part of a mesh draw before its render pass: the records' header is reset, the task program's workgroups
 // run (their count the draw's, or the converted indirect arguments), then the mesh workgroups they started. `set`: the
@@ -2541,6 +2710,8 @@ void Draw(const Command& command) {
             const u64 ns = (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
             draw_cpu_profile.draws.fetch_add(1, std::memory_order_relaxed);
             draw_cpu_profile.total_ns.fetch_add(ns, std::memory_order_relaxed);
+            if (draw_was_fast) { draw_cpu_profile.fast_draws.fetch_add(1, std::memory_order_relaxed); draw_cpu_profile.fast_ns.fetch_add(ns, std::memory_order_relaxed); }
+            draw_was_fast = false;
             auto& stat = draw_cpu_profile.shaders[shader]; stat.first += ns; ++stat.second;
         }
     } draw_cpu_scope{profile_cpu, draw_cpu_start, (*tls_state).stages[1].shader ? (*tls_state).stages[1].shader->address : 0};
@@ -2622,8 +2793,18 @@ void Draw(const Command& command) {
         const u32 base_instance=op==Op::DrawElementsInstanced?(u32)a[5]:op==Op::DrawArraysInstanced?(u32)a[3]:0;
         if(base_vertex!=draw_base_vertex||base_instance!=draw_base_instance){draw_base_vertex=base_vertex;draw_base_instance=base_instance;fast_draw_allowed=false;}
     }
+    if(fast_pipeline_stale){fast_pipeline_stale=false;
+        if(fast_draw_allowed&&fd.valid){
+            if(mesh||fd.feedback)fast_draw_allowed=false;
+            else{Pipeline* p=&GetPipeline(false);if(resolve_bail)return;
+                if(p==fd.pipeline||(p->push&&p->shaders==fd.pipeline->shaders)){if(p!=fd.pipeline){fd.pipeline=p;++fast_pipeline_swaps;}}
+                else fast_draw_allowed=false;}}}
+    {static const bool why=std::getenv("OOT_SET_STATS")!=nullptr;if(why){static std::atomic<u64> n[5]{};static std::atomic<u64> at{0};
+        ++n[mesh?0:stats_pool?1:!fd.valid?2:!fast_draw_allowed?3:4];
+        if(!resolve_worker&&at.load()!=frame_number&&frame_number%300==0){at=frame_number;RT_LOG("draws a frame: mesh %.0f, counted %.0f, no fast draw to follow %.0f, state changed since %.0f, fast tried %.0f",n[0].exchange(0)/300.0,n[1].exchange(0)/300.0,n[2].exchange(0)/300.0,n[3].exchange(0)/300.0,n[4].exchange(0)/300.0);}}}
     const bool fast=!fast_disabled&&!mesh&&!stats_pool&&fast_draw_allowed&&fd.valid&&(resolve_worker||draw_predicate==~0u)&&TryFastDraw(fd);
     if(fast)++fast_draw_count;
+    draw_was_fast=fast;
     Pipeline* const pipeline_ptr=fast?fd.pipeline:&GetPipeline(mesh);
     if(resolve_bail)return;
     auto& pipeline=*pipeline_ptr;auto& vk=Vk();
@@ -2666,7 +2847,14 @@ void Draw(const Command& command) {
         da.imageLayout=VK_IMAGE_LAYOUT_GENERAL;da.loadOp=VK_ATTACHMENT_LOAD_OP_LOAD;da.storeOp=VK_ATTACHMENT_STORE_OP_STORE;if(depth)da.imageView=AttachmentView(*depth,(*tls_state).targets.depth_view);
         const auto descriptor_cpu_start = profile_cpu ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if(resolve_bail)return; // (an attachment view to make)
-        const bool descriptors_ready = WriteDescriptors(pipeline);
+        static const bool trace_draws=std::getenv("OOT_GPU_TRACE")!=nullptr; // (the dumps of a logged frame are WriteDescriptors' own: LogThisFrame)
+        const bool cache=ResolveCacheOn()&&pipeline.push&&!mesh&&!trace_draws&&!LogThisFrame();
+        const bool taken=cache&&TakeResolved(pipeline,colors,depth);
+        if(resolve_bail)return;
+        if(cache)++(taken?resolve_cache_hits:resolve_cache_misses);
+        const bool descriptors_ready = taken||WriteDescriptors(pipeline);
+        if(cache&&!taken&&descriptors_ready&&descriptor_fast_eligible&&descriptor_cacheable&&!descriptor_writes)KeepResolved(pipeline);
+        else if(cache&&!taken&&descriptors_ready)++resolve_cache_why[!descriptor_cacheable?4:5];
         if (profile_cpu) draw_cpu_profile.descriptors_ns.fetch_add((u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - descriptor_cpu_start).count(), std::memory_order_relaxed);
         if(!descriptors_ready)return;
         // Allocated only for a draw that is recorded: every slot in the counter range must be reset
@@ -2754,6 +2942,7 @@ void Draw(const Command& command) {
     pk.checkpoint=vk.checkpoint?((*tls_state).stages[1].shader?(*tls_state).stages[1].shader->address:0)|1:0;
     const u64 profile_key=(*tls_state).stages[1].shader?(*tls_state).stages[1].shader->address:0;
     if(resolve_worker){ // resolved only: the executor commits it in command order (CommitResolvedDraw)
+        if(pk.mesh==2){RESOLVE_BAIL();return;} // (its task and mesh programs run as dispatches first: the executor's)
         pk.OwnWrites();pk.set_pipeline=pipeline.push?nullptr:&pipeline;
         if(fast)pk.to_general.clear();else pk.to_general=resolve_to_general;
         pk.end_pass_after=!fast&&descriptor_writes;
@@ -2762,8 +2951,10 @@ void Draw(const Command& command) {
         resolve_out->items.push_back({0,0,&pk,false,0,false,0,0});++resolve_out->used;
         if(!fast){
             fd.valid=pipeline.push&&descriptor_fast_eligible&&!descriptor_writes&&!mesh;
+            if(!fd.valid)++slow_draw_why[!pipeline.push?128:!descriptor_fast_eligible?129:descriptor_writes?130:132];
             if(fd.valid){fd.pipeline=&pipeline;fd.colors=colors;fd.depth=depth;fd.extent=extent;fd.attachments=attachments;fd.da=da;fd.key=key;
-                fd.flushes=FlushCount();fd.pools=PoolGeneration();fd.texture_writes=TextureWriteSequence();}
+                fd.flushes=FlushCount();fd.pools=PoolGeneration();fd.texture_writes=TextureWriteSequence();
+                fd.feedback=false;for(auto* t:descriptor_reads){if(t==depth)fd.feedback=true;for(auto* c:colors)if(c==t)fd.feedback=true;}}
             fast_draw_allowed=fd.valid;
         }
         return;
@@ -2820,7 +3011,8 @@ void Draw(const Command& command) {
             fd.valid=pipeline.push&&descriptor_fast_eligible&&!descriptor_writes&&predicate==~0u&&!mesh;
             if(!fd.valid)++slow_draw_why[!pipeline.push?128:!descriptor_fast_eligible?129:descriptor_writes?130:predicate!=~0u?131:132];
             if(fd.valid){fd.pipeline=&pipeline;fd.colors=colors;fd.depth=depth;fd.extent=extent;fd.attachments=attachments;fd.da=da;fd.key=key;
-                fd.flushes=FlushCount();fd.pools=PoolGeneration();fd.texture_writes=TextureWriteSequence();}
+                fd.flushes=FlushCount();fd.pools=PoolGeneration();fd.texture_writes=TextureWriteSequence();
+                fd.feedback=false;for(auto* t:descriptor_reads){if(t==depth)fd.feedback=true;for(auto* c:colors)if(c==t)fd.feedback=true;}}
             fast_draw_allowed=fd.valid;
         }
         if(descriptor_writes)EndPass(); // later work must see its storage writes
@@ -3359,10 +3551,10 @@ bool ExecuteRenderCommand(const Command& command) {
     case Op::BindVertexBuffer: (*tls_state).vertices.at(x[0])={x[1],x[2]};break;
     case Op::BindVertexBuffers: for(u32 i=0;i<x[1];++i)std::memcpy(&(*tls_state).vertices.at(x[0]+i),data+i*16,16);break;
     case Op::BindVertexAttribState: {decltype((*tls_state).attributes) next{};std::memcpy(next.data(),data,std::min(command.data.size(),sizeof next));
-        if(next!=(*tls_state).attributes){(*tls_state).attributes=next;fast_draw_allowed=false;}break;} // (a different vertex format changes the pipeline)
+        if(next!=(*tls_state).attributes){(*tls_state).attributes=next;PipelineStateChanged();}break;} // (a different vertex format changes the pipeline)
     case Op::BindVertexStreamState: {decltype((*tls_state).streams) next{};std::memcpy(next.data(),data,std::min(command.data.size(),sizeof next));
-        if(next!=(*tls_state).streams){(*tls_state).streams=next;fast_draw_allowed=false;}break;}
-    case Op::BindTexture: if((*tls_state).stages.at(x[0]).textures.at(x[1])!=x[2]){(*tls_state).stages[x[0]].textures[x[1]]=x[2];fast_draw_allowed=false;}break;
+        if(next!=(*tls_state).streams){(*tls_state).streams=next;PipelineStateChanged();}break;}
+    case Op::BindTexture: if((*tls_state).stages.at(x[0]).textures.at(x[1])!=x[2]){(*tls_state).stages[x[0]].textures[x[1]]=x[2];if(!FastTextures())fast_draw_allowed=false;}break;
     case Op::BindTextures: for(u32 i=0;i<x[2];++i)std::memcpy(&(*tls_state).stages.at(x[0]).textures.at(x[1]+i),data+i*8,8);break;
     case Op::BindImage: (*tls_state).stages.at(x[0]).images.at(x[1])=x[2];break;
     case Op::BindImages: for(u32 i=0;i<x[2];++i)std::memcpy(&(*tls_state).stages.at(x[0]).images.at(x[1]+i),data+i*8,8);break;
@@ -3375,11 +3567,11 @@ bool ExecuteRenderCommand(const Command& command) {
     case Op::SetDepthRanges: if(x[0]==0&&x[1])std::memcpy(&(*tls_state).viewport.minDepth,data,8);break;
     case Op::SetScissor: (*tls_state).scissor={{(s32)x[0],(s32)x[1]},{(u32)x[2],(u32)x[3]}};break;
     case Op::SetScissors: if(x[0]==0&&x[1])std::memcpy(&(*tls_state).scissor,data,16);break;
-    case Op::BindBlendState: {u64 blend;std::memcpy(&blend,data,8);if((*tls_state).blends[blend&7]!=blend){(*tls_state).blends[blend&7]=blend;fast_draw_allowed=false;}break;}
-    case Op::BindColorState: {u32 v;std::memcpy(&v,data,4);if(v!=(*tls_state).color){(*tls_state).color=v;fast_draw_allowed=false;}break;}
+    case Op::BindBlendState: {u64 blend;std::memcpy(&blend,data,8);if((*tls_state).blends[blend&7]!=blend){(*tls_state).blends[blend&7]=blend;PipelineStateChanged();}break;}
+    case Op::BindColorState: {u32 v;std::memcpy(&v,data,4);if(v!=(*tls_state).color){(*tls_state).color=v;PipelineStateChanged();}break;}
     case Op::BindChannelMaskState: {u32 v;std::memcpy(&v,data,4);if(v!=(*tls_state).channel){(*tls_state).channel=v;fast_draw_allowed=false;}break;}
-    case Op::BindDepthStencilState: {u64 value;std::memcpy(&value,data,8);if(value!=(*tls_state).depth){(*tls_state).depth=value;fast_draw_allowed=false;}break;}
-    case Op::BindPolygonState: {u32 v;std::memcpy(&v,data,4);if(v!=(*tls_state).polygon){(*tls_state).polygon=v;fast_draw_allowed=false;}break;}
+    case Op::BindDepthStencilState: {u64 value;std::memcpy(&value,data,8);if(value!=(*tls_state).depth){(*tls_state).depth=value;PipelineStateChanged();}break;}
+    case Op::BindPolygonState: {u32 v;std::memcpy(&v,data,4);if(v!=(*tls_state).polygon){(*tls_state).polygon=v;PipelineStateChanged();}break;}
     case Op::BindMultisampleState: break;
     case Op::SetBlendColor: std::memcpy((*tls_state).blend_color,data,16);break;
     case Op::SetDepthBias: std::memcpy((*tls_state).depth_bias,command.f,12);break;
@@ -3877,7 +4069,7 @@ void ReportRenderCounter(u32 counter,u64 address,bool flag_applied) {
     auto* out=static_cast<u64*>(ResolveAddress(address,16));
     static const bool force_visible=std::getenv("OOT_SAMPLES_VISIBLE")!=nullptr; // (diagnostic: every sample count large)
     if((frame_skipping||force_visible)&&counter==1){ // (no draws ran: report the object visible so the next rendered frame draws it)
-        out[0]=1u<<20;out[1]=GuestTimestampNs();known_reports[address]=1u<<20;gpu_counters.reports.erase(address);return;}
+        out[0]=1u<<20;out[1]=GuestTimestampNs();SetKnownReport(address,1u<<20);gpu_counters.reports.erase(address);return;}
     // Reports of other counters (OoT: TIMESTAMP_TOP, 16) are also the game's one-shot flags: its CPU writes 1 into a
     // report's counter word to ask for something drawn under `SetRenderEnableConditional(not equal)` (doors, vines,
     // ornaments on a shield, prompts), and the report after that draw puts the word back to 0. The 0 was written when the
@@ -3888,7 +4080,7 @@ void ReportRenderCounter(u32 counter,u64 address,bool flag_applied) {
     {static const bool late=std::getenv("OOT_FLAG_REPORTS_LATE")!=nullptr,dynamic=std::getenv("OOT_DYNAMIC_RESOLUTION")!=nullptr;
      if(counter!=1&&!late&&!dynamic){
         static u64 ticks=0;const u64 stamp=last_present_ns+(++ticks%100000)*100; // (the fixed-resolution time, see below)
-        known_reports.erase(address);
+        EraseKnownReport(address);
         // (its word was cleared when the game recorded it, commands.cpp; the time still is the executor's to write: the
         // game measures its GPU load from these, and without them fell to its lowest render size, 854 wide)
         if(flag_applied){PrepareHostWrite(address+8,8);out[1]=stamp;return;}
@@ -3902,7 +4094,7 @@ void ReportRenderCounter(u32 counter,u64 address,bool flag_applied) {
     // that writes colour, a draw that did not run (its pipeline not ready) or no draw at all reads "visible" (4096),
     // written here in command order. OOT_OCC_UNSURE=<bits>: which of those stay counted (1 mesh, 2 colour, 4 not run, 8 empty).
     if(counter==1&&!OcclusionQueries()){
-        known_reports[address]=4096;gpu_counters.reports.erase(address);
+        SetKnownReport(address,4096);gpu_counters.reports.erase(address);
         PrepareHostWrite(address,16);out[0]=4096;out[1]=GuestTimestampNs();
         return;}
     if(counter==1){
@@ -3917,13 +4109,13 @@ void ReportRenderCounter(u32 counter,u64 address,bool flag_applied) {
         ++run_classes[!cls?0:(cls&4)?3:(cls&1)?1:(cls&2)?2:4];if(split)++run_split;
         run_note={};samples_run_open=false;
         if(cls&~keep){
-            known_reports[address]=4096;gpu_counters.reports.erase(address);
+            SetKnownReport(address,4096);gpu_counters.reports.erase(address);
             PrepareHostWrite(address,16);out[0]=4096;out[1]=GuestTimestampNs();
             if(gpu_counters.ready){gpu_counters.pending.push_back({0,SplitSegment(),~0u,2,0});gpu_counters.last_report=0;} // (its queries belong to no report)
             return;}
     }
-    if(counter==1){NotePendingReport(address);known_reports.erase(address);}
-    else known_reports[address]=0;
+    if(counter==1){NotePendingReport(address);EraseKnownReport(address);}
+    else SetKnownReport(address,0);
     const bool on_gpu=gpu_counters.ready;
     if(LogThisFrame()&&counter==1){const u32 open=gpu_counters.segment_query;AfterFlush([out,address,open]{RT_LOG("report @%#llx after its batch: %llu samples (segment query open when recorded: %d)",(unsigned long long)address,(unsigned long long)out[0],(int)(open!=~0u));});}
     if(on_gpu){
@@ -3974,8 +4166,8 @@ void ReportRenderCounter(u32 counter,u64 address,bool flag_applied) {
 // the group runs the usual way. OOT_PARALLEL_DRAWS=<helper threads> (0: off).
 namespace {
 // A draw or dispatch of the open batch's conditional rendering state, as DrawEnabled reads it.
-void ResolveDrawCommand(const Command& command){
-    State& st=*tls_state;st.primitive=command.x[0];
+void ResolveDrawCommand(const Command& command,bool mesh=false){
+    State& st=*tls_state;st.primitive=mesh?4:command.x[0];
     if(!st.render_enable)return;
     bool deferred=false;
     if(st.render_condition&&st.render_decided){if(st.render_decided==2)return;} // (one of the game's flags, decided when recorded)
@@ -3989,7 +4181,17 @@ void ResolveDrawCommand(const Command& command){
         if(resolve_bail)return;
     }
     const size_t before=resolve_out->items.size();
-    Draw(command);
+    if(mesh){ // (as ExecuteRenderCommand's DrawMeshTasksIndirect, with the arguments ExecuteSegmentsParallel had converted)
+        if(!gfx::Current().foliage_shadows&&!st.color_count&&st.targets.depth){const Texture* shadow=HostTexture(st.targets.depth);if(shadow&&shadow->format==50)return;}
+        if((Op)command.op==Op::DrawMeshTasks)Draw(command); // (its task counts are in the command)
+        else{
+            const auto converted=mesh_preclamped.find(command.x[0]);
+            Command direct=command;direct.op=(u32)Op::DrawMeshTasks;direct.x[0]=0;direct.x[1]=0;
+            mesh_indirect_slot=converted->second+1;mesh_indirect_source=0;
+            Draw(direct);
+            mesh_indirect_slot=0;
+        }
+    }else Draw(command);
     if(deferred&&resolve_out->items.size()>before){auto& item=resolve_out->items.back();
         item.deferred=true;item.condition=st.render_condition;item.if_equal=st.render_if_equal;item.depth=st.depth;item.depth_target=st.targets.depth;}
 }
@@ -4000,19 +4202,22 @@ bool IsDrawCommand(Op op){return op==Op::DrawArrays||op==Op::DrawElements||op==O
 void ResolveSegment(const CommandList& list,size_t begin,size_t end,SegmentOutput& out){
     State* const saved=tls_state;
     tls_state=&out.state;resolve_out=&out;resolve_checked=&out.checked;resolve_worker=true;resolve_bail=false;fast_draw.valid=false;fast_draw_allowed=false;
+    const bool mesh_ahead=MeshAhead()&&!LogThisFrame()&&!std::getenv("OOT_MESH_INDIRECT_CPU");
     for(size_t i=begin;i<end;++i){
         const Command& command=list.commands[i];
         NoteFastDrawBreaker(command);
         const Op op=(Op)command.op;
         if(IsDrawCommand(op))ResolveDrawCommand(command);
         else if(op==Op::ReportCounter||op==Op::ResetCounter)out.items.push_back({1,(u32)i,nullptr,false,0,false,0,0});
+        else if(mesh_ahead&&(op==Op::DrawMeshTasks||(op==Op::DrawMeshTasksIndirect&&mesh_preclamped.count(command.x[0])))){ResolveDrawCommand(command,true);++mesh_ahead_stats[resolve_bail?1:0];}
         else if(IsSerialItem(op)){
+            if(op==Op::DrawMeshTasks)++mesh_ahead_stats[2];else if(op==Op::DrawMeshTasksIndirect)++mesh_ahead_stats[3];
             if(op==Op::DrawMeshTasks||op==Op::DrawMeshTasksIndirect)out.state.primitive=4;
             if(out.snapshots_used==out.snapshots.size())out.snapshots.emplace_back();
             out.snapshots[out.snapshots_used]=out.state;out.items.push_back({2,(u32)i,nullptr,false,out.snapshots_used++,false,0,0});
         }
         else if(op!=Op::Barrier)ExecuteRenderCommand(command);
-        if(resolve_bail&&IsDrawCommand(op)){
+        if(resolve_bail&&(IsDrawCommand(op)||op==Op::DrawMeshTasksIndirect||op==Op::DrawMeshTasks)){
             // A draw that needs the executor (a texture with no image yet, a pipeline to build): the executor runs that
             // draw in its place, from this state, and the draws after it are resolved here as before.
             if(out.snapshots_used==out.snapshots.size())out.snapshots.emplace_back();
@@ -4068,7 +4273,12 @@ bool CommitSegment(SegmentOutput& out,const CommandList& list,size_t end,const s
         if(item.kind==2){
             // (what the later draws resolved may no longer hold after it: see ExecuteSegmentsParallel)
             main_state=out.snapshots[item.condition];fast_draw.valid=false;fast_draw_allowed=false;
-            ExecuteRenderCommand(list.commands[item.index]);
+            {static const bool times=std::getenv("OOT_PARALLEL_TIMES")!=nullptr; // (diagnostic: what the commands the executor runs itself cost, by kind)
+             if(times){static u64 ns[3]{},n[3]{},at=0;const Op o=(Op)list.commands[item.index].op;const u32 kind=o==Op::DrawMeshTasks||o==Op::DrawMeshTasksIndirect?0:IsDrawCommand(o)?1:2;
+                const auto t0=std::chrono::steady_clock::now();ExecuteRenderCommand(list.commands[item.index]);
+                ns[kind]+=(u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t0).count();++n[kind];
+                if(at!=frame_number&&frame_number%300==0){at=frame_number;RT_LOG("executor's own commands a frame: %.1f mesh draws %.2f ms, %.1f other draws %.2f ms, %.1f clears %.2f ms",n[0]/300.0,ns[0]/300e6,n[1]/300.0,ns[1]/300e6,n[2]/300.0,ns[2]/300e6);RT_LOG("mesh draws a frame: %.1f resolved ahead, %.1f tried and left to the executor, %.1f direct, %.1f indirect not tried",mesh_ahead_stats[0].exchange(0)/300.0,mesh_ahead_stats[1].exchange(0)/300.0,mesh_ahead_stats[2].exchange(0)/300.0,mesh_ahead_stats[3].exchange(0)/300.0);std::memset(ns,0,sizeof ns);std::memset(n,0,sizeof n);}
+             }else ExecuteRenderCommand(list.commands[item.index]);}
             if(resolutions_hold())continue;
             ExecuteSegmentSerial(list,item.index+1,end);
             return false;
@@ -4106,7 +4316,8 @@ struct ResolvePool {
             // (groups follow each other within a frame: spin through the gaps, sleep between frames)
             int spins=0;u64 now;
             while((now=generation.load())==seen){
-                if(++spins<20000){
+                static const int spin_limit=std::getenv("OOT_RESOLVE_SPIN")?std::atoi(std::getenv("OOT_RESOLVE_SPIN")):20000;
+                if(++spins<spin_limit){
 #if defined(__x86_64__)||defined(__i386__)
                     __builtin_ia32_pause();
 #endif
@@ -4134,10 +4345,23 @@ unsigned ParallelResolveThreads(){
     return n;
 }
 bool ParallelDrawsUsable(){
+    // (where texture memory is not watched - Windows, AMD without placed maps - a draw resolved ahead cannot know its
+    // textures are current: each is handed to the executor, which checks it by content when the draw is committed
+    // (EnsureUploaded's resolve_texture_unready). Draws were not resolved ahead at all there: 38 against 53 fps in a
+    // heavy view. OOT_PARALLEL_UNWATCHED=0: not resolved ahead, as before.)
+    static const bool unwatched=!std::getenv("OOT_PARALLEL_UNWATCHED")||std::atoi(std::getenv("OOT_PARALLEL_UNWATCHED"))!=0;
     static const bool diagnostics=std::getenv("OOT_PASS_HAZARDS")||std::getenv("OOT_GPU_TRACE")||std::getenv("OOT_DRAW_CPU_PROFILE")||std::getenv("OOT_COUNTER_CHECK")||std::getenv("OOT_SKIP_SHADER")||std::getenv("OOT_OLD_PIPELINE")||std::getenv("OOT_SYNC_PIPELINES");
-    return ParallelResolveThreads()&&!diagnostics&&!FrameSkipOn()&&!LogThisFrame()&&!GpuProfilingNow()&&(gpu_counters.ready||!samples.enabled)&&ring.buffer&&TextureWatchUsable();
+    return ParallelResolveThreads()&&!diagnostics&&!FrameSkipOn()&&!LogThisFrame()&&!GpuProfilingNow()&&(gpu_counters.ready||!samples.enabled)&&ring.buffer&&(TextureWatchUsable()||unwatched);
 }
 void ExecuteSegmentsParallel(const std::vector<ParallelSegment>& segments,const std::vector<u64>& report_addresses){
+    // OOT_PARALLEL_TIMES=1 (diagnostic): where a group's time goes on the executor.
+    static const bool times=std::getenv("OOT_PARALLEL_TIMES")!=nullptr;
+    static u64 tn[4]{},tg=0,td=0,tmax=0,tat=0;
+    const auto clock=[]{return (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();};
+    u64 t0=times?clock():0,t1=0,t2=0,t3=0;
+    struct TimesEnd{const bool on;u64& t0;u64& t1;u64& t2;u64& t3;const std::function<u64()> clock;~TimesEnd(){if(!on||!t3)return;const u64 t4=clock();tn[0]+=t1-t0;tn[1]+=t2-t1;tn[2]+=t3-t2;tn[3]+=t4-t3;++tg;
+        if(tat!=frame_number&&frame_number%300==0){tat=frame_number;RT_LOG("parallel groups a frame: %.1f, %.0f draws, the largest list %.0f%% of its group's; per frame: state pass %.2f ms, executor's own share %.2f ms, waiting for the others %.2f ms, committing %.2f ms",
+            tg/300.0,td/300.0,tg?tmax*1.0/tg:0.0,tn[0]/300e6,tn[1]/300e6,tn[2]/300e6,tn[3]/300e6);tn[0]=tn[1]=tn[2]=tn[3]=tg=td=tmax=0;}}} times_end{times,t0,t1,t2,t3,clock};
     std::lock_guard lock{BatchMutex()}; // (held throughout: nothing is recorded, submitted or retired while draws are resolved)
     WaitAsyncDraws();                   // (the packets of the group before are reused)
     auto& pool=Resolvers();
@@ -4173,10 +4397,22 @@ void ExecuteSegmentsParallel(const std::vector<ParallelSegment>& segments,const 
         RT_LOG("  frame %llu segment %zu/%zu: colour %ux%u f%u (%u targets) depth %ux%u, state depth %#x cond %#llx; %u draws %u mesh %u reports",(unsigned long long)frame_number,k,segments.size(),c?c->width:0,c?c->height:0,c?c->format:0,st.color_count,
             d?d->width:0,d?d->height:0,(u32)st.depth,(unsigned long long)st.render_condition,draws,mesh,reports);}}
     static State exit_state;exit_state=main_state;
+    // (the group's indirect mesh draws, found before the helper threads start: they resolve those draws from the slots
+    // given here. The conversion itself is recorded below, before anything of the group is committed.)
+    static std::vector<u64> mesh_sources;bool mesh_scanned=false;
+    {static const bool preclamp=!std::getenv("OOT_MESH_PRECLAMP")||std::atoi(std::getenv("OOT_MESH_PRECLAMP"))!=0;
+     static const bool cpu_args=std::getenv("OOT_MESH_INDIRECT_CPU")!=nullptr;
+     if(MeshAhead()&&preclamp&&!cpu_args){mesh_scanned=true;mesh_sources.clear();mesh_preclamped.clear();
+        for(const auto& seg:segments)for(size_t i=seg.begin;i<seg.end;++i)if((Op)seg.list->commands[i].op==Op::DrawMeshTasksIndirect){
+            const u64 address=seg.list->commands[i].x[0];
+            if(mesh_preclamped.count(address)||mesh_preclamped.size()>=IndirectClamp::Slots/4)continue;
+            mesh_preclamped[address]=u64(indirect_clamp.next++%IndirectClamp::Slots)*16;mesh_sources.push_back(address);}}}
     pool.segments=&segments;pool.count=(u32)segments.size();pool.next.store(0);pool.done.store(0);pool.open.store(true);
     pool.generation.fetch_add(1);
     {std::lock_guard wake_lock{pool.mutex};}pool.wake.notify_all();
+    if(times){t1=clock();u32 all=0,most=0;for(const auto& seg:segments){u32 d=0;for(size_t i=seg.begin;i<seg.end;++i)d+=IsDrawCommand((Op)seg.list->commands[i].op);all+=d;most=std::max(most,d);}td+=all;tmax+=all?most*100/all:0;}
     pool.Work();
+    if(times)t2=clock();
     while(pool.done.load()<pool.count){
 #if defined(__x86_64__)||defined(__i386__)
         __builtin_ia32_pause();
@@ -4188,6 +4424,7 @@ void ExecuteSegmentsParallel(const std::vector<ParallelSegment>& segments,const 
         __builtin_ia32_pause();
 #endif
     }
+    if(times)t3=clock();
     ++frame_groups;
     ++parallel_stats.groups;parallel_stats.segments+=segments.size();
     // The indirect mesh draws of the group: their arguments are converted for all of them here, in one piece of work,
@@ -4196,8 +4433,9 @@ void ExecuteSegmentsParallel(const std::vector<ParallelSegment>& segments,const 
     // that do are compute dispatches, which no group holds. OOT_MESH_PRECLAMP=0: each at its draw, as before.
     {static const bool preclamp=!std::getenv("OOT_MESH_PRECLAMP")||std::atoi(std::getenv("OOT_MESH_PRECLAMP"))!=0;
      static const bool cpu_args=std::getenv("OOT_MESH_INDIRECT_CPU")!=nullptr;
-     static std::vector<u64> sources;sources.clear();mesh_preclamped.clear();
-     if(preclamp&&!cpu_args)for(size_t j=0;j<segments.size();++j)for(const auto& item:pool.outputs[j]->items)
+     auto& sources=mesh_sources;
+     if(!mesh_scanned){sources.clear();mesh_preclamped.clear();}
+     if(preclamp&&!cpu_args&&!mesh_scanned)for(size_t j=0;j<segments.size();++j)for(const auto& item:pool.outputs[j]->items)
         if(item.kind==2&&(Op)segments[j].list->commands[item.index].op==Op::DrawMeshTasksIndirect){
             const u64 address=segments[j].list->commands[item.index].x[0];
             if(mesh_preclamped.count(address)||mesh_preclamped.size()>=IndirectClamp::Slots/4)continue;
@@ -4303,7 +4541,7 @@ void NextFrame() {
     if(frame_number%30==0)PollGpuProfileSwitch();
     frame_skipping=FrameSkipOn()&&skip_level&&frame_number%(skip_level+1)!=0;
     if(frame_number%300==0){ReportParallelStats();ReportDrawCpuProfile();ReportGpuProfile();{static u64 lf=0,ld=0;static const bool st=std::getenv("OOT_SET_STATS")!=nullptr;if(st&&stats.draws>ld)RT_LOG("fast draws: %.0f%% of %.0f draws per frame",100.0*(fast_draw_count-lf)/(stats.draws-ld),(stats.draws-ld)/300.0);if(st){std::string b;for(u32 i=0;i<128;++i)if(fast_draw_breakers[i]>300){char t[32];std::snprintf(t,sizeof t," op%u:%.1f",i,fast_draw_breakers[i]/300.0);b+=t;}
-            RT_LOG("  fast path ended by (per frame):%s; declined: flush %.1f pools %.1f pass %.1f shader %.1f constants %.1f",b.c_str(),fast_draw_fails[0]/300.0,fast_draw_fails[1]/300.0,fast_draw_fails[2]/300.0,fast_draw_fails[3]/300.0,fast_draw_fails[4]/300.0);
+            RT_LOG("  fast path ended by (per frame):%s; declined: flush %.1f pools %.1f pass %.1f shader %.1f constants %.1f texture handle %.1f texture not ready %.1f storage %.1f; textures patched %.1f, pipelines changed %.1f; resolutions taken back %.1f, made anew %.1f (new batch %.1f, first of its pipeline %.1f, stale %.1f, patch failed %.1f; not kept: other resources %.1f, ineligible %.1f)",b.c_str(),fast_draw_fails[0]/300.0,fast_draw_fails[1]/300.0,fast_draw_fails[2]/300.0,fast_draw_fails[3]/300.0,fast_draw_fails[4]/300.0,fast_draw_fails[5]/300.0,fast_draw_fails[6]/300.0,fast_draw_fails[7]/300.0,fast_texture_patches.exchange(0)/300.0,fast_pipeline_swaps.exchange(0)/300.0,resolve_cache_hits.exchange(0)/300.0,resolve_cache_misses.exchange(0)/300.0,resolve_cache_why[0].exchange(0)/300.0,resolve_cache_why[1].exchange(0)/300.0,resolve_cache_why[2].exchange(0)/300.0,resolve_cache_why[3].exchange(0)/300.0,resolve_cache_why[4].exchange(0)/300.0,resolve_cache_why[5].exchange(0)/300.0);
             {std::string w;for(u32 i=0;i<136;++i)if(slow_draw_why[i]>150){char t[40];std::snprintf(t,sizeof t,i<128?" op%u:%.1f":i==128?" nopush:%.1f":i==129?" ineligible:%.1f":i==130?" writes:%.1f":i==131?" predicate:%.1f":" mesh:%.1f",i<128?i:0,slow_draw_why[i]/300.0);if(i>=128)std::snprintf(t,sizeof t,i==128?" nopush:%.1f":i==129?" ineligible:%.1f":i==130?" writes:%.1f":i==131?" predicate:%.1f":" mesh:%.1f",slow_draw_why[i]/300.0);w+=t;}RT_LOG("  full-path draws caused by (per frame):%s",w.c_str());std::memset(slow_draw_why,0,sizeof slow_draw_why);}std::memset(fast_draw_breakers,0,sizeof fast_draw_breakers);std::memset(fast_draw_fails,0,sizeof fast_draw_fails);}lf=fast_draw_count;ld=stats.draws;}static const bool rate=std::getenv("OOT_BINDING_RATE")!=nullptr;if(rate)ReportBindingRate();}
     { static std::map<u32,u32> widths; if(frame_render_width>1)++widths[frame_render_width]; frame_render_width=0;
       if(frame_number%300==0&&!widths.empty()){std::string t;for(auto& [w,n]:widths){char b[32];std::snprintf(b,sizeof b," %u:%u",w,n);t+=b;}RT_LOG("render widths (frames):%s",t.c_str());widths.clear();} }

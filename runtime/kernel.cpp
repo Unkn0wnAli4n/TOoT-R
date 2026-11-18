@@ -233,7 +233,7 @@ void StartArbiterWatchdog() {
                     std::vector<std::pair<ArbiterWaitKey, ArbiterWaitStat>> top(arbiter_wait_stats.begin(), arbiter_wait_stats.end());
                     std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.waited > b.second.waited; });
                     RT_LOG("arbiter profile: %zu wait sites", top.size());
-                    for (size_t i = 0; i < std::min<size_t>(top.size(), 12); ++i) {
+                    for (size_t i = 0; i < std::min<size_t>(top.size(), std::getenv("OOT_ARB_PROFILE_TOP") ? (size_t)std::atoi(std::getenv("OOT_ARB_PROFILE_TOP")) : 12); ++i) {
                         const auto& [key, stat] = top[i];
                         RT_LOG("  thread %llu addr %#llx type %u lr %#llx (%s): %llu waits, %.2f ms total, %.2f ms max",
                                (unsigned long long)key.thread, (unsigned long long)key.addr, key.type, (unsigned long long)key.lr,
@@ -812,6 +812,21 @@ u32 SvcWaitForAddressImpl(Cpu* c) {
     const u64 addr = c->x[0];
     const u32 type = (u32)c->x[1];
     const s64 timeout = (s64)c->x[3];
+    // OOT_WAIT_SPIN_US=<n>: a thread about to wait for a word to change watches it for that long first. The game's job
+    // system hands work between its threads through such waits many times a frame, and a sleeping thread takes tens
+    // of microseconds to come back; the word changing while it is watched is the same as the call arriving later.
+    {static const int spin_us = std::getenv("OOT_WAIT_SPIN_US") ? std::atoi(std::getenv("OOT_WAIT_SPIN_US")) : 0;
+     if (spin_us > 0 && type == 2 && timeout != 0) {
+        const auto until = Clock::now() + std::chrono::microseconds(spin_us);
+        const u32 expected = (u32)c->x[2];
+        for (;;) {
+            if (__atomic_load_n(U32At(addr), __ATOMIC_RELAXED) != expected) return ResultInvalidState;
+            if (Clock::now() >= until) break;
+#if defined(__x86_64__) || defined(__i386__)
+            for (int i = 0; i < 8; ++i) __builtin_ia32_pause();
+#endif
+        }
+     }}
     std::unique_lock lock{k_lock};
     switch (type) {
     case 0: // WaitIfLessThan
