@@ -47,8 +47,8 @@ legally obtained dump of the game, on your machine.
 
 NVIDIA DLSS is not part of this project and is not distributed with it. When you tick the DLSS
 option, the installer downloads NVIDIA's DLSS files from NVIDIA's own repository onto your PC, under
-NVIDIA's licence, which you accept there. Without it everything else works the same. DLSS is
-offered by the Linux installer for now; on Windows it is not built in yet.
+NVIDIA's licence, which you accept there. Without it everything else works the same. On Windows
+DLSS is new and has not been tried on many PCs yet; tell us how it runs.
 
 ## Steam Deck: work in progress
 

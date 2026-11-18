@@ -1,5 +1,8 @@
 # TOoT:R installer for Windows (double-click install.cmd, or run:
-#   powershell -ExecutionPolicy Bypass -File install.ps1 [-Nup C:\path\game.nup] [-Dir C:\Games\TOoT-R])
+#   powershell -ExecutionPolicy Bypass -File install.ps1 [-Nup C:\path\game.nup] [-Dir C:\Games\TOoT-R] [-Dlss])
+# -Dlss: NVIDIA DLSS added (its SDK downloaded from NVIDIA's own repository during the installation; by giving it you
+# accept NVIDIA's RTX SDKs licence, github.com/NVIDIA/DLSS/blob/main/LICENSE.txt). Without it, an installation keeps
+# the choice it was made with.
 #
 # Sets up MSYS2 (CLANG64) with the build tools and libraries, asks for your own dump of the game and
 # for the folder to install into (default %LOCALAPPDATA%\tootr), builds the game there, and creates
@@ -9,7 +12,8 @@ param(
     [string]$Nup = "",
     [string]$Dir = "",
     [string]$Msys = "C:\msys64",
-    [string]$Repo = "Unkn0wnAli4n/TOoT-R"  # (keep in sync with installer/repo.txt)
+    [string]$Repo = "Unkn0wnAli4n/TOoT-R",  # (keep in sync with installer/repo.txt)
+    [switch]$Dlss
 )
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
@@ -101,7 +105,8 @@ $clang64 = Join-Path $Msys "clang64\bin"
 $env:PATH = "$clang64;" + (Join-Path $Msys "usr\bin") + ";$env:PATH"
 $env:MSYSTEM = "CLANG64"
 $python = Join-Path $clang64 "python.exe"
-& $python (Join-Path $source "installer\launcher.py") install --source $source --nup $Nup --dir $Dir
+$extra = @(); if ($Dlss) { $extra += "--dlss" }
+& $python (Join-Path $source "installer\launcher.py") install --source $source --nup $Nup --dir $Dir @extra
 if ($LASTEXITCODE -ne 0) { Say "the build failed; see the messages above"; exit 1 }
 if ($temp) { Remove-Item -Recurse -Force $temp -ErrorAction SilentlyContinue }
 

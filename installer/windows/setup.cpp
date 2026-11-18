@@ -24,7 +24,7 @@
 
 namespace {
 
-enum : int { IdNup = 101, IdNupBrowse, IdDir, IdDirBrowse, IdLog, IdInstall, IdClose, IdPlay, IdDetails, IdBack, IdFolder };
+enum : int { IdNup = 101, IdNupBrowse, IdDir, IdDirBrowse, IdLog, IdInstall, IdClose, IdPlay, IdDetails, IdBack, IdFolder, IdDlss };
 constexpr UINT WmOutput = WM_APP + 1, WmDone = WM_APP + 2;
 constexpr COLORREF Bg = RGB(0x12, 0x15, 0x1c), Panel = RGB(0x1b, 0x20, 0x2b), Field = RGB(0x24, 0x2b, 0x39), TextColor = RGB(0xe8, 0xea, 0xf0),
                    Muted = RGB(0x8d, 0x96, 0xa8), Accent = RGB(0xe0, 0xb6, 0x4a), Good = RGB(0x6f, 0xcf, 0x7f), Bad = RGB(0xef, 0x6b, 0x6b);
@@ -37,6 +37,7 @@ Step steps[] = {
     {L"packages", L"Download the build tools", 10},
     {L"source", L"Get TOoT:R's source", 2},
     {L"tools", L"Prepare the translator", 3},
+    {L"dlss", L"Download NVIDIA DLSS (if chosen)", 1},
     {L"check", L"Read and check your game", 3},
     {L"translate", L"Translate the game's code", 6},
     {L"compile", L"Compile the game", 55},
@@ -45,7 +46,7 @@ Step steps[] = {
 };
 
 enum Page { Setup, Working, Done, Failed } page = Setup;
-HWND window, nup_edit, dir_edit, log_edit, install_button, close_button, play_button, details_button, back_button, folder_button, nup_browse, dir_browse;
+HWND window, dlss_check, nup_edit, dir_edit, log_edit, install_button, close_button, play_button, details_button, back_button, folder_button, nup_browse, dir_browse;
 HFONT font, bold_font, title_font, heading_font, mono_font;
 HBRUSH bg_brush, field_brush, panel_brush;
 HICON icon;
@@ -285,7 +286,8 @@ void Install() {
     si.hStdOutput = si.hStdError = write;
     si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
     std::wstring command = L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" + script +
-                           L"\" -Nup \"" + nup + L"\" -Dir \"" + install_dir + L"\"";
+                           L"\" -Nup \"" + nup + L"\" -Dir \"" + install_dir + L"\"" +
+                           (SendMessageW(dlss_check, BM_GETCHECK, 0, 0) == BST_CHECKED ? L" -Dlss" : L"");
     PROCESS_INFORMATION pi{};
     if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, folder.c_str(), &si, &pi)) {
         CloseHandle(read); CloseHandle(write);
@@ -327,6 +329,7 @@ void Layout() {
     place(nup_browse, w - 116, 172, 90, 30, setup);
     place(dir_edit, 26, 296, w - 26 - 150, 30, setup);
     place(dir_browse, w - 116, 296, 90, 30, setup);
+    place(dlss_check, 26, 482, 18, 18, setup);
     place(install_button, w - 176, h - 62, 150, 42, setup);
     place(play_button, w - 176, h - 62, 150, 42, page == Done);
     place(close_button, w - (setup || page == Done ? 286 : 126), h - 58, 100, 34, true);
@@ -386,6 +389,10 @@ void Paint(HDC dc) {
         Draw(dc, space_note, 26, 330, w - 52, space_ok ? Good : Bad, font);
         Draw(dc, L"3   Build tools", 26, 370, 500, Accent, heading_font);
         Draw(dc, L"MSYS2 (compilers and libraries, about 3 GB) is downloaded and set up in C:\\msys64 if it is not there yet. No administrator rights are needed.", 26, 392, w - 52, Muted, font);
+        // (the box's own text is drawn here: a themed check box draws its label in black, unreadable on this background)
+        Draw(dc, L"4   Optional: NVIDIA DLSS", 26, 450, 500, Accent, heading_font);
+        Draw(dc, L"Add NVIDIA DLSS, DLAA and DLSS Frame Generation (NVIDIA RTX graphics cards)", 52, 481, w - 78, TextColor, font);
+        Draw(dc, L"Downloads NVIDIA's DLSS files (about 60 MB) from github.com/NVIDIA/DLSS during the installation. They are NVIDIA's software, not part of TOoT:R: by ticking the box you accept NVIDIA's RTX SDKs licence (github.com/NVIDIA/DLSS/blob/main/LICENSE.txt). Without it, AMD FSR 3.1 upscaling and frame generation still work on every graphics card.", 26, 506, w - 52, Muted, font);
         Draw(dc, L"The first installation compiles the whole game:\n15 to 60 minutes, depending on the processor.", 26, h - 62, 420, Muted, font);
         return;
     }
@@ -452,6 +459,7 @@ LRESULT CALLBACK Proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         dir_edit = Make(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, IdDir);
         SendMessageW(dir_edit, EM_SETCUEBANNER, TRUE, (LPARAM)(L"Default: " + DefaultDir()).c_str());
         dir_browse = Make(L"BUTTON", L"Change...", WS_TABSTOP | BS_OWNERDRAW, IdDirBrowse);
+        dlss_check = Make(L"BUTTON", L"", WS_TABSTOP | BS_AUTOCHECKBOX, IdDlss);
         log_edit = Make(L"EDIT", L"", WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, IdLog);
         SendMessageW(log_edit, WM_SETFONT, (WPARAM)mono_font, TRUE);
         SendMessageW(log_edit, EM_SETLIMITTEXT, 0, 0);
@@ -468,7 +476,7 @@ LRESULT CALLBACK Proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_SIZE: if (nup_edit) { Layout(); InvalidateRect(h, nullptr, TRUE); } return 0;
-    case WM_GETMINMAXINFO: { auto* m = (MINMAXINFO*)lp; m->ptMinTrackSize = {S(760), S(600)}; return 0; }
+    case WM_GETMINMAXINFO: { auto* m = (MINMAXINFO*)lp; m->ptMinTrackSize = {S(760), S(720)}; return 0; }
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
@@ -483,6 +491,7 @@ LRESULT CALLBACK Proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_CTLCOLOREDIT: case WM_CTLCOLORSTATIC: {
         const bool log = (HWND)lp == log_edit;
+        if ((HWND)lp == dlss_check) { SetBkColor((HDC)wp, Bg); return (LRESULT)bg_brush; } // (the window's own background around the box)
         SetTextColor((HDC)wp, log ? Muted : TextColor); SetBkColor((HDC)wp, log ? Panel : Field);
         return (LRESULT)(log ? panel_brush : field_brush);
     }
@@ -557,7 +566,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(1));
     wc.hIconSm = wc.hIcon;
     RegisterClassExW(&wc);
-    RECT r{0, 0, S(880), S(680)};
+    RECT r{0, 0, S(880), S(740)};
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     CreateWindowExW(0, L"TootrSetup", L"TOoT:R Installer", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                     r.right - r.left, r.bottom - r.top, nullptr, nullptr, instance, nullptr);
