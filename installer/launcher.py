@@ -486,6 +486,14 @@ def build(source, nup, dlss=False):
         return run_logged(sandbox(tool, ["python3"] + args, binds) if tool else [sys.executable] + args, "build") == 0
     ok = attempt()
     if not ok and sdk:
+        # (why, in the launcher's own log: its build log is replaced by the next attempt's - kept as build.1.log)
+        try:
+            with open(os.path.join(log_dir() or "", "build.log"), errors="replace") as f:
+                lines = [l.rstrip() for l in f if "error" in l.lower() or "undefined" in l.lower()]
+            for line in lines[:12]:
+                say("  " + line[:300])
+        except OSError:
+            pass
         # (the game itself must not be lost to an optional part: once more without NVIDIA's library)
         say("the build with NVIDIA DLSS did not finish: building once more without it (AMD FSR 3.1 still works)")
         os.environ["OOT_NGX_SDK"] = ""

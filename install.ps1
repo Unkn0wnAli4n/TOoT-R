@@ -142,3 +142,10 @@ foreach ($dir in @([Environment]::GetFolderPath("Programs"), [Environment]::GetF
     $link.Save()
 }
 Say "installed. Start the game from the Start menu or the desktop shortcut."
+# (run by hand in a console, not by the graphical installer - which starts PowerShell -NonInteractive and has its own
+# Play button: the game can be started from here at once)
+$interactive = [Environment]::UserInteractive -and -not ([Environment]::GetCommandLineArgs() | Where-Object { $_ -like "-NonI*" })
+if ($interactive) {
+    $answer = Read-Host "Start the game now? [Y/n]"
+    if ($answer -notmatch "^[nN]") { Start-Process -FilePath $runner -WorkingDirectory $data }
+}
