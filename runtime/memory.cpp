@@ -5,6 +5,7 @@
 #include <cstring>
 #include <mutex>
 
+#include "logfile.h"
 #include "rt.h"
 
 namespace rt {
@@ -12,11 +13,12 @@ namespace rt {
 void Fatal(const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    std::fprintf(stderr, "[rt] FATAL: ");
-    std::vfprintf(stderr, fmt, args);
-    std::fprintf(stderr, "\n");
+    char message[1024];
+    std::vsnprintf(message, sizeof message, fmt, args);
     va_end(args);
+    std::fprintf(stderr, "[rt] FATAL: %s\n", message);
     std::fflush(stderr);
+    rt::ShowFatal(message); // (a player who started from a shortcut sees why, and where the log is)
     std::abort();
 }
 

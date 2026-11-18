@@ -6,7 +6,8 @@
                                                        to install; the default place when none is given)
     launcher.py run [game args...]                     update if GitHub has a newer version, then play
     launcher.py update [--force]                       only update
-    launcher.py set-game [PATH]                        point the install at another copy of the game
+    launcher.py set-game [PATH]                        another copy of the game for this installation (asks when no
+                                                       path is given; "tootr --game [PATH]" does the same, then plays)
 
 Layout under the install directory (by default ~/.local/share/tootr, or %LOCALAPPDATA%\\tootr; the
 launcher finds the one it was installed into, OOT_RECOMP_HOME overrides):
@@ -56,8 +57,73 @@ def set_root(path):
 set_root(installed_dir())
 
 
+def log_dir():
+    """<install folder>/logs: the game's own log of each run (tootr.log, the three before it), the launcher's
+    (launcher.log) and the last build's output (build.log). What a problem report needs."""
+    path = os.path.join(ROOT, "logs")
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        return None
+    return path
+
+
 def say(msg):
     print(f"[TOoT:R] {msg}", flush=True)
+    try:  # (kept, with the time: a console window that closed took its lines with it)
+        logs = log_dir()
+        if logs:
+            path = os.path.join(logs, "launcher.log")
+            if os.path.exists(path) and os.path.getsize(path) > (1 << 20):
+                os.replace(path, path + ".old")
+            with open(path, "a", encoding="utf-8", errors="replace") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + str(msg) + "\n")
+    except OSError:
+        pass
+
+
+def run_logged(cmd, name):
+    """cmd run with its output shown as it comes and kept in logs/<name>.log (the one before it as <name>.1.log)."""
+    logs = log_dir()
+    if not logs:
+        return subprocess.run(cmd).returncode
+    path = os.path.join(logs, name + ".log")
+    try:
+        if os.path.exists(path):
+            os.replace(path, os.path.join(logs, name + ".1.log"))
+        out = open(path, "wb")
+    except OSError:
+        return subprocess.run(cmd).returncode
+    with out:
+        out.write((time.strftime("%Y-%m-%d %H:%M:%S ") + " ".join(str(c) for c in cmd) + "\n").encode("utf-8", "replace"))
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        target = getattr(sys.stdout, "buffer", None)
+        for line in iter(p.stdout.readline, b""):
+            out.write(line); out.flush()
+            try:
+                if target:
+                    target.write(line); target.flush()
+                else:
+                    sys.stdout.write(line.decode("utf-8", "replace")); sys.stdout.flush()
+            except (OSError, ValueError):
+                pass
+        return p.wait()
+
+
+def notify(text):
+    """A message the player sees even without a console: a system dialog where one is at hand."""
+    say(text)
+    try:
+        if WINDOWS:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, text, "TOoT:R", 0x10 | 0x10000)
+        elif os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            for cmd in (["zenity", "--error", "--title", "TOoT:R", "--no-wrap", "--text", text], ["kdialog", "--title", "TOoT:R", "--error", text]):
+                if shutil.which(cmd[0]):
+                    subprocess.run(cmd, timeout=600)
+                    break
+    except Exception:
+        pass
 
 
 def load_config():
@@ -180,7 +246,7 @@ def copy_source(src, dest):
 # ---- game file -----------------------------------------------------------------------------------
 def pick_game_file():
     """Asks for the .nup: a file dialog where one is available, else the terminal."""
-    prompt = "Select your dump of The Legend of Zelda: Ocarina of Time (Switch 2, v131072, .nup)"
+    prompt = "Select your dump of The Legend of Zelda: Ocarina of Time (Switch 2, .nup; update v131072 is the tested one)"
     path = None
     if not WINDOWS and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         for cmd in (["zenity", "--file-selection", "--title", prompt, "--file-filter=*.nup"],
@@ -417,11 +483,15 @@ def build(source, nup, dlss=False):
         tool = None
     if tool:
         binds = [nup] if nup and os.path.exists(nup) and not os.path.abspath(nup).startswith(ROOT + os.sep) else []
-        if subprocess.run(sandbox(tool, ["python3"] + args, binds)).returncode != 0:
+        if run_logged(sandbox(tool, ["python3"] + args, binds), "build") != 0:
+            say("the build's output is kept in " + os.path.join(ROOT, "logs", "build.log"))
             return False
         step("libraries")
         return bundle_libraries(tool)
-    return subprocess.run([sys.executable] + args).returncode == 0
+    if run_logged([sys.executable] + args, "build") != 0:
+        say("the build's output is kept in " + os.path.join(ROOT, "logs", "build.log"))
+        return False
+    return True
 
 
 def write_shortcuts(source):
@@ -560,6 +630,12 @@ def update(force=False):
 
 
 def cmd_run(args):
+    # (tootr --game [file]: choose the copy of the game to play from, then play)
+    if args and args[0] in ("--game", "--choose-game"):
+        path = args[1:2] if len(args) > 1 and not args[1].startswith("-") else []
+        if cmd_set_game(path):
+            return 1
+        args = args[1 + len(path):]
     update()
     cfg = load_config()
     exe = os.path.join(APP, "tootr" + EXE)
@@ -570,19 +646,60 @@ def cmd_run(args):
     if cfg.get("nup"):
         env.setdefault("OOT_RECOMP_NUP", cfg["nup"])
     env.setdefault("OOT_RECOMP_DATA", ROOT)
-    if WINDOWS:
-        return subprocess.run([exe] + args, env=env).returncode
+    command = [exe] + args
     loader = os.path.join(APP, "lib", "ld-linux-x86-64.so.2")
-    if cfg.get("own_libc") and os.path.exists(loader):  # (built against a newer C library than this system's: bundle_libraries)
-        os.execve(loader, [loader, "--library-path", os.path.join(APP, "lib"), exe] + args, env)
-    os.execve(exe, [exe] + args, env)
+    if not WINDOWS and cfg.get("own_libc") and os.path.exists(loader):  # (built against a newer C library than this system's: bundle_libraries)
+        command = [loader, "--library-path", os.path.join(APP, "lib"), exe] + args
+    say("starting the game: its log is " + os.path.join(ROOT, "logs", "tootr.log"))
+    try:
+        code = subprocess.run(command, env=env).returncode
+    except KeyboardInterrupt:
+        return 130
+    except OSError as e:
+        notify("TOoT:R could not be started: %s\n\nThe logs are in %s" % (e, os.path.join(ROOT, "logs")))
+        return 1
+    # (ended by itself with an error, or by a fault: the player is told where the log is. Closed by the player or the
+    # system - a signal such as SIGTERM, Ctrl+C - is not an error. The game shows its own message for the errors it
+    # knows; this is for the ones it could not: a missing library, a crash in a driver.)
+    stopped = code in (-2, -15, -9, 130, 143) or (WINDOWS and code in (0xC000013A, -1073741510))
+    if code != 0 and not stopped:
+        log = os.path.join(ROOT, "logs", "tootr.log")
+        tail = ""
+        try:
+            with open(log, "rb") as f:
+                lines = f.read().decode("utf-8", "replace").splitlines()
+            fatal = [l for l in lines if "FATAL" in l or "access violation" in l or "SIGSEGV" in l]
+            tail = "\n\n" + fatal[-1][:400] if fatal else ""
+        except OSError:
+            pass
+        shown_by_game = bool(tail)  # (the game's own message box said it: only noted here)
+        text = "TOoT:R closed unexpectedly (code %s).%s\n\nThe log of this run is kept here; attach it when you report the problem:\n%s" % (
+            hex(code & 0xffffffff) if WINDOWS else code, tail, log)
+        if shown_by_game:
+            say(text.replace("\n", " "))
+        else:
+            notify(text)
+    return code
 
 
 def cmd_set_game(args):
+    """Another copy of the game for this installation: asked for when no path is given. Its code is read at once; a
+    copy of the same game version changes nothing more, another version's is built (the long step)."""
     cfg = load_config()
-    cfg["nup"] = os.path.abspath(args[0]) if args else pick_game_file()
+    before = cfg.get("nup")
+    nup = os.path.abspath(os.path.expanduser(args[0])) if args else pick_game_file()
+    if not os.path.isfile(nup):
+        say("no such file: " + nup)
+        return 1
+    cfg["nup"] = nup
     save_config(cfg)
-    say("game file: " + cfg["nup"])
+    say("game file: " + nup)
+    if os.path.isdir(SOURCE) and not build(SOURCE, nup, bool(cfg.get("dlss"))):
+        cfg["nup"] = before
+        save_config(cfg)
+        say("this file could not be built: the game file is as it was" + (" (" + before + ")" if before else ""))
+        return 1
+    return 0
 
 
 def main():

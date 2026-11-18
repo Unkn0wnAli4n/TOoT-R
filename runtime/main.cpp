@@ -1,3 +1,4 @@
+#include "logfile.h"
 #ifdef __linux__
 #include "native/graphics_settings.h"
 #include <unistd.h>
@@ -69,6 +70,7 @@ static void RaiseDriverShaderCaches() {
 namespace rt { void StartProfiler(); }
 using rt::StartProfiler;
 int main(int argc, char** argv) {
+    rt::OpenLogFile(); // (<data>/logs/tootr.log, the three runs before it kept)
 #ifdef __linux__
     // Steam's Game Mode sets RADV_FORCE_VRS_CONFIG_FILE (its Half Rate Shading switch) for everything it starts, and
     // while that file exists RADV keys every graphics pipeline differently: neither this game's pipeline cache nor the

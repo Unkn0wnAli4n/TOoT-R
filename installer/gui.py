@@ -171,7 +171,8 @@ class Installer(tk.Tk):
         self.clear()
         b = self.body
         self.label(b, "1   Your copy of the game", ACCENT, 12, True).pack(anchor="w")
-        self.label(b, "The Legend of Zelda: Ocarina of Time for Nintendo Switch 2, update v131072, dumped as one .nup file. "
+        self.label(b, "The Legend of Zelda: Ocarina of Time for Nintendo Switch 2, dumped as one .nup file. Update v131072 is the tested one; "
+                      "other updates are built from what is found in them, and may lack some options. "
                       "It is only read on this computer: nothing from it is uploaded or downloaded.", MUTED, wraplength=820).pack(anchor="w", pady=(2, 8))
         row = tk.Frame(b, bg=BG); row.pack(fill="x")
         self.nup = tk.StringVar()
