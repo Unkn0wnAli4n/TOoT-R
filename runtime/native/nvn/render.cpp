@@ -3464,7 +3464,7 @@ void Dispatch(u32 gx,u32 gy,u32 gz,u64 indirect=0){
         for(const auto& r:v.compiled.resources){if(r.kind!=nvshader::ResourceKind::Image&&r.kind!=nvshader::ResourceKind::Texture)continue;
             for(u32 e=0;e<r.count;++e){const u32 handle=ResourceHandle(r,v,e);if(!handle)continue;Texture* t=Binding(handle).host.get();if(!t)continue;
                 char b[96];std::snprintf(b,sizeof b," [%s %ux%u f%u]",r.kind==nvshader::ResourceKind::Image?"img":"tex",t->width,t->height,t->format);c+=b;}}
-        RT_LOG("compute %#llx (network %d, frame %llu):%s",(unsigned long long)v.identity,(int)IsNetwork(*stage.shader),(unsigned long long)CurrentFrameNumber(),c.c_str());}}
+        RT_LOG("compute %#llx at %#llx (network %d, frame %llu):%s",(unsigned long long)v.identity,(unsigned long long)stage.shader->address,(int)IsNetwork(*stage.shader),(unsigned long long)CurrentFrameNumber(),c.c_str());}}
     {static const u64 dump=std::getenv("OOT_DUMP_COMPUTE")?std::strtoull(std::getenv("OOT_DUMP_COMPUTE"),nullptr,16):0;static int dumps=0; // (diagnostic: the textures a compute program reads, as raw files in the data folder)
      if(dump&&v.identity==dump&&CurrentFrameNumber()>1500&&CurrentFrameNumber()%90==0&&dumps<4){++dumps;int index=0;
         for(const auto& r:v.compiled.resources){if(r.kind!=nvshader::ResourceKind::Image&&r.kind!=nvshader::ResourceKind::Texture)continue;
