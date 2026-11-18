@@ -69,8 +69,10 @@ int mprotect(void* addr, size_t len, int prot) {
     return ok ? 0 : (errno = ENOMEM, -1);
 }
 
+namespace rt { void LazyForget(void* addr, size_t len); }
 int madvise(void* addr, size_t len, int advice) {
     if (advice != MADV_REMOVE) return 0;
+    rt::LazyForget(addr, len); // (decommitted below: no longer known to be usable)
     const bool ok = ForEachRegion(addr, len, [](void* p, size_t n, const MEMORY_BASIC_INFORMATION& info) {
         return info.State != MEM_COMMIT || VirtualFree(p, n, MEM_DECOMMIT) != 0;
     });
@@ -95,6 +97,14 @@ bool CommitReserved(std::uint64_t from, std::uint64_t to) {
     }
     return true;
 }
+// Which 64 KiB steps of the range are known to be committed whole: one bit each, set when a step is committed and
+// never by guessing. EnsureCommitted is called before every write the renderer makes into the game's memory -
+// thousands a frame - and asked the system each time (VirtualQuery): 60% of the renderer thread's time on a
+// reporter's PC, 16 frames a second where the graphics card had room for 40. Now it reads a bit.
+constexpr std::uint64_t LazyMaxChunks = (32ull << 30) / LazyChunk;
+std::atomic<std::uint64_t> lazy_known[LazyMaxChunks / 64];
+bool LazyKnown(std::uint64_t chunk) { return chunk < LazyMaxChunks && (lazy_known[chunk / 64].load(std::memory_order_relaxed) >> (chunk % 64) & 1); }
+void LazyMark(std::uint64_t chunk) { if (chunk < LazyMaxChunks) lazy_known[chunk / 64].fetch_or(1ull << (chunk % 64), std::memory_order_relaxed); }
 LONG CALLBACK LazyHandler(EXCEPTION_POINTERS* e) {
     if (e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || e->ExceptionRecord->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
     return CommitOnFault(reinterpret_cast<void*>(e->ExceptionRecord->ExceptionInformation[1]), e->ExceptionRecord->ExceptionInformation[0] == 1) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
@@ -115,12 +125,26 @@ bool CommitOnFault(void* address, bool write) {
     if (info.State == MEM_COMMIT) return info.Protect == PAGE_READWRITE || (!write && info.Protect == PAGE_READONLY);
     if (info.State != MEM_RESERVE) return false;
     const std::uint64_t from = std::max(base, a & ~(LazyChunk - 1)), to = std::min(end, (a & ~(LazyChunk - 1)) + LazyChunk);
-    return CommitReserved(from, to);
+    if (!CommitReserved(from, to)) return false;
+    LazyMark(((a & ~(LazyChunk - 1)) - (base & ~(LazyChunk - 1))) / LazyChunk);
+    return true;
+}
+void LazyForget(void* addr, size_t len) {
+    const std::uint64_t a = reinterpret_cast<std::uint64_t>(addr), base = lazy_base.load(), end = lazy_end.load();
+    if (!len || a + len <= base || a >= end) return;
+    const std::uint64_t origin = base & ~(LazyChunk - 1);
+    for (std::uint64_t c = (std::max(a, base) - origin) / LazyChunk, last = (std::min(a + len, end) - 1 - origin) / LazyChunk; c <= last && c < LazyMaxChunks; ++c)
+        lazy_known[c / 64].fetch_and(~(1ull << (c % 64)), std::memory_order_relaxed);
 }
 void EnsureCommitted(const void* address, size_t size) {
     const std::uint64_t a = reinterpret_cast<std::uint64_t>(address), base = lazy_base.load(), end = lazy_end.load();
     if (!size || a + size <= base || a >= end) return;
-    CommitReserved(std::max(base, a & ~0xfffull), std::min(end, (a + size + 0xfff) & ~0xfffull));
+    const std::uint64_t origin = base & ~(LazyChunk - 1);
+    for (std::uint64_t c = (std::max(a, base) - origin) / LazyChunk, last = (std::min(a + size, end) - 1 - origin) / LazyChunk; c <= last; ++c) {
+        if (LazyKnown(c)) continue;
+        // (the whole step, so that its bit can say so from now on)
+        if (CommitReserved(std::max(base, origin + c * LazyChunk), std::min(end, origin + (c + 1) * LazyChunk))) LazyMark(c);
+    }
 }
 } // namespace rt
 
