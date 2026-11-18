@@ -305,6 +305,38 @@ def build_game_code(tools, data, work, jobs):
     return cached
 
 
+def write_symbols(exe, out):
+    """Windows: the runtime's function names by their place in tootr.exe, written beside the installed (stripped)
+    executable as tootr.sym. The game names the functions in its crash report and in its profiler's output with it,
+    so a log sent with a report can be read. The recompiled game code's 300 thousand functions are left as one name."""
+    nm = shutil.which("llvm-nm")
+    if not nm or not os.path.exists(exe):
+        return
+    try:
+        with open(exe, "rb") as f:
+            head = f.read(4096)
+        pe = int.from_bytes(head[0x3c:0x40], "little")
+        base = int.from_bytes(head[pe + 24 + 24:pe + 24 + 32], "little")
+        listing = subprocess.run([nm, "--defined-only", "-n", "-C", exe], capture_output=True, text=True, errors="replace").stdout
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        last = None
+        with open(out, "w", encoding="utf-8", newline="\n") as f:
+            for line in listing.splitlines():
+                parts = line.split(None, 2)
+                if len(parts) < 3 or parts[1] not in "tT":
+                    continue
+                name = parts[2].strip()
+                if name.startswith(("main_", "sdk_", "subsdk", "native_fn_")):
+                    name = "<game code>"
+                if name == last:
+                    continue
+                last = name
+                f.write("%x %s\n" % (int(parts[0], 16) - base, name.replace(" ", "")[:120]))
+        log("function names for crash reports: " + out)
+    except (OSError, ValueError) as error:
+        log(f"function names not written: {error}")
+
+
 def build_runtime(game_lib, work, prefix, jobs, debug):
     build = os.path.join(work, "runtime-build")
     # (NVIDIA DLSS is built in only with NVIDIA's SDK, which is never part of this project: OOT_NGX_SDK=<its folder>)
@@ -312,6 +344,7 @@ def build_runtime(game_lib, work, prefix, jobs, debug):
     cmake_configure(ROOT, build, [f"-DOOT_GAME_LIB={game_lib}", f"-DCMAKE_INSTALL_PREFIX={prefix}",
                                   f"-DOOT_DEBUG_INFO={'ON' if debug else 'OFF'}", f"-DOOT_NGX_SDK={ngx}"])
     run(["cmake", "--build", build, "-j", str(jobs)])
+    write_symbols(os.path.join(build, "tootr.exe"), os.path.join(prefix, "tootr.sym"))
     run(["cmake", "--install", build] + ([] if debug else ["--strip"]))
     if not debug:  # (the installed copy is the one that runs; objects stay for incremental builds)
         for name in ("tootr", "tootr.exe"):

@@ -64,6 +64,9 @@ const std::string& DataDir();
 // Names the calling thread (debuggers, profilers, crash reports).
 void SetThreadName(const char* name);
 #ifdef _WIN32
+// The name of the function at an offset in tootr.exe, from tootr.sym beside it (tools/build_game.py writes it): "" when
+// there is no such file. offset_out: how far into the function.
+const char* SymbolAt(unsigned long long rva, unsigned long long* offset_out);
 void* ThreadByName(const char* name); // (the profiler: a handle of the last thread that took that name; null when none)
 #endif
 // Sleeps of the length asked for. Windows wakes a sleeping thread only on its timer tick, 15.6 ms apart unless a

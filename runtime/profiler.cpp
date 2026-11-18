@@ -244,7 +244,12 @@ std::string ModuleOffset(DWORD64 pc) {
     }
     char path[MAX_PATH]; const DWORD n = GetModuleFileNameA(module, path, MAX_PATH);
     const char* name = path; for (DWORD i = 0; i < n; ++i) if (path[i] == '\\' || path[i] == '/') name = path + i + 1;
-    std::snprintf(text, sizeof text, "%s+%#llx", n ? name : "?", (unsigned long long)(pc - reinterpret_cast<DWORD64>(module)));
+    const unsigned long long rva = pc - reinterpret_cast<DWORD64>(module);
+    if (module == GetModuleHandleW(nullptr)) { // (ours: by name when tootr.sym is there)
+        unsigned long long into = 0; const char* symbol = SymbolAt(rva, &into);
+        if (*symbol) { std::snprintf(text, sizeof text, "%s+%#llx", symbol, into); return text; }
+    }
+    std::snprintf(text, sizeof text, "%s+%#llx", n ? name : "?", rva);
     return text;
 }
 void Sampler(std::string name) {

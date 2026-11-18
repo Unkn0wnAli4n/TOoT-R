@@ -15,6 +15,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -199,6 +200,33 @@ void SetThreadName(const char* name) {
         std::snprintf(named_threads[slot].name, sizeof named_threads[slot].name, "%s", name);
         DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &named_threads[slot].handle, 0, FALSE, DUPLICATE_SAME_ACCESS);
     }
+}
+const char* SymbolAt(unsigned long long rva, unsigned long long* offset_out) {
+    struct Entry { unsigned long long rva; std::string name; };
+    static const std::vector<Entry> table = [] {
+        std::vector<Entry> t;
+        char exe[MAX_PATH]; const DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+        if (!n || n >= MAX_PATH) return t;
+        std::string path(exe, n);
+        if (const size_t cut = path.find_last_of("\\/"); cut != std::string::npos) path.resize(cut + 1);
+        if (FILE* f = std::fopen((path + "tootr.sym").c_str(), "r")) {
+            char line[256];
+            while (std::fgets(line, sizeof line, f)) {
+                char* end = nullptr; const unsigned long long at = std::strtoull(line, &end, 16);
+                if (!end || *end != ' ') continue;
+                std::string name(end + 1); while (!name.empty() && (name.back() == '\n' || name.back() == '\r')) name.pop_back();
+                t.push_back({at, std::move(name)});
+            }
+            std::fclose(f);
+        }
+        return t;
+    }();
+    if (offset_out) *offset_out = 0;
+    if (table.empty() || rva < table.front().rva) return "";
+    size_t lo = 0, hi = table.size();
+    while (hi - lo > 1) { const size_t mid = (lo + hi) / 2; if (table[mid].rva <= rva) lo = mid; else hi = mid; }
+    if (offset_out) *offset_out = rva - table[lo].rva;
+    return table[lo].name.c_str();
 }
 void* ThreadByName(const char* name) {
     const unsigned count = std::min(named_thread_count.load(), 256u);

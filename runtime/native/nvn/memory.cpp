@@ -586,6 +586,12 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* e) {
         std::fprintf(stderr, "[rt]   tootr.exe at %#llx; pc +%#llx; stack:", (unsigned long long)base, (unsigned long long)((u64)e->ContextRecord->Rip - base));
         for (USHORT i = 0; i < count; ++i) std::fprintf(stderr, " +%#llx", (unsigned long long)((u64)frames[i] - base));
         std::fprintf(stderr, "\n");
+        // (and by name, with tootr.sym beside the executable: only the frames inside it)
+        std::fprintf(stderr, "[rt]   in:");
+        const auto named = [&](u64 pc) { unsigned long long into = 0; const char* s = pc >= base && pc - base < (1ull << 31) ? rt::SymbolAt(pc - base, &into) : ""; if (*s) std::fprintf(stderr, " %s+%#llx <-", s, into); };
+        named((u64)e->ContextRecord->Rip);
+        for (USHORT i = 0; i < count; ++i) named((u64)frames[i]);
+        std::fprintf(stderr, "\n");
     }
     std::fflush(stderr);
     rt::ShowFatal("The game stopped on an error it could not recover from (an access violation).");
