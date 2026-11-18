@@ -51,10 +51,17 @@ void OpenLogFile() {
     }
     std::fflush(stdout); std::fflush(stderr);
     const int console = dup(fileno(stderr)); // (may be -1: a start without any console)
+#ifdef _WIN32
+    // A program started without a console has no descriptor behind stderr at all (fileno gives -2), so there is
+    // nothing to point at the file: the streams themselves are opened on it. (v0.3.0 left the file empty.)
+    if (!_wfreopen(path.wstring().c_str(), L"ab", stderr)) return;
+    _wfreopen(path.wstring().c_str(), L"ab", stdout);
+#else
     FILE* file = std::fopen(path.string().c_str(), "ab");
     if (!file) { if (console >= 0) { const char* m = "[rt] the log file cannot be written\n"; (void)!write(console, m, (unsigned)std::strlen(m)); } return; }
     dup2(fileno(file), fileno(stderr));
     dup2(fileno(file), fileno(stdout));
+#endif
     std::setvbuf(stderr, nullptr, _IONBF, 0);
     std::setvbuf(stdout, nullptr, _IOLBF, 1 << 12);
     log_path = path.string(); console_fd = console;
@@ -64,7 +71,11 @@ void OpenLogFile() {
         std::fprintf(stderr, "[rt] log of %s (%s)\n", stamp, log_path.c_str());
     }
     if (console >= 0) std::thread([console, path] {
+#ifdef _WIN32
+        FILE* in = _wfopen(path.wstring().c_str(), L"rb");
+#else
         FILE* in = std::fopen(path.string().c_str(), "rb");
+#endif
         if (!in) return;
         char buffer[4096];
         for (;;) {
