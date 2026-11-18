@@ -53,7 +53,7 @@ bool VideoMemoryTight(u64* used_out=nullptr,u64* budget_out=nullptr){
 std::atomic<bool> memory_pressure{false}; // (an image allocation failed: textures loaded from now on are compressed as Low does)
 // (OOT_IMAGE_TRACE: live images by kind)
 std::mutex live_kinds_mutex; std::map<std::tuple<u32,u32,u32,bool,bool>,std::pair<s64,s64>> live_kinds;
-void NoteLive(const Texture& t,s64 sign){ static const bool on=std::getenv("OOT_IMAGE_TRACE")!=nullptr; if(!on)return;
+void NoteLive(const Texture& t,s64 sign){ // (always: a map update per image made or freed; the list is logged when video memory is full)
     std::lock_guard l{live_kinds_mutex}; auto& k=live_kinds[{t.width,t.height,t.format,(t.usage&(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))!=0,t.decoded_astc}];
     k.first+=sign; k.second+=sign*(s64)t.allocation_size; }
 // GPU-written images kept for re-created texture objects (history buffers, transient targets).
@@ -1129,6 +1129,15 @@ void ReportImageCache() {
     AgeSpareImages();
     if (const u64 reduced = images_reduced.exchange(0), shared = images_in_shared_memory.exchange(0); reduced || shared)
         RT_LOG("textures: %llu loaded without their largest level, %llu placed in memory shared with the system (the card's own was full)", (unsigned long long)reduced, (unsigned long long)shared);
+    // (a full card: what holds the memory, largest first, at most once a minute and six times - a log sent with a report
+    // then says where the video memory went)
+    {u64 used=0,budget=0;VideoMemoryTight(&used,&budget);static u64 last_frame=0;static u32 told=0;
+     if(budget&&used>budget&&told<6&&CurrentFrameNumber()-last_frame>3600){last_frame=CurrentFrameNumber();++told;
+        std::lock_guard l{live_kinds_mutex};std::vector<std::tuple<s64,s64,u32,u32,u32,bool,bool>> top;
+        for(auto& [k,v]:live_kinds)if(v.first)top.push_back({v.second,v.first,std::get<0>(k),std::get<1>(k),std::get<2>(k),std::get<3>(k),std::get<4>(k)});
+        std::sort(top.rbegin(),top.rend());
+        RT_LOG("video memory full (%llu of %llu MiB): %.0f MiB of images live, %.0f MiB cached; the largest kinds:",(unsigned long long)(used>>20),(unsigned long long)(budget>>20),image_live_bytes/1048576.0,image_cached_bytes/1048576.0);
+        for(size_t i=0;i<top.size()&&i<24;++i)RT_LOG("  held %ux%u fmt %u%s%s: %lld images, %.0f MiB",std::get<2>(top[i]),std::get<3>(top[i]),std::get<4>(top[i]),std::get<5>(top[i])?" target-capable":"",std::get<6>(top[i])?" astc":"",(long long)std::get<1>(top[i]),std::get<0>(top[i])/1048576.0);}}
     {u64 used=0,budget=0;const bool tight=VideoMemoryTight(&used,&budget);
      // (short of video memory: what is only kept for speed goes before an allocation fails and the picture stalls)
      if(tight){DropSpareImages(8, 128ull << 20);static u32 told=0;if(told++<8)RT_LOG("video memory tight: %llu of %llu MiB the system allows in use; spare render targets released",(unsigned long long)(used>>20),(unsigned long long)(budget>>20));}
@@ -1150,7 +1159,7 @@ void ReportImageCache() {
         std::lock_guard l{live_kinds_mutex}; std::vector<std::pair<s64,std::string>> top;
         for (auto& [k,v] : live_kinds) if (v.first) { char b[160]; std::snprintf(b,sizeof b,"%ux%u fmt %u%s%s: %lld images, %.0f MiB",std::get<0>(k),std::get<1>(k),std::get<2>(k),std::get<3>(k)?" attachment":"",std::get<4>(k)?" astc":"",(long long)v.first,v.second/1048576.0); top.push_back({v.second,b}); }
         std::sort(top.rbegin(),top.rend());
-        for (size_t i=0;i<top.size()&&i<14;++i) RT_LOG("  live %s",top[i].second.c_str());
+        for (size_t i=0;i<top.size()&&i<(std::getenv("OOT_IMAGE_TRACE_ALL")?400u:14u);++i) RT_LOG("  live %s",top[i].second.c_str());
         ReportImageAges();
     }
 }
