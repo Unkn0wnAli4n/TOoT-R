@@ -127,7 +127,7 @@ const std::vector<Row>& Rows() {
         {"Display", "HDR Highlights", &S::hdr_boost, {{"Off", 0}, {"25%", 25}, {"50%", 50}, {"75%", 75}, {"100%", 100}}, "How strongly the brightest parts of the picture are raised above paper white. Off shows the game's picture unchanged, only in the HDR signal.", false, false},
         {"Display", "Frame Rate Cap", &S::frame_cap, {{"15", 15}, {"20", 20}, {"30", 30}, {"40", 40}, {"45", 45}, {"60", 60}, {"90", 90}, {"120", 120}, {"144", 144}, {"165", 165}, {"240", 240}, {"Uncapped", 0}},
          "The most frames shown per second. The game keeps its normal speed at every cap. 40 suits a Steam Deck set to 40 Hz or 80 Hz.", true, false},
-        {"Display", "FPS Counter", &S::show_fps, {{"Off", 0}, {"On", 1}, {"With Graph", 2}, {"With Details", 3}}, "Shows the frame rate and frame time. With Graph adds the last frames' times as a plot (a flat line is a smooth game); With Details adds what a frame costs the GPU and the renderer, and the video memory in use.", false, false},
+        {"Display", "FPS Counter", &S::show_fps, {{"Off", 0}, {"On", 1}, {"With Graph", 2}, {"With Details", 3}}, "Shows the frame rate and frame time. With Graph adds the last frames' times as a plot (a flat line is a smooth game; the faint lines mark 60 and 30 frames a second), their average, the rate of the slowest hundredth and the longest one; With Details adds what a frame costs the GPU and the renderer, the video memory in use and the 3D resolution.", false, false},
         {"Display", "FPS Counter Position", &S::fps_corner, {{"Top Left", 0}, {"Top Right", 1}, {"Bottom Left", 2}, {"Bottom Right", 3}}, "The corner the FPS counter sits in.", false, false},
 
         {"Resolution and anti-aliasing", "Quality Profile", &S::handheld, {{"Console", 0}, {"Handheld", 1}}, "Handheld is the game's own lower-detail profile, as the console uses undocked. Takes effect after a restart.", true, true},
@@ -595,7 +595,7 @@ void Counter() {
     const ImVec2 display = ImGui::GetIO().DisplaySize;
     const float pad = 12 * scale;
     ImGui::SetNextWindowPos(ImVec2(corner & 1 ? display.x - pad : pad, corner & 2 ? display.y - pad : pad), ImGuiCond_Always, ImVec2(corner & 1 ? 1.0f : 0.0f, corner & 2 ? 1.0f : 0.0f));
-    ImGui::SetNextWindowBgAlpha(0.45f);
+    ImGui::SetNextWindowBgAlpha(level >= 2 ? 0.6f : 0.45f);
     static float times[240]; static int at = 0;
     const float dt_ms = ImGui::GetIO().DeltaTime * 1000.0f;
     times[at] = dt_ms; at = (at + 1) % 240;
@@ -606,17 +606,50 @@ void Counter() {
         if (const float shown = nvn::ShownFps(); shown > fps * 1.2f) ImGui::Text("%.0f fps  (game %.0f, %.1f ms)", shown, fps, fps > 0 ? 1000.0f / fps : 0.0f);
         else ImGui::Text("%.0f fps  %.1f ms", fps, fps > 0 ? 1000.0f / fps : 0.0f);
         if (level >= 2) {
-            float worst = 0; for (float t : times) worst = std::max(worst, t);
+            // The last 240 frame times, drawn here rather than by ImGui's plot (whose label sat over the line): the line,
+            // faint guides where 60 and 30 frames a second lie, the scale's top, and under it the numbers that say how
+            // even the frames are - their average, the rate of the slowest hundredth, and the longest one.
+            float worst = 0, sum = 0; int counted = 0;
+            float slowest[3] = {0, 0, 0}; // (the three longest of 240: the slowest hundredth)
+            for (float t : times) {
+                if (t <= 0) continue;
+                worst = std::max(worst, t); sum += t; ++counted;
+                if (t > slowest[2]) { slowest[2] = t; if (slowest[2] > slowest[1]) std::swap(slowest[2], slowest[1]); if (slowest[1] > slowest[0]) std::swap(slowest[1], slowest[0]); }
+            }
+            const float average = counted ? sum / counted : 0.0f;
+            const float low_ms = (slowest[0] + slowest[1] + slowest[2]) / 3.0f;
             const float top = std::max(20.0f, std::ceil(worst / 10.0f) * 10.0f);
-            char label[32]; std::snprintf(label, sizeof label, "worst %.1f ms", worst);
-            ImGui::PlotLines("##times", times, 240, at, label, 0.0f, top, ImVec2(220 * scale, 48 * scale));
+            char numbers[96]; std::snprintf(numbers, sizeof numbers, "avg %.1f ms   1%% low %.0f fps   worst %.1f ms", average, low_ms > 0 ? 1000.0f / low_ms : 0.0f, worst);
+            // (as wide as the row of numbers under it, so the two line up)
+            const ImVec2 size(std::max(250 * scale, ImGui::CalcTextSize(numbers).x), 58 * scale), p0 = ImGui::GetCursorScreenPos(), p1(p0.x + size.x, p0.y + size.y);
+            ImGui::Dummy(size);
+            ImDrawList* draw = ImGui::GetWindowDrawList();
+            ImFont* font = ImGui::GetFont(); const float small = ImGui::GetFontSize() * 0.78f;
+            draw->AddRectFilled(p0, p1, IM_COL32(0, 0, 0, 175), 3 * scale);
+            const auto y_of = [&](float ms) { return p1.y - size.y * std::min(ms, top) / top; };
+            for (const auto& [ms, name] : {std::pair<float, const char*>{1000.0f / 60, "60"}, {1000.0f / 30, "30"}}) {
+                if (ms >= top) continue;
+                draw->AddLine(ImVec2(p0.x, y_of(ms)), ImVec2(p1.x, y_of(ms)), IM_COL32(255, 255, 255, 46), 1.0f);
+                draw->AddText(font, small, ImVec2(p1.x - small * 1.4f, std::max(p0.y, y_of(ms) - small * 1.05f)), IM_COL32(255, 255, 255, 120), name);
+            }
+            ImVec2 points[240];
+            for (int i = 0; i < 240; ++i) points[i] = ImVec2(p0.x + size.x * i / 239.0f, y_of(times[(at + i) % 240]));
+            draw->AddPolyline(points, 240, IM_COL32(120, 230, 150, 255), 0, std::max(1.0f, 1.4f * scale));
+            char label[32]; std::snprintf(label, sizeof label, "%.0f ms", top);
+            draw->AddText(font, small, ImVec2(p0.x + 4 * scale, p0.y + 2 * scale), IM_COL32(255, 255, 255, 150), label);
+            ImGui::TextUnformatted(numbers);
         }
         if (level >= 3) {
             const nvn::FrameCosts costs = nvn::LastFrameCosts();
             ImGui::Text("GPU %.1f ms   renderer %.1f ms", costs.gpu_ms, costs.record_ms);
             u64 used = 0, budget = 0; nvn::VideoMemoryNow(&used, &budget);
-            if (budget) ImGui::Text("video memory %.1f of %.1f GiB", used / 1073741824.0, budget / 1073741824.0);
-            ImGui::Text("%.0f x %.0f", display.x, display.y);
+            if (budget) {
+                // (over what the system allows: the driver moves pictures to the PC's memory and everything slows down)
+                const bool over = used > budget;
+                ImGui::TextColored(over ? ImVec4(1.0f, 0.55f, 0.45f, 1.0f) : ImGui::GetStyleColorVec4(ImGuiCol_Text), "video memory %.1f of %.1f GiB%s", used / 1073741824.0, budget / 1073741824.0, over ? " (full)" : "");
+            }
+            if (const int render = gfx::EffectiveRenderScale(); render > 0 && render < 100) ImGui::Text("%.0f x %.0f   3D at %d%%", display.x, display.y, render);
+            else ImGui::Text("%.0f x %.0f", display.x, display.y);
         }
     }
     ImGui::End();
