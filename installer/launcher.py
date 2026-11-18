@@ -481,16 +481,21 @@ def build(source, nup, dlss=False):
     if tool and not sandbox_works(tool):
         say("the build tools' sandbox cannot start on this system (unprivileged user namespaces are off): using the system's tools")
         tool = None
-    if tool:
-        binds = [nup] if nup and os.path.exists(nup) and not os.path.abspath(nup).startswith(ROOT + os.sep) else []
-        if run_logged(sandbox(tool, ["python3"] + args, binds), "build") != 0:
-            say("the build's output is kept in " + os.path.join(ROOT, "logs", "build.log"))
-            return False
-        step("libraries")
-        return bundle_libraries(tool)
-    if run_logged([sys.executable] + args, "build") != 0:
+    binds = [nup] if tool and nup and os.path.exists(nup) and not os.path.abspath(nup).startswith(ROOT + os.sep) else []
+    def attempt():
+        return run_logged(sandbox(tool, ["python3"] + args, binds) if tool else [sys.executable] + args, "build") == 0
+    ok = attempt()
+    if not ok and sdk:
+        # (the game itself must not be lost to an optional part: once more without NVIDIA's library)
+        say("the build with NVIDIA DLSS did not finish: building once more without it (AMD FSR 3.1 still works)")
+        os.environ["OOT_NGX_SDK"] = ""
+        ok = attempt()
+    if not ok:
         say("the build's output is kept in " + os.path.join(ROOT, "logs", "build.log"))
         return False
+    if tool:
+        step("libraries")
+        return bundle_libraries(tool)
     return True
 
 
