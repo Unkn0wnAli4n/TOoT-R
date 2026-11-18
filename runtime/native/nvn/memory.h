@@ -114,6 +114,7 @@ u32 ArmTextureMemory(u64 address, u64 size);
 bool PageProtectionUsable();
 bool PoolsInGpuMemory(); // (every pool is GPU memory mapped at its address or plain memory: nothing imported, submissions are cheap)
 bool TextureWatchUsable(); // (CPU writes to texture memory are found by page protection: memory.cpp)
+bool PoolsMirrored();     // (GPU-cached pools have copies in device memory, kept current at each submission)
 void NoteLateReadRange(u64 address, u64 size); // (its pages are never made inaccessible for a pending write-back)
 // GPU results kept in a pool's device copy (batch.cpp): inaccessible to the CPU until copied back.
 void ProtectDeviceAhead(u64 start, u64 end, const std::set<u64>* keep = nullptr);

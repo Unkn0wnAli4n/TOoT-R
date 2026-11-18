@@ -1618,6 +1618,7 @@ std::string DescribeDeviceAddress(u64 address) {
     }
     return "not in a guest pool";
 }
+bool PoolsMirrored() { return MirrorEnabled(); }
 } // namespace nvn
 
 using namespace nvn;

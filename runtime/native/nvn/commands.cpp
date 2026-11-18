@@ -265,6 +265,12 @@ bool RunParallelGroup(QueueContext& c, Work& w) {
     const size_t end = std::min(w.end, w.list->commands.size());
     u32 draws = 0;
     const size_t stop = ParallelRunEnd(*w.list, w.next, end, &draws, &reports);
+    {static const bool times = std::getenv("OOT_PARALLEL_TIMES") != nullptr;
+     if (times && draws < ParallelRunDraws) { static u64 short_draws = 0, runs = 0, stoppers[160]{}, at = 0;
+        short_draws += draws; ++runs; if (stop < end) ++stoppers[std::min<u32>(w.list->commands[stop].op, 159)]; else ++stoppers[159];
+        if (const u64 now = CurrentFrameNumber(); now != at && now % 300 == 0) { at = now; std::string t;
+            for (u32 i = 0; i < 160; ++i) if (stoppers[i] > 150) { char b[40]; std::snprintf(b, sizeof b, i == 159 ? " end:%.1f" : " op%u:%.1f", i == 159 ? stoppers[i] / 300.0 : (double)i, stoppers[i] / 300.0); if (i != 159) std::snprintf(b, sizeof b, " op%u:%.1f", i, stoppers[i] / 300.0); t += b; }
+            RT_LOG("short runs a frame: %.1f with %.1f draws, ended by:%s", runs / 300.0, short_draws / 300.0, t.c_str()); short_draws = runs = 0; std::memset(stoppers, 0, sizeof stoppers); } } }
     if (draws < ParallelRunDraws && stop < end) {
         // Not here: the usual way up to the next run that is.
         size_t at = stop + 1, cut = end;
@@ -672,9 +678,17 @@ Step ExecuteFrom(const CommandList& list, size_t& index, size_t end, std::vector
             // frame's data; GPU results are still waited for where they are read (WaitForWrites, page faults): 54 fps.
             // OOT_FENCE=done|submit|record (record: as soon as recorded, an experiment: later CPU writes can reach
             // the frame's draws). OOT_EARLY_FENCES=1 is record, as before.
+            // "submit" holds only where the device has its own copies of the pools. Where the GPU reads the game's
+            // memory itself (no copies: Windows, AMD, GPUs that share system memory) the game wrote its next frame's
+            // data over what a slower GPU had yet to draw: HUD and menu pieces at wrong places and sizes, wrong
+            // icons, on a GPU-bound Windows laptop (gone with "done"). There the default is "done".
             static const int fence_mode = [] { const char* e = std::getenv("OOT_FENCE");
                 if (std::getenv("OOT_EARLY_FENCES") || (e && !std::strcmp(e, "record"))) return 2;
-                return e && !std::strcmp(e, "done") ? 0 : 1; }();
+                if (e && !std::strcmp(e, "done")) return 0;
+                if (e && !std::strcmp(e, "submit")) return 1;
+                const bool copies = nvn::PoolsMirrored();
+                if (!copies) RT_LOG("fences: signalled when the GPU has finished (it reads the game's memory in place)");
+                return copies ? 1 : 0; }();
             if (fence_mode == 2) { __atomic_store_n(sync, 1u, __ATOMIC_RELEASE); break; }
             if (fence_mode == 1) {
                 __atomic_store_n(sync, 0u, __ATOMIC_RELEASE);
