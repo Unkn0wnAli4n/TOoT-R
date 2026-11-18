@@ -13,13 +13,16 @@ legally obtained dump of the game, on your machine.
 - **Upscalers.** One *Upscaler* setting chooses what makes the picture: the game's own neural
   network, **NVIDIA DLSS** (DLAA at the Native quality step, with a choice of DLSS model),
   **AMD FSR 3.1** on any GPU, **AMD FSR 4** (experimental; it uses AMD's FSR 4 library for Vulkan
-  when your PC has one), or none, with or without FXAA. Quality steps from Native to Ultra
-  Performance, or a render resolution of your choice (540p to 1440p), and a sharpness control.
+  when your PC has one), or none, with or without FXAA. One Render Resolution setting carries the
+  quality steps (100% is DLAA, then Quality, Balanced, Performance, Ultra Performance), and there is
+  a sharpness control.
+- **Output resolution.** The game's own 1440p picture, or 1080p, 1800p or **4K**.
 - **Frame generation.** 2x and more, with NVIDIA DLSS Frame Generation where it runs and AMD
   FSR 3.1's everywhere else. It never makes more frames than your display shows, and the FPS counter
   shows the rate you see.
 - **High frame rates.** The game runs above 60 frames per second at the right speed: caps from 15
-  to 240, or uncapped. VSync on, off or adaptive (for variable refresh rate displays).
+  to 240, or uncapped. Game logic that counts whole 60 Hz frames (sound, the day's clock, water,
+  songs, physics steps) is kept right at every rate. VSync on, off or adaptive (for variable refresh rate displays).
 - **Displays.** Windowed or fullscreen; the game's 16:9 picture, or one drawn for 4:3, 16:10, 21:9,
   32:9 or your display's own shape, with the HUD at the screen's edges or kept in the middle. **HDR** output
   (experimental) with peak brightness, paper white and highlight controls.
@@ -28,7 +31,18 @@ legally obtained dump of the game, on your machine.
 - **Controls.** Any controller with rumble and **gyro aiming**; keyboard and mouse with a direct
   mouse camera and the **mouse as a pointer in the game's menus**. Every control can be rebound.
 - **Game options.** Field of view, camera speed, text speed, skipping the opening.
-- **Cheats and hacks.** Infinite health, rupees and magic; game speed.
+- **Cheats and hacks.** Infinite health, rupees and magic, damage taken from none to quadruple, autosave
+  off; game speed and movement speed. In play, the Cheats tab also has **teleport** to 31 places,
+  **set the time of day**, **switch Link's age**, an **inventory editor**, **flight** (no clip), a
+  **free camera**, and mark / return to a place.
+- **Mods.** RomFS mods in the layout emulators use work as they are: put a mod in
+  `<install folder>/mods/<name>/romfs/...` and its files replace or add to the game's. Folders whose
+  names start with `-` or `_` are off; where two mods have the same file, the one sorting last wins.
+  (Code patches, `exefs`, cannot apply to a recompiled game.)
+- **Language and text.** The game's 16 languages, and larger dialogue text (up to 175%).
+- **Low latency.** NVIDIA Reflex, or AMD Anti-Lag 2 where the driver has it.
+- **FPS counter** with a frame time graph and details (GPU and renderer time, video memory), in any
+  corner. A choice of graphics card and sound output on PCs with several.
 - **Game files.** Compressed `.nup` packages are read as well as uncompressed ones.
 
 NVIDIA DLSS is not part of this project and is not distributed with it. When you tick the DLSS
@@ -47,9 +61,10 @@ report what you find. PC (Linux and Windows) is the supported way to play for no
 - An x86-64 PC with a Vulkan 1.3 GPU and driver supporting `VK_EXT_external_memory_host`
   (current NVIDIA and AMD drivers do). 16 GB of RAM recommended for the build.
 - Linux, or Windows 10 1809+ / Windows 11.
-- Your dump of the game as a single **`.nup`** file containing update **v131072**
-  (title ID `0400486024DEC000`). The installer checks the extracted code against known hashes and
-  stops if the version does not match.
+- Your dump of the game as a single **`.nup`** file (title ID `0400486024DEC000`). Update **v131072**
+  is the version this port is made and tested with. Other updates are not refused: the build finds
+  what it needs in the game's own code by what that code looks like, and leaves out the options whose
+  code a version does not have (the build's log names them). An untested update may still not run.
 - About 10 GB of free space while building (Windows: 16 GB, with MSYS2), ~3 GB afterwards (plus the
   game file, which stays where it is).
 
@@ -105,6 +120,10 @@ can be rebound there: click a binding, then press the new key, mouse button or c
   switches fullscreen.
 
 Data (saves, settings, shader caches) lives in the install folder.
+
+**If something goes wrong:** every run writes a log to `logs/tootr.log` in the install folder (the three
+runs before it are kept beside it, with the launcher's and the last build's output). A fatal error
+shows a message with the reason. Attach `tootr.log` when you report a problem.
 
 ## Updates
 
