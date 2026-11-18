@@ -9,8 +9,8 @@
        -> their destination mix or splitter (per channel pair volumes)
        -> sub mixes in dependency order (sub mix volume, then to their destination)
        -> the final mix (volume) -> the device sink (its channel map, down to stereo) -> waveOut
-   and signals the renderer event the game's audio thread waits on. Effects are accepted and left out (dry signal);
-   aux effects pass through. Played sample counts and released wave buffers go back to the game as on hardware.
+   and signals the renderer event the game's audio thread waits on. I3DL2 reverb here; Reverb, Delay and the biquad
+   filters in audio_effects.inc; other effects are accepted and left out (dry signal); aux effects pass through. Played sample counts and released wave buffers go back to the game as on hardware.
    The game's parameter changes take effect together at RequestUpdateAudioRenderer, and volume changes ramp over a
    frame, as the console's renderer does them (see "parameter updates").
    HOS_AUDIO_DUMP=<file.wav>: also write what is played (checking without speakers); HOS_AUDIO=0: silence. */
@@ -52,6 +52,12 @@ typedef struct {
     int dest_mix[MAX_SPLIT_DESTS];
     float vol[MAX_SPLIT_DESTS][MAX_CH][MAX_BUF];
     float ramp[MAX_SPLIT_DESTS][MAX_CH][MAX_BUF];   /* the volumes the last frame ended with */
+    /* (audio_effects.inc: a destination's two biquad filters. What the voices send to a filtered destination is
+       gathered in fin for the frame, filtered once, and mixed with the destination's volumes.) */
+    int bq_on[MAX_SPLIT_DESTS][2];
+    float bq_b[MAX_SPLIT_DESTS][2][3], bq_a[MAX_SPLIT_DESTS][2][2], bq_z[MAX_SPLIT_DESTS][2][MAX_CH][2];
+    float fin[MAX_CH][FRAME];
+    int fin_used;
 } Splitter;
 
 typedef struct {
@@ -344,9 +350,12 @@ static void reverb_frame(Reverb *rv, Mix *m) {
         }
     }
 }
+static void fx_frame(int mix);           /* (audio_effects.inc: Reverb, Delay and BiquadFilter effects) */
+static void fx_splitters_frame(void);    /* (audio_effects.inc: the splitters' filtered destinations) */
 static void effects_frame(int mix) {
     for (int e = 0; e < MAX_EFFECTS; e++)
         if (reverbs[e].used && reverbs[e].mix == mix) reverb_frame(&reverbs[e], &mixes[mix]);
+    fx_frame(mix);
 }
 
 /* ---- the mixer ------------------------------------------------------------------------------------------------- */
@@ -409,9 +418,11 @@ static void render_voice(Voice *v) {
             }
     } else if (v->dest_kind == DEST_SPLITTER && splitters[v->dest].used) {
         Splitter *s = &splitters[v->dest];
+        int filtered = 0;
         for (int d = 0; d < s->dests; d++) {
             const int mi = s->dest_mix[d];
             if (mi < 0 || !mixes[mi].used) continue;
+            if (s->bq_on[d][0] || s->bq_on[d][1]) { filtered = 1; continue; }   /* (fx_splitters_frame mixes it) */
             Mix *m = &mixes[mi];
             for (int ch = 0; ch < v->channels && ch < MAX_CH; ch++)
                 for (int b = 0; b < m->buffers; b++) {
@@ -420,6 +431,11 @@ static void render_voice(Voice *v) {
                     const float dg = (g1 - g0) / FRAME;
                     for (int i = 0; i < FRAME; i++) m->buf[b][i] += out[ch][i] * (g0 + dg * (float)(i + 1));
                 }
+        }
+        if (filtered) {
+            if (!s->fin_used) { memset(s->fin, 0, sizeof s->fin); s->fin_used = 1; }
+            for (int ch = 0; ch < v->channels && ch < MAX_CH; ch++)
+                for (int i = 0; i < FRAME; i++) s->fin[ch][i] += out[ch][i];
         }
     }
     memcpy(v->ramp_vol, v->vol, sizeof v->ramp_vol);   /* (splitters catch up in render_frame) */
@@ -438,6 +454,7 @@ static void render_frame(int16_t *pcm) {   /* 240 stereo frames */
         }
     for (int i = 0; i < MAX_VOICES; i++)
         if (voices[i].used) render_voice(&voices[i]);
+    fx_splitters_frame();
     for (int i = 0; i < MAX_SPLITTERS; i++)   /* (the splitters' volume ramps: once a frame, whichever voices use them) */
         if (splitters[i].used)
             for (int d = 0; d < splitters[i].dests; d++)

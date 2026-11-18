@@ -68,6 +68,7 @@ static int master_volume_percent() { return gfx::Current().mute_background && !g
 
 static int oot_audio_device_choice() { return gfx::Current().audio_device; }
 #include "audio_hookshot.inc"
+#include "audio_effects.inc" // (this project's: Reverb, Delay, biquad filters)
 #include "audio_stubs.inc"
 
 // ---- device-side calls (no Hookshot version) -----------------------------------------------------------
