@@ -616,22 +616,33 @@ std::atomic<u64> images_reduced{0};
 //    Texture Detail is High or Ultra;
 //  - after an image allocation failed: one, whatever the setting.
 // OOT_TEXTURE_SKIP=<n>: n levels always (0: never).
+bool SmallCard(); // (below: a card with under 6 GiB of its own)
 u32 MipSkipWanted() {
     static const int forced = std::getenv("OOT_TEXTURE_SKIP") ? std::atoi(std::getenv("OOT_TEXTURE_SKIP")) : -1;
     if (forced >= 0) return (u32)forced;
     const int detail = gfx::Current().texture_detail;
     if (detail == 1) return 1;
+    const bool small_card = SmallCard();
+    if (small_card && detail != 3 && detail != 4) return 1;
+    if (memory_pressure.load(std::memory_order_relaxed)) return 1;
+    return 0;
+}
+bool SmallCard() {
     static const bool small_card = [] {
         auto& vk = Vk(); VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(vk.physical, &p);
         u64 local = 0; for (u32 h = 0; h < vk.memory_properties.memoryHeapCount; ++h) if (vk.memory_properties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) local = std::max<u64>(local, vk.memory_properties.memoryHeaps[h].size);
         const bool small = p.deviceType != VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && local < (6ull << 30);
         if (small) RT_LOG("textures: a card with %llu MiB of video memory: big textures are loaded without their largest level (Texture Detail High or Ultra keeps it)", (unsigned long long)(local >> 20));
         return small; }();
-    if (small_card && detail != 3 && detail != 4) return 1;
-    if (memory_pressure.load(std::memory_order_relaxed)) return 1;
-    return 0;
+    return small_card;
 }
-u32 MipSkipFrom() { static const u32 from = std::getenv("OOT_TEXTURE_SKIP_FROM") ? (u32)std::atoi(std::getenv("OOT_TEXTURE_SKIP_FROM")) : 1024; return from; }
+// From what size a texture is loaded without its largest level: 1024; 512 where the card is small or full (a 4 GB card in
+// Castle Town held 187 textures of 768 x 768 at full size, 187 MiB, while it was out of memory).
+u32 MipSkipFrom() {
+    static const int forced = std::getenv("OOT_TEXTURE_SKIP_FROM") ? std::atoi(std::getenv("OOT_TEXTURE_SKIP_FROM")) : 0;
+    if (forced > 0) return (u32)forced;
+    return SmallCard() || memory_pressure.load(std::memory_order_relaxed) ? 512 : 1024;
+}
 void CreateImage(Texture& t) {
     RelieveVideoMemory();
     auto& vk = Vk();
