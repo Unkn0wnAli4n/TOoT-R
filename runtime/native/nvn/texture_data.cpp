@@ -447,6 +447,22 @@ void UploadTexels(Texture& t);
 std::atomic<u64> upload_ns_frame{0}, uploads_frame{0}, upload_staging_ns{0}, upload_swizzle_ns{0}, upload_decode_ns{0}; // (slow-frame diagnosis, render.cpp)
 extern std::atomic<u64> cpu_reuploads; // (memory.cpp reports)
 bool StealLiveImage(Texture& t); // (texture.cpp)
+// Whether EnsureUploaded would have nothing to do for this texture (the draw fast path: no upload, no image to make).
+bool TextureReadyNow(Texture& t) {
+    if (t.owner_finalized || !t.image) return false;
+    if (!t.gpu_written) {
+        if (!t.uploaded) return false;
+        if (t.storage) {
+            if (!TextureWatchUsable()) return false;
+            if (const u32 now = TextureWriteSequence(); now != t.checked_sequence) {
+                if (TextureMemoryWritten(t.storage, t.storage_size, t.upload_sequence)) return false;
+                t.checked_sequence = now;
+            }
+        }
+    }
+    t.used_frame = CurrentFrameNumber();
+    return true;
+}
 void EnsureUploaded(Texture& t) {
     if (resolve_worker) { // (its image is what a draw needs resolved; contents are brought when the draw is committed)
         // (a finalized texture a descriptor still names keeps its image for this batch: the executor notes that when
@@ -485,7 +501,13 @@ void EnsureUploaded(Texture& t) {
         return true;
     };
     const bool by_content = !TextureWatchUsable();
-    if (by_content && t.uploaded && !t.gpu_written && t.storage && t.storage_size <= HashedMax && CurrentFrameNumber() >= t.hash_frame + 16) {
+    // (a texture uploaded lately is looked at every time it is used: menus draw a label or an icon first and fill it
+    // a moment later, and for up to 16 frames the old contents showed - boxes of noise and wrong shapes flashing in
+    // the pause menu. One that has kept its contents for two seconds goes back to every 16 frames.
+    // OOT_HASH_EVERY=<frames>: that interval for all, as before.)
+    static const u64 hash_every = std::getenv("OOT_HASH_EVERY") ? std::strtoull(std::getenv("OOT_HASH_EVERY"), nullptr, 10) : 0;
+    const u64 hash_wait = hash_every ? hash_every : CurrentFrameNumber() < t.upload_frame + 120 ? 1 : 16;
+    if (by_content && t.uploaded && !t.gpu_written && t.storage && t.storage_size <= HashedMax && CurrentFrameNumber() >= t.hash_frame + hash_wait) {
         t.hash_frame = CurrentFrameNumber();
         u64 h; if (hash_of(t, &h) && h != t.content_hash) { t.uploaded = false; ++cpu_reuploads; }
     }

@@ -75,6 +75,7 @@ struct UploadStats { u64 count = 0, bytes = 0; };
 extern UploadStats upload_stats;
 void EnsureImage(Texture& t);
 void EnsureUploaded(Texture& t);
+bool TextureReadyNow(Texture& t);
 void AdoptCachedImage(Texture& t);
 void ReportImageCache(); // (diagnostics, every 300 frames)
 void TrimImageCache(u64 keep_bytes, bool small_too = true); // releases cached GPU-written images beyond keep_bytes

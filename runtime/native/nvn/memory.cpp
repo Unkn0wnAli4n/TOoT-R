@@ -1508,6 +1508,15 @@ void PrepareHostWrite(u64 address, u64 size) {
 
 bool PageProtectionUsable() {
     static const bool usable = [] {
+        // (OOT_NO_PAGE_PROTECTION=1: none anywhere, as on AMD)
+        if (std::getenv("OOT_NO_PAGE_PROTECTION")) { RT_LOG("CPU writes: no page protection of imported memory (asked for)"); return false; }
+#ifdef _WIN32
+        // Windows: with texture pages left alone the game ran, but its menus showed shapes from stale buffers now and
+        // then (wrong outlines flashing, a band across the screen, squares of noise): the GPU copies of the game's
+        // buffers are kept current by write protection too. The GPU reads the game's memory itself there, as on AMD.
+        // OOT_PAGE_PROTECTION=1: protected all the same.
+        if (!std::getenv("OOT_PAGE_PROTECTION")) { RT_LOG("CPU writes: Windows, no page protection of imported memory"); return false; }
+#endif
         VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(Vk().physical, &p);
         const bool amd = p.vendorID == 0x1002;
         if (amd) RT_LOG("CPU writes: AMD GPU, no page protection of imported memory (textures checked by content)");
