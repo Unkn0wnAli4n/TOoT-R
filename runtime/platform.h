@@ -63,6 +63,9 @@ inline void EnsureCommitted(const void*, size_t) {}
 const std::string& DataDir();
 // Names the calling thread (debuggers, profilers, crash reports).
 void SetThreadName(const char* name);
+#ifdef _WIN32
+void* ThreadByName(const char* name); // (the profiler: a handle of the last thread that took that name; null when none)
+#endif
 // Sleeps of the length asked for. Windows wakes a sleeping thread only on its timer tick, 15.6 ms apart unless a
 // program asks for finer, and its Sleep counts whole milliseconds: the game's job system waits for its workers in
 // steps of 20 microseconds, and each became a tick - a frame took four of them, 62 ms, whatever the graphics card.

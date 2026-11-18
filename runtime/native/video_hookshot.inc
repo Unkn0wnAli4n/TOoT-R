@@ -319,8 +319,25 @@ static void drain(Dec *d) {
 }
 /* the oldest submissions decoded until a picture comes out (or none are left) */
 static void decode_next(Dec *d);
+/* (tootr) What a movie costs, always in the log (one line every 600 pictures asked for): how many pictures were shown,
+   how often there was none ready and the last one stayed, how many were skipped to keep up with the sound, and the
+   time one submission takes to decode. A movie that looks slower than the frame rate shows it here. */
+static int64_t vstat_asked, vstat_repeated, vstat_skipped, vstat_decode_ns, vstat_decodes, vstat_worst_ns;
+static void decode_timed(Dec *d) {
+    const int64_t t0 = hos_now_ns();
+    decode_next(d);
+    const int64_t spent = hos_now_ns() - t0;
+    vstat_decode_ns += spent; vstat_decodes++;
+    if (spent > vstat_worst_ns) vstat_worst_ns = spent;
+}
+static void video_stats(void) {
+    if (++vstat_asked < 600) return;
+    hos_log("video: of 600 pictures asked for, %lld times none was ready (the last one stayed), %lld skipped to keep up; decoding took %.1f ms a step on average, %.1f at worst (%lld steps)",
+            (long long)vstat_repeated, (long long)vstat_skipped, vstat_decodes ? vstat_decode_ns / 1e6 / (double)vstat_decodes : 0.0, vstat_worst_ns / 1e6, (long long)vstat_decodes);
+    vstat_asked = vstat_repeated = vstat_skipped = vstat_decode_ns = vstat_decodes = vstat_worst_ns = 0;
+}
 static void decode_pending(Dec *d) {
-    while (!d->qn && d->phead) decode_next(d);
+    while (!d->qn && d->phead) decode_timed(d);
 }
 /* one submission decoded (its pictures into the queue, if any) */
 static void decode_next(Dec *d) {
@@ -463,7 +480,9 @@ static void dec_acquire(Ctx *c) {
         return;
     }
     d->acquires++;
-    if (!d->qn) {   /* (nothing decoded: the buffer's last picture again; after the last submission, as the last) */
+    video_stats();
+    if (!d->qn) {
+        if (!d->eos) vstat_repeated++;   /* (nothing decoded: the buffer's last picture again; after the last submission, as the last) */
         d->busy[slot] = 1;
         if (d->eos) d->slot_last[slot] = 1;
         if (video_log()) hos_log("video: acquire %lld: nothing decoded%s, buffer %d again", (long long)d->acquires,
@@ -489,13 +508,14 @@ static void dec_acquire(Ctx *c) {
             if (d->queue[d->qhead].pts + late >= due) break;
             if (d->qn < 2) {
                 if (!d->phead) break;
-                decode_next(d);
+                decode_timed(d);
                 continue;
             }
             picture_free(&d->queue[d->qhead]);
             d->qhead = (d->qhead + 1) % MAX_QUEUE, d->qn--;
             skipped++;
         }
+        vstat_skipped += skipped;
         if (skipped && video_log()) hos_log("video: %d pictures skipped to catch up with the movie's clock", skipped);
     }
     Picture *p = &d->queue[d->qhead];

@@ -213,6 +213,110 @@ void StartProfiler() {
     RT_LOG("profiler: sampling CPU time at 2 kHz; reports every 10 s in the data directory");
 }
 } // namespace rt
+#elif defined(_WIN32)
+// Windows: OOT_PROFILE_WALL=<thread name> (nvn-exec: the renderer's thread) samples that thread in wall-clock time,
+// a thousand times a second: the thread is stopped for a moment, its call chain read from the unwind tables, and
+// every 10 s the chains are written to <data>/profile-<n>.txt as "<count> <module>+<offset> <module>+<offset> ..."
+// (innermost first), the most frequent first. Offsets are within each module, so a build of the same source with
+// debug information names them (llvm-symbolizer --obj=tootr.exe --relative-address). OOT_PROFILE_WALL_DELAY=<s>:
+// seconds before sampling starts (20).
+#include <windows.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "platform.h"
+#include "rt.h"
+
+namespace rt {
+namespace {
+std::string ModuleOffset(DWORD64 pc) {
+    HMODULE module = nullptr; char text[320];
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(pc), &module) || !module) {
+        std::snprintf(text, sizeof text, "?+%#llx", (unsigned long long)pc); return text;
+    }
+    char path[MAX_PATH]; const DWORD n = GetModuleFileNameA(module, path, MAX_PATH);
+    const char* name = path; for (DWORD i = 0; i < n; ++i) if (path[i] == '\\' || path[i] == '/') name = path + i + 1;
+    std::snprintf(text, sizeof text, "%s+%#llx", n ? name : "?", (unsigned long long)(pc - reinterpret_cast<DWORD64>(module)));
+    return text;
+}
+void Sampler(std::string name) {
+    const char* delay = std::getenv("OOT_PROFILE_WALL_DELAY");
+    std::this_thread::sleep_for(std::chrono::seconds(delay ? std::atoi(delay) : 20));
+    const HANDLE thread = ThreadByName(name.c_str());
+    if (!thread) { RT_LOG("profiler: no thread named %s", name.c_str()); return; }
+    RT_LOG("profiler: sampling thread %s in wall-clock time, 1000 times a second; reports every 10 s in the data directory", name.c_str());
+    std::map<std::vector<DWORD64>, unsigned long long> chains;
+    auto written = std::chrono::steady_clock::now(); int file = 0;
+    unsigned long long random = 0x9e3779b97f4a7c15ull;
+    for (;;) {
+        // (0.5 to 1.5 ms apart, at random: an even step falls into step with a thread that itself works by the clock)
+        random ^= random << 13; random ^= random >> 7; random ^= random << 17;
+        SleepNs(500000 + (long long)(random % 1000000));
+        std::vector<DWORD64> chain;
+        if (SuspendThread(thread) != (DWORD)-1) {
+            CONTEXT context{}; context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+            if (GetThreadContext(thread, &context)) {
+                for (int depth = 0; depth < 28 && context.Rip; ++depth) {
+                    chain.push_back(context.Rip);
+                    DWORD64 image = 0;
+                    // (no allocation and no lock of ours while the thread is stopped: it may hold the heap's)
+                    const PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &image, nullptr);
+                    if (!function) { // (a leaf: its return address is on top of the stack)
+                        if (IsBadReadPtr(reinterpret_cast<void*>(context.Rsp), 8)) break;
+                        context.Rip = *reinterpret_cast<DWORD64*>(context.Rsp); context.Rsp += 8; continue;
+                    }
+                    void* handler_data = nullptr; DWORD64 frame = 0;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, context.Rip, function, &context, &handler_data, &frame, nullptr);
+                }
+            }
+            ResumeThread(thread);
+        }
+        if (!chain.empty()) ++chains[chain];
+        if (std::chrono::steady_clock::now() - written < std::chrono::seconds(10)) continue;
+        written = std::chrono::steady_clock::now();
+        std::vector<std::pair<unsigned long long, const std::vector<DWORD64>*>> order;
+        unsigned long long total = 0;
+        for (auto& [c, n] : chains) { order.push_back({n, &c}); total += n; }
+        std::sort(order.rbegin(), order.rend());
+        const std::string path = DataDir() + "/profile-" + std::to_string(file++) + ".txt";
+        if (FILE* f = std::fopen(path.c_str(), "w")) {
+            std::fprintf(f, "# thread %s, %llu samples, about 1 ms apart\n", name.c_str(), total);
+            // (the innermost frames first: where the time is; then the chains)
+            std::map<std::string, unsigned long long> leaves, anywhere;
+            for (auto& [n, c] : order) { leaves[ModuleOffset((*c)[0])] += n; std::vector<std::string> seen; for (DWORD64 pc : *c) { std::string m = ModuleOffset(pc); if (std::find(seen.begin(), seen.end(), m) == seen.end()) { anywhere[m] += n; seen.push_back(m); } } }
+            std::vector<std::pair<unsigned long long, std::string>> top;
+            for (auto& [m, n] : leaves) top.push_back({n, m});
+            std::sort(top.rbegin(), top.rend());
+            std::fprintf(f, "# innermost\n");
+            for (size_t i = 0; i < top.size() && i < 60; ++i) std::fprintf(f, "leaf %llu %s\n", top[i].first, top[i].second.c_str());
+            top.clear(); for (auto& [m, n] : anywhere) top.push_back({n, m});
+            std::sort(top.rbegin(), top.rend());
+            std::fprintf(f, "# anywhere in the chain\n");
+            for (size_t i = 0; i < top.size() && i < 120; ++i) std::fprintf(f, "incl %llu %s\n", top[i].first, top[i].second.c_str());
+            std::fprintf(f, "# chains\n");
+            for (size_t i = 0; i < order.size() && i < 400; ++i) {
+                std::fprintf(f, "%llu", order[i].first);
+                for (DWORD64 pc : *order[i].second) std::fprintf(f, " %s", ModuleOffset(pc).c_str());
+                std::fprintf(f, "\n");
+            }
+            std::fclose(f);
+        }
+        chains.clear();
+    }
+}
+} // namespace
+void StartProfiler() {
+    if (const char* wall = std::getenv("OOT_PROFILE_WALL")) std::thread(Sampler, std::string(wall)).detach();
+}
+} // namespace rt
 #else
 namespace rt { void StartProfiler() {} }
 #endif

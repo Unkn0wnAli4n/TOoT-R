@@ -4,6 +4,8 @@
 #include <thread>
 
 #include <cstdlib>
+#include <cstring>
+#include <cstdio>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -159,10 +161,25 @@ const std::string& DataDir() {
     }();
     return dir;
 }
+namespace {
+struct NamedThread { char name[32]; HANDLE handle; };
+NamedThread named_threads[256]; std::atomic<unsigned> named_thread_count{0};
+}
 void SetThreadName(const char* name) {
     wchar_t wide[64];
     const int n = MultiByteToWideChar(CP_UTF8, 0, name, -1, wide, 64);
     if (n > 0) SetThreadDescription(GetCurrentThread(), wide);
+    // (for the profiler, which stops a thread by its name)
+    const unsigned slot = named_thread_count.fetch_add(1);
+    if (slot < 256) {
+        std::snprintf(named_threads[slot].name, sizeof named_threads[slot].name, "%s", name);
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &named_threads[slot].handle, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    }
+}
+void* ThreadByName(const char* name) {
+    const unsigned count = std::min(named_thread_count.load(), 256u);
+    for (unsigned i = count; i-- > 0;) if (!std::strcmp(named_threads[i].name, name) && named_threads[i].handle) return named_threads[i].handle;
+    return nullptr;
 }
 namespace {
 long long NowNs() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
