@@ -274,7 +274,7 @@ void UploadAstcOnGpu(Texture& t) {
     const u64 align = std::max<u64>(vk.properties.limits.minStorageBufferOffsetAlignment, 16);
     struct Part { u32 level, layer, row_blocks, block_rows; u64 offset, size; };
     std::vector<Part> parts; u64 total = 0;
-    for (u32 level = 0; level < t.levels; ++level) {
+    for (u32 level = t.skip; level < t.levels; ++level) {
         const auto& m = t.mips[level];
         const u32 bx = (m.width + t.info.block_w - 1) / t.info.block_w, by = (m.height + t.info.block_h - 1) / t.info.block_h;
         for (u32 layer = 0; layer < t.layers; ++layer) {
@@ -284,11 +284,11 @@ void UploadAstcOnGpu(Texture& t) {
         }
     }
     Staging staging(std::max<u64>(total, 16));
-    for (u32 level = 0; level < t.levels; ++level) {
+    for (u32 level = t.skip; level < t.levels; ++level) {
         const auto& m = t.mips[level];
         std::vector<u8> storage(m.storage_size);
         for (u32 layer = 0; layer < t.layers; ++layer) {
-            const Part& part = parts[level * t.layers + layer];
+            const Part& part = parts[(level - t.skip) * t.layers + layer];
             ReadStorage(t.storage + m.offset + layer * t.layer_stride, storage.data(), storage.size());
             u8* const base = static_cast<u8*>(staging.mapped) + part.offset;
             const u64 row_bytes = (u64)part.row_blocks * 16;
@@ -356,7 +356,7 @@ void UploadAstcOnGpu(Texture& t) {
                 vkCmdPushConstants(cmd, e.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof encode, encode);
                 vkCmdDispatch(cmd, (encode[0] + 7) / 8, (encode[1] + 7) / 8, 1);
                 FullBarrier(cmd);
-                const VkBufferImageCopy copy{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, part.level, part.layer, 1}, {0, 0, 0}, {w, h, 1}};
+                const VkBufferImageCopy copy{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, part.level - t.skip, part.layer, 1}, {0, 0, 0}, {w, h, 1}};
                 vkCmdCopyBufferToImage(cmd, e.out, t.image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
             }
             FullBarrier(cmd);
@@ -368,7 +368,7 @@ void UploadAstcOnGpu(Texture& t) {
         VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO}; usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
         vi.pNext = &usage; vi.image = t.image; vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY; vi.format = VK_FORMAT_R8G8B8A8_UNORM;
-        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, part.level, 1, part.layer, 1};
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, part.level - t.skip, 1, part.layer, 1};
         VkImageView view; VK_CHECK(vkCreateImageView(vk.device, &vi, nullptr, &view)); views.push_back(view);
         const VkDescriptorSet set = AllocateBatchSet(astc_decoder.set_layout); sets.push_back(set);
         const VkDescriptorBufferInfo buffer{staging.buffer, part.offset, std::max<u64>(part.size, 16)};
@@ -668,7 +668,7 @@ void UploadTexelsNow(Texture& t) {
     }
     std::vector<VkBufferImageCopy> copies;
     u64 linear_size = 0;
-    for (u32 level = 0; level < t.levels; ++level) {
+    for (u32 level = t.skip; level < t.levels; ++level) {
         const auto& m = t.mips[level];
         linear_size = (linear_size + 15) & ~15ULL;
         // (a texture kept as BC3 is staged as its blocks, a quarter of its texels: the terrain's 90-layer arrays were
@@ -677,7 +677,7 @@ void UploadTexelsNow(Texture& t) {
             ((m.height + t.info.block_h - 1) / t.info.block_h) * m.depth * t.info.bytes;
         for (u32 layer = 0; layer < t.layers; ++layer) {
             VkBufferImageCopy copy{}; copy.bufferOffset = linear_size;
-            copy.imageSubresource = {t.info.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : t.info.stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1};
+            copy.imageSubresource = {t.info.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : t.info.stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT, level - t.skip, layer, 1};
             copy.imageExtent = {m.width, m.height, m.depth}; copies.push_back(copy);
             linear_size = (linear_size + bytes + 15) & ~15ULL;
         }
@@ -687,7 +687,7 @@ void UploadTexelsNow(Texture& t) {
     Staging staging(linear_size);
     upload_staging_ns+=(u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-_t_st).count();
     size_t index = 0;
-    for (u32 level = 0; level < t.levels; ++level) {
+    for (u32 level = t.skip; level < t.levels; ++level) {
         const auto& m = t.mips[level];
         const u32 width = (m.width + t.info.block_w - 1) / t.info.block_w;
         const u32 height = (m.height + t.info.block_h - 1) / t.info.block_h;
@@ -750,6 +750,7 @@ void UploadTexelsNow(Texture& t) {
 // CopyTextureToBuffer: reads a texture region (from the host image, which holds GPU-rendered
 // contents) into guest memory, rows/images placed at the given strides (0 = tightly packed).
 void CopyTextureToGuest(Texture& t, const TextureCopy& r, u64 address, u64 row_stride, u64 image_stride) {
+    WantFullImage(t);
     EnsureUploaded(t);
     if (t.decoded_astc || t.decoded_rgb9e5) Fatal("readback of a host-converted texture format");
     const u32 level = r.view.levels_base;
@@ -786,6 +787,7 @@ void CopyTextureToGuest(Texture& t, const TextureCopy& r, u64 address, u64 row_s
 
 // Mip 0 / layer 0 texels of a small texture, tightly packed (debugging).
 std::vector<u8> ReadTexels(Texture& t) {
+    WantFullImage(t);
     EnsureUploaded(t);
     const u32 depth = t.target == Target::T3D ? t.depth : 1;
     const u64 size = (u64)t.width * t.height * depth * t.info.bytes;
@@ -800,6 +802,7 @@ std::vector<u8> ReadTexels(Texture& t) {
 }
 
 void CopyTexture(Texture& source, const TextureCopy& src, Texture& destination, const TextureCopy& dst, u32 flags) {
+    WantFullImage(source); WantFullImage(destination);
     EnsureUploaded(source);
     EnsureUploaded(destination); // preserve pixels outside the destination region
     const auto region = [](const Texture& t, const TextureCopy& r, VkImageSubresourceLayers& sub,

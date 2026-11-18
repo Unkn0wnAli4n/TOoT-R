@@ -3660,7 +3660,7 @@ bool ExecuteRenderCommand(const Command& command) {
         break;
     }
     case Op::ClearTexture:case Op::ClearTexturei:case Op::ClearTextureui: {
-        auto& t=*HostTexture(x[0]);TextureCopy region;std::memcpy(&region,data,sizeof region);
+        auto& t=*HostTexture(x[0]);if(t.skip){WantFullImage(t);EnsureImage(t);}TextureCopy region;std::memcpy(&region,data,sizeof region);
         VkClearColorValue color;std::memcpy(&color,data+sizeof region,16);
         Immediate([&](VkCommandBuffer cmd){Transition(cmd,t,VK_IMAGE_LAYOUT_GENERAL);
             if(t.info.depth||t.info.stencil){VkClearDepthStencilValue v{color.float32[0],color.uint32[1]};VkImageSubresourceRange r{AspectOf(t),region.view.levels_base,1,region.view.layers_base,region.view.layers_count?region.view.layers_count:1};vkCmdClearDepthStencilImage(cmd,t.image,t.layout,&v,1,&r);}

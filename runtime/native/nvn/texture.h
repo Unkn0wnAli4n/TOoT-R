@@ -50,6 +50,10 @@ struct Texture : std::enable_shared_from_this<Texture> {
     u32 upload_sequence = 0, checked_sequence = 0; // CPU-write tracking (ArmTextureMemory)
     u64 content_hash = 0, hash_frame = 0;          // (where pages cannot be protected: the contents' hash at upload)
     bool decoded_astc = false;
+    // The host image leaves out the texture's first `skip` levels (CreateImage, MipSkipWanted): its level 0 is the
+    // texture's level `skip`. Only textures the game fills from its memory and samples; anything else done to one
+    // (a copy, a readback, a target) brings the full image back first (WantFullImage).
+    u32 skip = 0; bool full_wanted = false;
     bool bc3 = false; // decoded ASTC kept as BC3 (re-encoded on the GPU: a quarter of RGBA8's memory)
     bool decoded_rgb9e5 = false; // RGB9E5 (no host storage-image support) kept as RGBA16F
     struct Mip {
@@ -74,6 +78,7 @@ void Transition(VkCommandBuffer cmd, Texture& t, VkImageLayout layout);
 struct UploadStats { u64 count = 0, bytes = 0; };
 extern UploadStats upload_stats;
 void EnsureImage(Texture& t);
+void WantFullImage(Texture& t); // (before anything but sampling: a reduced image is let go, the next is whole)
 void EnsureUploaded(Texture& t);
 bool TextureReadyNow(Texture& t);
 void AdoptCachedImage(Texture& t);

@@ -188,12 +188,28 @@ bool TakeFrom(ImageBlock& b, const VkMemoryRequirements& req, u64* offset) {
     }
     return false;
 }
-bool SubAllocate(const VkMemoryRequirements& req, u32 type, Texture& t) {
+// The card's own memory was full a moment ago (an image allocation failed after everything spare was let go): for
+// two seconds images go straight to the memory the driver shares with the system, without asking the card again.
+// Every failed request took the driver tens of milliseconds, and with the card full each new image made up to four
+// (32 thousand of them in one long session on a 4 GB card). OOT_FULL_COOLDOWN_MS=0: ask every time, as before.
+std::atomic<s64> device_full_until_ms{0};
+s64 NowMs() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+bool DeviceFullLately() {
+    static const bool test = std::getenv("OOT_TEST_DEVICE_FULL") != nullptr; // (every image as if the card were full)
+    return test || NowMs() < device_full_until_ms.load(std::memory_order_relaxed);
+}
+void NoteDeviceFull() {
+    static const s64 cooldown = std::getenv("OOT_FULL_COOLDOWN_MS") ? std::atoll(std::getenv("OOT_FULL_COOLDOWN_MS")) : 2000;
+    device_full_until_ms.store(NowMs() + cooldown, std::memory_order_relaxed);
+}
+std::atomic<u64> images_in_shared_memory{0};
+bool SubAllocate(const VkMemoryRequirements& req, u32 type, Texture& t, bool may_allocate = true) {
     static const bool off = std::getenv("OOT_DEDICATED_IMAGES") != nullptr;
     if (off || req.size > BlockMax || !(req.memoryTypeBits >> type & 1)) return false;
     std::lock_guard lock{blocks_mutex};
     for (ImageBlock* b : image_blocks)
         if (b->type == type && b->size - b->used >= req.size && TakeFrom(*b, req, &t.memory_offset)) { t.memory = b->memory; t.block = b; return true; }
+    if (!may_allocate) return false;
     auto* b = new ImageBlock;
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = BlockSize; ai.memoryTypeIndex = type;
@@ -289,6 +305,7 @@ VkImageView MakeView(Texture& t, TextureView view, bool attachment) {
         if(!custom)std::memcpy(view.swizzle,t.swizzle,sizeof view.swizzle);
         if(!view.depth_stencil_mode)view.depth_stencil_mode=t.depth_stencil_mode+1;
     }
+    if (attachment && t.skip) { if (resolve_worker) { RESOLVE_BAIL(); return VK_NULL_HANDLE; } WantFullImage(t); EnsureImage(t); }
     if (attachment) {
         view.present = true; view.levels_count = 1; view.target = (u32)Target::T2DArray + 1;
         // Attachment views must use identity component mapping.
@@ -320,8 +337,10 @@ VkImageView MakeView(Texture& t, TextureView view, bool attachment) {
     case Target::CubeArray: info.viewType = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY; break;
     default: info.viewType = VK_IMAGE_VIEW_TYPE_2D; break;
     }
-    info.subresourceRange = {AspectOf(t), view.levels_base,
-        view.levels_count ? view.levels_count : t.levels - view.levels_base,
+    // (a reduced image, Texture::skip: the view's levels, less the ones left out; a view of only those shows the first kept)
+    const u32 view_first = std::min(std::max(view.levels_base, t.skip), t.levels - 1);
+    const u32 view_end = std::max(view_first + 1, view.levels_count ? std::min(view.levels_base + view.levels_count, t.levels) : t.levels);
+    info.subresourceRange = {AspectOf(t), view_first - t.skip, view_end - view_first,
         view.layers_base, view.layers_count ? view.layers_count : t.layers - view.layers_base};
     if (!attachment) {
         if (t.info.depth || t.info.stencil) {
@@ -545,7 +564,7 @@ void AgeSpareImages() { // (now and then: what nothing took for 1800 frames)
 // (the image is no longer used by the GPU) true: kept.
 bool KeepSpareImage(const Texture& t) {
     static const bool off = std::getenv("OOT_NO_SPARE_IMAGES") != nullptr;
-    if (off || !t.image || !t.memory || t.block || t.allocation_size > SpareBudget() / 2) { ++stat_spare_refused; return false; }
+    if (off || !t.image || !t.memory || t.block || t.skip || t.allocation_size > SpareBudget() / 2) { ++stat_spare_refused; return false; }
     if (!(t.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))) { ++stat_spare_refused; return false; }
     ++stat_spare_kept;
     VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -590,6 +609,29 @@ void RelieveVideoMemory() {
      if (ms > 5 && shown++ < 20) RT_LOG("video memory relief took %.1f ms (cache trim %.1f ms)", ms, trim_ms);}
     static u32 told = 0; if (told++ < 6) { u64 used = 0, budget = 0; VideoMemoryTight(&used, &budget); RT_LOG("video memory tight (%llu of %llu MiB): spare and cached images released", (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20)); }
 }
+std::atomic<u64> images_reduced{0};
+// How many of a big texture's largest levels its image leaves out (0: none).
+//  - Texture Detail Low: one;
+//  - a card with less than 6 GiB of its own (not one sharing the system's, as a Steam Deck's): one, unless the
+//    Texture Detail is High or Ultra;
+//  - after an image allocation failed: one, whatever the setting.
+// OOT_TEXTURE_SKIP=<n>: n levels always (0: never).
+u32 MipSkipWanted() {
+    static const int forced = std::getenv("OOT_TEXTURE_SKIP") ? std::atoi(std::getenv("OOT_TEXTURE_SKIP")) : -1;
+    if (forced >= 0) return (u32)forced;
+    const int detail = gfx::Current().texture_detail;
+    if (detail == 1) return 1;
+    static const bool small_card = [] {
+        auto& vk = Vk(); VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(vk.physical, &p);
+        u64 local = 0; for (u32 h = 0; h < vk.memory_properties.memoryHeapCount; ++h) if (vk.memory_properties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) local = std::max<u64>(local, vk.memory_properties.memoryHeaps[h].size);
+        const bool small = p.deviceType != VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && local < (6ull << 30);
+        if (small) RT_LOG("textures: a card with %llu MiB of video memory: big textures are loaded without their largest level (Texture Detail High or Ultra keeps it)", (unsigned long long)(local >> 20));
+        return small; }();
+    if (small_card && detail != 3 && detail != 4) return 1;
+    if (memory_pressure.load(std::memory_order_relaxed)) return 1;
+    return 0;
+}
+u32 MipSkipFrom() { static const u32 from = std::getenv("OOT_TEXTURE_SKIP_FROM") ? (u32)std::atoi(std::getenv("OOT_TEXTURE_SKIP_FROM")) : 1024; return from; }
 void CreateImage(Texture& t) {
     RelieveVideoMemory();
     auto& vk = Vk();
@@ -635,13 +677,23 @@ void CreateImage(Texture& t) {
             }
         }
     }
+    // Big textures without their largest level(s) where video memory is short: a 2048 square one is 5.3 MiB as BC3
+    // and 1.3 MiB from its second level on. Only ASTC textures with a mip chain - the world's and the characters'
+    // surfaces; the UI's have one level and stay whole - and never one that was needed whole (WantFullImage).
+    t.skip = 0;
+    if (t.format >= 121 && t.format <= 148 && !t.full_wanted && t.target != Target::T3D && t.samples == 1 && t.levels >= 2 && t.mips.size() == t.levels) {
+        const u32 wanted = MipSkipWanted();
+        while (t.skip < wanted && t.skip + 2 <= t.levels && std::max(t.mips[t.skip].width, t.mips[t.skip].height) >= MipSkipFrom()) ++t.skip;
+        if (t.skip) { images_reduced.fetch_add(1, std::memory_order_relaxed); }
+    }
+    const u32 host_width = t.skip ? t.mips[t.skip].width : t.width, host_height = t.skip ? t.mips[t.skip].height : t.height;
     const VkFormatFeatureFlags features = fp.optimalTilingFeatures;
     VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ii.imageType = t.target == Target::T3D ? VK_IMAGE_TYPE_3D
                  : (t.target == Target::T1D || t.target == Target::T1DArray) ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
     ii.format = t.info.vk;
-    ii.extent = {t.width, t.height, t.target == Target::T3D ? t.depth : 1};
-    ii.mipLevels = t.levels;
+    ii.extent = {host_width, host_height, t.target == Target::T3D ? t.depth : 1};
+    ii.mipLevels = t.levels - t.skip;
     ii.arrayLayers = t.target == Target::T3D ? 1 : t.layers;
     ii.samples = (VkSampleCountFlagBits)t.samples;
     ii.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -681,7 +733,11 @@ void CreateImage(Texture& t) {
     ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     // (only images that cannot be render targets: NVIDIA compresses attachments in memory of their own; shared
     // blocks made the frame's GPU time 20% longer)
-    if(!(ii.usage&(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))&&SubAllocate(req,ai.memoryTypeIndex,t)){
+    // (only images that cannot be render targets: a target placed in the shared memory came out black on NVIDIA's
+    // Linux driver - the whole picture, with OOT_TEST_DEVICE_FULL covering them - so those ask the card every time;
+    // sampled textures there look and run the same. Room in a block the card already gave is still taken.)
+    const bool full_lately=DeviceFullLately()&&!(ii.usage&(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT));
+    if(!(ii.usage&(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))&&SubAllocate(req,ai.memoryTypeIndex,t,!full_lately)){
         t.allocation_size=req.size;image_live_bytes+=req.size;if(t.decoded_astc)image_astc_bytes+=req.size;NoteLive(t,1);
         VK_CHECK(vkBindImageMemory(vk.device,t.image,t.memory,t.memory_offset));
         return;
@@ -694,8 +750,18 @@ void CreateImage(Texture& t) {
             VK_CHECK(vkBindImageMemory(vk.device,t.image,t.memory,0));
             return;
         }}
+    if(full_lately){
+        const u32 shared=FindMemoryType(req.memoryTypeBits,0);
+        if(!attachment&&SubAllocate(req,shared,t)){
+            t.allocation_size=req.size;image_live_bytes+=req.size;if(t.decoded_astc)image_astc_bytes+=req.size;NoteLive(t,1);++images_in_shared_memory;
+            VK_CHECK(vkBindImageMemory(vk.device,t.image,t.memory,t.memory_offset));
+            return;
+        }
+        ai.memoryTypeIndex=shared;
+    }
     VkResult allocated=vkAllocateMemory(vk.device,&ai,nullptr,&t.memory);
-    if(allocated!=VK_SUCCESS){
+    if(allocated==VK_SUCCESS&&full_lately)++images_in_shared_memory;
+    if(allocated!=VK_SUCCESS&&!full_lately){
         // Out of device memory: release every cached image (destroyed after the GPU is done with
         // them), then retry; as a last resort use any memory type the image allows (slower).
         memory_pressure.store(true,std::memory_order_relaxed);
@@ -710,8 +776,8 @@ void CreateImage(Texture& t) {
         DropSpareImages();
         allocated=vkAllocateMemory(vk.device,&ai,nullptr,&t.memory);
         if(allocated!=VK_SUCCESS){TrimImageCache(0);allocated=vkAllocateMemory(vk.device,&ai,nullptr,&t.memory);}
-        if(allocated!=VK_SUCCESS){ai.memoryTypeIndex=FindMemoryType(req.memoryTypeBits,0);allocated=vkAllocateMemory(vk.device,&ai,nullptr,&t.memory);
-            if(allocated==VK_SUCCESS)RT_LOG("texture placed in non-device-local memory");}
+        if(allocated!=VK_SUCCESS){NoteDeviceFull();ai.memoryTypeIndex=FindMemoryType(req.memoryTypeBits,0);allocated=vkAllocateMemory(vk.device,&ai,nullptr,&t.memory);
+            if(allocated==VK_SUCCESS){++images_in_shared_memory;static std::atomic<u32> told{0};if(told++<20)RT_LOG("texture placed in non-device-local memory");}}
     }
     if(allocated!=VK_SUCCESS)RT_LOG("texture allocation failed: %ux%ux%u format %u, requested %llu MiB; live images %llu MiB, cached %llu MiB",t.width,t.height,t.depth,t.format,
         (unsigned long long)(req.size>>20),(unsigned long long)(image_live_bytes.load()>>20),(unsigned long long)(image_cached_bytes.load()>>20));
@@ -853,7 +919,7 @@ void AdoptCachedImage(Texture& t) {
     t.block = cached.block; t.memory_offset = cached.memory_offset; cached.block = nullptr;
     t.allocation_size=cached.allocation_size;image_cached_bytes-=cached.allocation_size;if(it->second.small)small_cached_bytes-=cached.allocation_size;
     t.layout = cached.layout; t.usage = cached.usage; t.gpu_written = contents && cached.gpu_written; t.uploaded = contents && cached.uploaded;
-    t.decoded_astc = cached.decoded_astc; t.bc3 = cached.bc3; t.decoded_rgb9e5 = cached.decoded_rgb9e5; t.info = cached.info;
+    t.skip = cached.skip; t.decoded_astc = cached.decoded_astc; t.bc3 = cached.bc3; t.decoded_rgb9e5 = cached.decoded_rgb9e5; t.info = cached.info;
     cached.image = VK_NULL_HANDLE; cached.memory = VK_NULL_HANDLE; cached.view = VK_NULL_HANDLE; cached.views.clear();
     (it->second.small ? small_order : cache_order).erase(it->second.position);
     image_cache.erase(it);
@@ -942,10 +1008,10 @@ void ReuseOverlapping(Texture& t, bool take) {
             if (h->format != t.format || h->width != t.width || h->height != t.height || h->depth != t.depth || h->levels != t.levels ||
                 h->layers != t.layers || h->samples != t.samples || h->target != t.target) continue;
             if (take) {
-                if (h->depth_stencil_mode != t.depth_stencil_mode || std::memcmp(h->swizzle, t.swizzle, sizeof t.swizzle)) continue;
+                if ((h->skip && t.full_wanted) || h->depth_stencil_mode != t.depth_stencil_mode || std::memcmp(h->swizzle, t.swizzle, sizeof t.swizzle)) continue;
                 t.image = h->image; t.memory = h->memory; t.block = h->block; t.memory_offset = h->memory_offset; t.allocation_size = h->allocation_size;
                 t.view = h->view; t.views = std::move(h->views); t.layout = h->layout; t.usage = h->usage;
-                t.decoded_astc = h->decoded_astc; t.bc3 = h->bc3; t.decoded_rgb9e5 = h->decoded_rgb9e5; t.info = h->info;
+                t.skip = h->skip; t.decoded_astc = h->decoded_astc; t.bc3 = h->bc3; t.decoded_rgb9e5 = h->decoded_rgb9e5; t.info = h->info;
                 t.uploaded = t.gpu_written = false; // (a new image as far as its contents go)
                 h->image = VK_NULL_HANDLE; h->memory = VK_NULL_HANDLE; h->block = nullptr; h->view = VK_NULL_HANDLE; h->views.clear(); h->allocation_size = 0;
                 h->layout = VK_IMAGE_LAYOUT_UNDEFINED; h->uploaded = h->gpu_written = false;
@@ -973,6 +1039,23 @@ void ReuseOverlapping(Texture& t, bool take) {
         ++images_released;
     }
     if (!dead.empty()) ++binding_generation;
+}
+void WantFullImage(Texture& t) {
+    t.full_wanted = true;
+    if (!t.skip) return;
+    static std::atomic<u32> told{0}; if (told++ < 10) RT_LOG("texture %ux%u fmt %u loaded without its largest level is needed whole: made again", t.width, t.height, t.format);
+    if (t.image) {
+        { std::lock_guard lock{holders_mutex};
+          auto it = holders.find(KeyOf(t)); if (it != holders.end() && it->second == &t) holders.erase(it);
+          Unlist(&t); }
+        auto* image = new Texture(t);
+        t.image = VK_NULL_HANDLE; t.memory = VK_NULL_HANDLE; t.block = nullptr; t.view = VK_NULL_HANDLE; t.views.clear(); t.allocation_size = 0;
+        t.layout = VK_IMAGE_LAYOUT_UNDEFINED; t.uploaded = t.gpu_written = false;
+        image->object = 0; image->owner_finalized = false; image->gpu_retirement_pending = false;
+        DestroyLater(image);
+        ++binding_generation;
+    }
+    t.skip = 0;
 }
 void ReportImageAges() {
     std::lock_guard lock{holders_mutex};
@@ -1007,14 +1090,14 @@ bool StealLiveImage(Texture& t) {
     auto it = holders.find(KeyOf(t));
     if (it == holders.end()) return false;
     Texture& h = *it->second;
-    if (&h == &t || !h.image || h.depth_stencil_mode != t.depth_stencil_mode || std::memcmp(h.swizzle, t.swizzle, sizeof t.swizzle)) return false;
+    if (&h == &t || !h.image || (h.skip && t.full_wanted) || h.depth_stencil_mode != t.depth_stencil_mode || std::memcmp(h.swizzle, t.swizzle, sizeof t.swizzle)) return false;
     std::unique_lock<std::shared_mutex> moving{worker_views, std::defer_lock};
     if (resolve_worker) moving.lock();
     t.image = h.image; t.memory = h.memory; t.block = h.block; t.memory_offset = h.memory_offset; t.allocation_size = h.allocation_size;
     t.view = h.view; t.views = std::move(h.views);
     t.layout = h.layout; t.usage = h.usage; t.gpu_written = h.gpu_written; t.uploaded = h.uploaded; t.upload_frame = h.upload_frame;
     t.upload_sequence = h.upload_sequence; t.checked_sequence = h.checked_sequence; t.content_hash = h.content_hash; t.hash_frame = h.hash_frame;
-    t.decoded_astc = h.decoded_astc; t.bc3 = h.bc3; t.decoded_rgb9e5 = h.decoded_rgb9e5; t.info = h.info;
+    t.skip = h.skip; t.decoded_astc = h.decoded_astc; t.bc3 = h.bc3; t.decoded_rgb9e5 = h.decoded_rgb9e5; t.info = h.info;
     h.image = VK_NULL_HANDLE; h.memory = VK_NULL_HANDLE; h.block = nullptr; h.view = VK_NULL_HANDLE; h.views.clear(); h.allocation_size = 0;
     h.layout = VK_IMAGE_LAYOUT_UNDEFINED; h.uploaded = h.gpu_written = false;
     it->second = &t;
@@ -1044,6 +1127,8 @@ void ReportImageCache() {
            (unsigned long long)images_released.exchange(0), (unsigned long long)image_cache_evicted.exchange(0),
            image_cache.size(), image_cached_bytes / 1048576.0, image_live_bytes / 1048576.0, image_astc_bytes / 1048576.0);
     AgeSpareImages();
+    if (const u64 reduced = images_reduced.exchange(0), shared = images_in_shared_memory.exchange(0); reduced || shared)
+        RT_LOG("textures: %llu loaded without their largest level, %llu placed in memory shared with the system (the card's own was full)", (unsigned long long)reduced, (unsigned long long)shared);
     {u64 used=0,budget=0;const bool tight=VideoMemoryTight(&used,&budget);
      // (short of video memory: what is only kept for speed goes before an allocation fails and the picture stalls)
      if(tight){DropSpareImages(8, 128ull << 20);static u32 told=0;if(told++<8)RT_LOG("video memory tight: %llu of %llu MiB the system allows in use; spare render targets released",(unsigned long long)(used>>20),(unsigned long long)(budget>>20));}

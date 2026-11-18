@@ -161,7 +161,9 @@ int EffectiveRenderScale() {
     return current.render_scale;
 }
 float LodBias() {
-    static constexpr float bias[] = {0.0f, 1.5f, 0.75f, 0.0f, -0.5f};
+    // (Low: big textures are loaded without their largest level - nvn/texture.cpp MipSkipWanted - which is a whole
+    // level of bias for them already; with the 0.5 here they look as Low's 1.5 did, and the small ones a little sharper)
+    static constexpr float bias[] = {0.0f, 0.5f, 0.75f, 0.0f, -0.5f};
     float b = bias[current.texture_detail];
     // (a temporal upscaler rebuilds detail finer than the 3D's pixels from many frames: textures are sampled as sharp as
     // the finished picture wants them, log2 of the 3D's share, as NVIDIA's and AMD's guides ask)

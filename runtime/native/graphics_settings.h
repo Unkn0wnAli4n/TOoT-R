@@ -21,7 +21,7 @@ struct Settings {
     int frame_cap = 60;      // frames per second: one of FrameCaps (0: no limit)
     int vsync = 0;           // 0 off, 1 on, 2 adaptive: for a variable refresh rate display (frames held just under its refresh rate)
     int filtering = 0;       // 0 original, 1 bilinear, 2 trilinear, 3..6 anisotropic 2x/4x/8x/16x
-    int texture_detail = 0;  // 0 original, 1 low, 2 medium, 3 high, 4 ultra (mip LOD bias)
+    int texture_detail = 0;  // 0 original, 1 low (big textures without their largest level), 2 medium, 3 high, 4 ultra (mip LOD bias)
     int texture_memory = 0;  // 0 original, 1 low (more BC3), 2 quality (no BC3: RGBA8)
     int upscaling = 0;       // the game's 1080p frame to the window: 0 linear, 1 Catmull-Rom, 2 Lanczos, 3 FSR 1
     int sharpness = 0;       // percent, 0..200
