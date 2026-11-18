@@ -58,6 +58,60 @@ std::map<u64, std::weak_ptr<HostImport>> imports; // base -> import
 // When the last pool goes, the contents go back into ordinary memory. OOT_IMPORT_POOLS=1: imports only.
 bool BackPools();
 std::shared_ptr<HostImport> CreateBacked(u64 base, u64 size);
+// NVIDIA's Windows driver takes hold of an import's pages when the GPU first reaches them, and loses the device if a page
+// is read-only at that moment (found with a test program on a Tesla T4, driver 616.92: import, protect, first copy =
+// device lost; a page the GPU had reached while writable may be protected afterwards). The game's pages are protected
+// to find CPU writes (texture memory, the pools with device copies), often before the GPU has used them: that was
+// the crash at start-up on Windows. So the GPU reads every page of a new import once, while it is still writable.
+// On by default on Windows; OOT_PRIME_IMPORTS=1 / 0 elsewhere or to turn it off.
+bool ImportsPrimed() { // (whether new imports get that first read: asked before any is made)
+    const char* e = std::getenv("OOT_PRIME_IMPORTS");
+#ifdef _WIN32
+    const bool on = !e || std::atoi(e) != 0;
+#else
+    const bool on = e && std::atoi(e) != 0;
+#endif
+    return on && Vk().copy_queue != Vk().queue;
+}
+void PrimeImport(VkBuffer buffer, u64 size) {
+    static const bool on = [] { const char* e = std::getenv("OOT_PRIME_IMPORTS");
+#ifdef _WIN32
+        return !e || std::atoi(e) != 0;
+#else
+        return e && std::atoi(e) != 0;
+#endif
+    }();
+    if (!on || !size) return;
+    auto& vk = Vk();
+    // (on the second queue: imports are made with the pool locks held, and the main queue's lock is held by threads
+    // that wait for those - the presenter for one. A device with a single queue goes without.)
+    if (vk.copy_queue == vk.queue) { static bool told = false; if (!told) { told = true; RT_LOG("imports: no second queue to read them on first"); } return; }
+    constexpr u64 Chunk = 8u << 20;
+    static std::mutex mutex; std::lock_guard lock{mutex};
+    static VkCommandPool pool = VK_NULL_HANDLE; static VkBuffer scratch = VK_NULL_HANDLE; static VkFence fence = VK_NULL_HANDLE;
+    if (!pool) {
+        VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; pi.queueFamilyIndex = vk.queue_family; pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        VK_CHECK(vkCreateCommandPool(vk.device, &pi, nullptr, &pool));
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bi.size = Chunk; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        VK_CHECK(vkCreateBuffer(vk.device, &bi, nullptr, &scratch));
+        VkMemoryRequirements req; vkGetBufferMemoryRequirements(vk.device, scratch, &req);
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize = req.size; ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VkDeviceMemory memory; VK_CHECK(vkAllocateMemory(vk.device, &ai, nullptr, &memory)); VK_CHECK(vkBindBufferMemory(vk.device, scratch, memory, 0));
+        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VK_CHECK(vkCreateFence(vk.device, &fi, nullptr, &fence));
+    }
+    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO}; ai.commandPool = pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
+    VkCommandBuffer cmd; VK_CHECK(vkAllocateCommandBuffers(vk.device, &ai, &cmd));
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
+    for (u64 at = 0; at < size; at += Chunk) { const VkBufferCopy region{at, 0, std::min(Chunk, size - at)}; vkCmdCopyBuffer(cmd, buffer, scratch, 1, &region); }
+    VK_CHECK(vkEndCommandBuffer(cmd));
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
+    { std::lock_guard copy{vk.copy_mutex}; VK_CHECK(vkQueueSubmit(vk.copy_queue, 1, &si, fence)); }
+    VK_CHECK(vkWaitForFences(vk.device, 1, &fence, VK_TRUE, UINT64_MAX)); VK_CHECK(vkResetFences(vk.device, 1, &fence));
+    vkFreeCommandBuffers(vk.device, pool, 1, &cmd);
+    static std::atomic<u64> total{0}; static std::atomic<u32> told{0};
+    total += size; if (told++ == 0) RT_LOG("imports: each is read once by the GPU while its pages are writable");
+}
 std::shared_ptr<HostImport> CreateImport(u64 base, u64 size) {
     auto& vk = Vk();
     // (an import of pages GPU memory is mapped over would get every submission rejected)
@@ -110,6 +164,7 @@ std::shared_ptr<HostImport> CreateImport(u64 base, u64 size) {
 #endif
         vkDestroyBuffer(vk.device, imp->buffer, nullptr); imp->buffer = VK_NULL_HANDLE; return nullptr; }
     VK_CHECK(vkBindBufferMemory(vk.device, imp->buffer, imp->memory, 0));
+    PrimeImport(imp->buffer, size);
     return imp;
 }
 namespace track { bool UnprotectForImport(u64 base, u64 size); }
@@ -1515,7 +1570,10 @@ bool PageProtectionUsable() {
         // then (wrong outlines flashing, a band across the screen, squares of noise): the GPU copies of the game's
         // buffers are kept current by write protection too. The GPU reads the game's memory itself there, as on AMD.
         // OOT_PAGE_PROTECTION=1: protected all the same.
-        if (!std::getenv("OOT_PAGE_PROTECTION")) { RT_LOG("CPU writes: Windows, no page protection of imported memory"); return false; }
+        // (2026-11-18: the cause was the driver losing the device over pages that are read-only when the GPU first
+        // reaches them - PrimeImport, above. With every import read once first, protection is as on Linux.
+        // OOT_PAGE_PROTECTION=0: none, the slow way of the days between.)
+        if (const char* e = std::getenv("OOT_PAGE_PROTECTION"); (e && std::atoi(e) == 0) || (!e && !ImportsPrimed())) { RT_LOG("CPU writes: Windows, no page protection of imported memory"); return false; }
 #endif
         VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(Vk().physical, &p);
         const bool amd = p.vendorID == 0x1002;
@@ -1538,7 +1596,7 @@ bool TextureWatchUsable() {
         // Windows: NVIDIA's driver loses the device at the first submission after imported pages were write-protected
         // (an RTX 3050 laptop, driver 617.42: device lost as the first textures went in; none with the watch off).
         // OOT_TEXTURE_WATCH=1: protected all the same.
-        if (!std::getenv("OOT_TEXTURE_WATCH")) { RT_LOG("CPU writes: Windows, no page protection of texture memory (textures checked by content)"); return false; }
+        if (const char* e = std::getenv("OOT_TEXTURE_WATCH"); (e && std::atoi(e) == 0) || (!e && !ImportsPrimed())) { RT_LOG("CPU writes: Windows, no page protection of texture memory (textures checked by content)"); return false; }
 #endif
         if (PageProtectionUsable()) return true;
         const char* e = std::getenv("OOT_BACKED_WATCH");
