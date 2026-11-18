@@ -18,6 +18,7 @@
 #include <mutex>
 #include <map>
 #include <unordered_map>
+#include <list>
 #include <memory>
 #include <string>
 #include "../../native.h"
@@ -963,7 +964,7 @@ struct ShaderVariant { const ShaderCode* source; nvshader::Request request; nvsh
     mutable std::atomic<u64> resource_hash{0}; }; // (see SameResources) // (identity: what the translation is, the same in every run; cache_key 0: not in the shader cache)
 struct CompileTime { double translate=0, pipelines=0; u32 created=0, cached=0; } compile_time; // seconds since the last report
 // This frame's executor time in work that varies with new content (slow-frame diagnosis).
-struct Hitch { double translate=0, pipeline_wait=0; } hitch;
+struct Hitch { double translate=0, pipeline_wait=0, lookup=0, module=0; } hitch; // (lookup: GetPipeline in all, with the translation inside it)
 std::vector<std::unique_ptr<ShaderVariant>> shaders;
 // The variants of each program, so a lookup scans only that program's few variants.
 std::unordered_map<const ShaderCode*,std::vector<ShaderVariant*>> variants_by_code;
@@ -998,6 +999,7 @@ constexpr u32 ShaderCacheVersion=12; // 12: the depth conversion exact; // 11: m
 bool ShaderCacheEnabled(){static const bool on=std::getenv("OOT_NO_SHADER_CACHE")==nullptr;return on;}
 std::string ShaderCacheDirectory(){
     static const std::string dir=[]{std::string d=rt::DataDir()+"/shader_cache";
+        if(const char* e=std::getenv("OOT_SHADER_CACHE_DIR"))d=e; // (tests: a cold start without touching the real cache)
         std::filesystem::create_directories(d);return d;}();
     return dir;
 }
@@ -1194,7 +1196,7 @@ ShaderVariant& CompileShader(const ShaderCode& code, u32 binding_base, const Sha
     variant->cache_key=cache_key;variant->identity=ShaderIdentity(variant->compiled,code.stage);
     if(variant->compiled.global_loads||variant->compiled.global_stores)PatchAddressTable(variant->compiled.spirv);
     VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO}; info.codeSize=variant->compiled.spirv.size()*4;info.pCode=variant->compiled.spirv.data();
-    VK_CHECK(vkCreateShaderModule(Vk().device,&info,nullptr,&variant->module));
+    {const auto module_t0=std::chrono::steady_clock::now();VK_CHECK(vkCreateShaderModule(Vk().device,&info,nullptr,&variant->module));hitch.module+=std::chrono::duration<double>(std::chrono::steady_clock::now()-module_t0).count();}
     if(!variant->compiled.fallback_vertex_spirv.empty()){VkShaderModuleCreateInfo vi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};vi.codeSize=variant->compiled.fallback_vertex_spirv.size()*4;vi.pCode=variant->compiled.fallback_vertex_spirv.data();
         VK_CHECK(vkCreateShaderModule(Vk().device,&vi,nullptr,&variant->fallback_vertex_module));
         if(const char* dir=std::getenv("OOT_SHADER_DUMP")){char path[512];std::snprintf(path,sizeof path,"%s/%llx-v%zu-fbvertex.spv",dir,(unsigned long long)code.address,shaders.size());if(FILE* file=std::fopen(path,"wb")){std::fwrite(vi.pCode,1,vi.codeSize,file);std::fclose(file);}}}
@@ -1203,16 +1205,46 @@ ShaderVariant& CompileShader(const ShaderCode& code, u32 binding_base, const Sha
 }
 
 // Background pipeline compilation.
+// The threads that make pipelines. Jobs carry a key (their Pipeline): Urgent(key) moves a waiting job ahead of the
+// others - a pipeline a draw of this frame is left out for goes before the hundreds a new area asks for at once.
+// Extra threads join while more than a few jobs wait (the first visit to an area: a thousand pipelines, 70 s of
+// compiling), and sleep otherwise. OOT_PIPELINE_THREADS=<n>: the usual threads; OOT_PIPELINE_SURGE=<n>: the extra.
 class WorkerPool {
 public:
-    explicit WorkerPool(unsigned count){for(unsigned i=0;i<count;++i)threads.emplace_back([this]{Loop();});}
-    void Run(std::function<void()> job){{std::lock_guard lock{mutex};jobs.push_back(std::move(job));}ready.notify_one();}
+    WorkerPool(unsigned count,unsigned surge){for(unsigned i=0;i<count+surge;++i)threads.emplace_back([this,i,count]{Loop(i>=count);});}
+    void Run(std::function<void()> job,const void* key=nullptr){
+        size_t waiting;
+        {std::lock_guard lock{mutex};normal.push_back({std::move(job),key});if(key)queued[key]=std::prev(normal.end());waiting=normal.size()+urgent.size();}
+        ready.notify_one();if(waiting>SurgeFrom)ready.notify_all();
+    }
+    void Urgent(const void* key){
+        std::lock_guard lock{mutex};
+        const auto it=queued.find(key);if(it==queued.end())return; // (started, done, or already urgent)
+        urgent.splice(urgent.end(),normal,it->second);queued.erase(it);
+    }
 private:
-    void Loop(){for(;;){std::function<void()> job;{std::unique_lock lock{mutex};ready.wait(lock,[this]{return !jobs.empty();});job=std::move(jobs.front());jobs.pop_front();}job();}}
-    std::mutex mutex;std::condition_variable ready;std::deque<std::function<void()>> jobs;std::vector<std::thread> threads;
+    static constexpr size_t SurgeFrom=8;
+    struct Job{std::function<void()> run;const void* key;};
+    void Loop(bool surge){for(;;){Job job;
+        {std::unique_lock lock{mutex};ready.wait(lock,[&]{return !urgent.empty()||(surge?normal.size()>SurgeFrom:!normal.empty());});
+         auto& from=urgent.empty()?normal:urgent;job=std::move(from.front());
+         if(&from==&normal&&job.key)queued.erase(job.key);
+         from.pop_front();}
+        job.run();}}
+    std::mutex mutex;std::condition_variable ready;std::list<Job> normal,urgent;std::unordered_map<const void*,std::list<Job>::iterator> queued;std::vector<std::thread> threads;
 };
-WorkerPool& PipelineWorkers(){static WorkerPool pool{std::max(2u,std::min(6u,std::thread::hardware_concurrency()/3))};return pool;}
+WorkerPool& PipelineWorkers(){
+    static WorkerPool pool{[]{const unsigned hw=std::thread::hardware_concurrency();
+            return std::getenv("OOT_PIPELINE_THREADS")?(unsigned)std::max(1,std::atoi(std::getenv("OOT_PIPELINE_THREADS"))):std::max(2u,std::min(6u,hw/3));}(),
+        []{const unsigned hw=std::thread::hardware_concurrency(),usual=std::max(2u,std::min(6u,hw/3));
+            return std::getenv("OOT_PIPELINE_SURGE")?(unsigned)std::max(0,std::atoi(std::getenv("OOT_PIPELINE_SURGE"))):(hw*3/4>usual+2?hw*3/4-2-usual:0u);}()};
+    return pool;}
 std::mutex compile_time_mutex;
+std::atomic<u64> quick_wait_frame{0},quick_wait_us{0};
+bool QuickWaitAllowed(){ // (see where pipelines are queued)
+    if(quick_wait_frame.load(std::memory_order_relaxed)!=frame_number){quick_wait_frame.store(frame_number,std::memory_order_relaxed);quick_wait_us.store(0,std::memory_order_relaxed);}
+    return quick_wait_us.load(std::memory_order_relaxed)<12000;
+}
 struct Pipeline {
     std::atomic<VkPipeline> pipeline{VK_NULL_HANDLE}; // null while a worker compiles it
     VkPipelineLayout layout=VK_NULL_HANDLE;
@@ -1573,11 +1605,16 @@ Pipeline& GetPipelineOld(bool mesh) {
     static const bool synchronous=std::getenv("OOT_SYNC_PIPELINES")!=nullptr;
     if(synchronous)job();
     else{
-        PipelineWorkers().Run(std::move(job));
+        PipelineWorkers().Run(std::move(job),target);
         const auto waited_from=std::chrono::steady_clock::now();
-        const auto deadline=waited_from+std::chrono::microseconds(3000);
-        while(!target->pipeline.load(std::memory_order_acquire)&&std::chrono::steady_clock::now()<deadline)std::this_thread::yield();
-        hitch.pipeline_wait+=std::chrono::duration<double>(std::chrono::steady_clock::now()-waited_from).count();
+        // (a quick one is there in a moment and its draw need not be left out: up to 3 ms, but no more than 12 ms a
+        // frame for all of them - a new area's thousand pipelines were 3 s of these waits)
+        if(QuickWaitAllowed()){
+            const auto deadline=waited_from+std::chrono::microseconds(3000);
+            while(!target->pipeline.load(std::memory_order_acquire)&&std::chrono::steady_clock::now()<deadline)std::this_thread::yield();
+            const double waited=std::chrono::duration<double>(std::chrono::steady_clock::now()-waited_from).count();
+            hitch.pipeline_wait+=waited;quick_wait_us.fetch_add((u64)(waited*1e6),std::memory_order_relaxed);
+        }
     }
     }
     auto* result=pipeline.get();pipelines.emplace(std::move(key),std::move(pipeline));return *result;
@@ -1692,11 +1729,16 @@ Pipeline& GetPipeline(bool mesh) {
     static const bool synchronous=std::getenv("OOT_SYNC_PIPELINES")!=nullptr;
     if(synchronous)job();
     else{
-        PipelineWorkers().Run(std::move(job));
+        PipelineWorkers().Run(std::move(job),target);
         const auto waited_from=std::chrono::steady_clock::now();
-        const auto deadline=waited_from+std::chrono::microseconds(3000);
-        while(!target->pipeline.load(std::memory_order_acquire)&&std::chrono::steady_clock::now()<deadline)std::this_thread::yield();
-        hitch.pipeline_wait+=std::chrono::duration<double>(std::chrono::steady_clock::now()-waited_from).count();
+        // (a quick one is there in a moment and its draw need not be left out: up to 3 ms, but no more than 12 ms a
+        // frame for all of them - a new area's thousand pipelines were 3 s of these waits)
+        if(QuickWaitAllowed()){
+            const auto deadline=waited_from+std::chrono::microseconds(3000);
+            while(!target->pipeline.load(std::memory_order_acquire)&&std::chrono::steady_clock::now()<deadline)std::this_thread::yield();
+            const double waited=std::chrono::duration<double>(std::chrono::steady_clock::now()-waited_from).count();
+            hitch.pipeline_wait+=waited;quick_wait_us.fetch_add((u64)(waited*1e6),std::memory_order_relaxed);
+        }
     }
     }
     auto* result=pipeline.get();pipelines.emplace(std::move(key),std::move(pipeline));return *result;
@@ -2700,6 +2742,44 @@ bool MeshFallbackDispatch(Pipeline& pipeline,VkDescriptorSet set,const Command& 
     if(mesh_fallback_draws%20000==0)RT_LOG("mesh fallback: of the last draws %llu kept their render pass open, %llu ended it",(unsigned long long)mesh_hoisted.exchange(0),(unsigned long long)mesh_resets.exchange(0));
     return true;
 }
+// ---- draws whose pipeline is not made yet ---------------------------------------------------------------------------
+// The game draws most objects twice: depth only first (a pre-pass), then shaded where the depth is EQUAL. The shaded
+// draw's pipeline is the slow one to make (hundreds of ms on a first sight, and a new area asks for a thousand at
+// once). Left out while it compiles, the pre-pass alone left the object as a hole showing the sky; waited for, the
+// game froze - frames of 9, 20 and 29 s on a first visit to Kokiri Forest with nothing cached. Now neither: the
+// shaded draw names its mesh here, and until its pipeline is there every depth-writing draw of that mesh is left
+// out as well. The object appears whole a moment later, and the game keeps running. The frame it is first seen can
+// still show the hole once, when its pre-pass pipeline already existed.
+// OOT_EQUAL_PASS_WAIT_MS=<ms>: wait for such pipelines instead, as before (2000 was the default).
+u32 EqualPassWaitMs(){static const u32 ms=std::getenv("OOT_EQUAL_PASS_WAIT_MS")?(u32)std::atoi(std::getenv("OOT_EQUAL_PASS_WAIT_MS")):0;return ms;}
+constexpr u32 PendingMeshSlots=4096;
+std::atomic<u64> pending_mesh_key[PendingMeshSlots],pending_mesh_until[PendingMeshSlots];
+std::atomic<u64> pending_mesh_latest{0},pending_mesh_marks{0};
+u64 MeshKey(const Command& command,bool mesh){
+    u64 k=0xcbf29ce484222325ull;const auto mix=[&](u64 v){k=(k^v)*0x100000001b3ull;};
+    if(mesh){mix(1);mix(mesh_indirect_source);mix(command.x[0]);mix(command.x[1]);mix(command.x[2]);}
+    else{mix(command.op);mix(command.x[2]);mix(command.x[3]);mix(command.x[4]);mix((*tls_state).vertices[0].address);}
+    return k|1; // (never 0: an empty slot)
+}
+void MarkMeshPending(u64 key){
+    const u64 until=frame_number+1; // (this frame's later draws and the next frame's)
+    pending_mesh_latest.store(until,std::memory_order_relaxed);
+    for(u32 probe=0;probe<8;++probe){
+        const u32 slot=(u32)(key+probe)&(PendingMeshSlots-1);
+        const u64 held=pending_mesh_key[slot].load(std::memory_order_relaxed);
+        if(held!=key&&pending_mesh_until[slot].load(std::memory_order_relaxed)>=frame_number)continue; // (another mesh's, still current)
+        if(held!=key){pending_mesh_key[slot].store(key,std::memory_order_relaxed);pending_mesh_marks.fetch_add(1,std::memory_order_relaxed);}
+        pending_mesh_until[slot].store(until,std::memory_order_relaxed);
+        return;
+    }
+}
+bool MeshPending(u64 key){
+    for(u32 probe=0;probe<8;++probe){
+        const u32 slot=(u32)(key+probe)&(PendingMeshSlots-1);
+        if(pending_mesh_key[slot].load(std::memory_order_relaxed)==key)return pending_mesh_until[slot].load(std::memory_order_relaxed)>=frame_number;
+    }
+    return false;
+}
 void Draw(const Command& command) {
     const bool profile_cpu = DrawCpuProfiling();
     const auto draw_cpu_start = profile_cpu ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -2781,6 +2861,10 @@ void Draw(const Command& command) {
         if(!index_range.buffer||index_bytes>index_range.available){static int told=0;if(told++<16)RT_LOG("draw skipped: index buffer %#llx has %s (%llu indices, %llu bytes left in its pool)",(unsigned long long)command.x[3],
             index_range.buffer?"too few bytes":"no GPU buffer",(unsigned long long)command.x[2],(unsigned long long)index_range.available);return;}}
     const u64 indirect_slot=mesh?mesh_indirect_slot:0; // (DrawMeshTasksIndirect: arguments in indirect_clamp's slot - 1)
+    // A mesh whose shading pipeline is still being made (MarkMeshPending, below) is left out whole: its depth pre-pass
+    // and its shadow draws too, so it is simply not there for the moment instead of a hole in the picture.
+    {const u64 d=(*tls_state).depth;
+     if(!EqualPassWaitMs()&&(d&3)==3&&((d>>4)&15)!=3&&pending_mesh_latest.load(std::memory_order_relaxed)>=frame_number&&MeshPending(MeshKey(command,mesh))){++stats.pending;++run_note.not_run;return;}}
     // Fast path: draws that differ from the previous one only in uniform/vertex buffer bindings
     // (most of the game's per-object draws) reuse its pipeline, attachments and descriptor writes,
     // patching only the uniform buffer descriptors. OOT_NO_FAST_DRAW=1 disables it.
@@ -2805,7 +2889,9 @@ void Draw(const Command& command) {
     const bool fast=!fast_disabled&&!mesh&&!stats_pool&&fast_draw_allowed&&fd.valid&&(resolve_worker||draw_predicate==~0u)&&TryFastDraw(fd);
     if(fast)++fast_draw_count;
     draw_was_fast=fast;
+    const auto lookup_t0=std::chrono::steady_clock::now();
     Pipeline* const pipeline_ptr=fast?fd.pipeline:&GetPipeline(mesh);
+    if(!fast&&!resolve_worker){const double spent=std::chrono::duration<double>(std::chrono::steady_clock::now()-lookup_t0).count();if(spent>0.0005)hitch.lookup+=spent;}
     if(resolve_bail)return;
     auto& pipeline=*pipeline_ptr;auto& vk=Vk();
     std::array<Texture*,8> colors{};Texture* depth=nullptr;VkExtent2D extent{0,0};
@@ -2819,10 +2905,11 @@ void Draw(const Command& command) {
         for(const auto* shader:pipeline.shaders)if(shader->compiled.global_loads||shader->compiled.global_stores){if(!resolve_worker)GlobalAddressTable();else if(!GlobalAddressTableCurrent()){RESOLVE_BAIL();return;}break;}
         // A draw that shades over a depth pre-pass (depth test EQUAL) and is left out while its pipeline compiles leaves
         // the pre-pass's hole: the object as a cut-out in the sky's colour until the pipeline is there (far trees, doors,
-        // seconds on a first visit). Such a draw waits for its pipeline instead: a hitch once, where the picture was wrong.
-        // OOT_EQUAL_PASS_WAIT_MS=<ms> (2000; 0: left out as other draws are).
+        // seconds on a first visit). With OOT_EQUAL_PASS_WAIT_MS such a draw waits for its pipeline, as it did by default
+        // before; now the whole mesh is left out until the pipeline is there (MarkMeshPending).
         if(!pipeline.pipeline.load(std::memory_order_acquire)&&pipeline.layout&&((*tls_state).depth&1)&&(((*tls_state).depth>>4)&15)==3){
-            static const u32 wait_ms=std::getenv("OOT_EQUAL_PASS_WAIT_MS")?(u32)std::atoi(std::getenv("OOT_EQUAL_PASS_WAIT_MS")):2000;
+            const u32 wait_ms=EqualPassWaitMs();
+            if(!wait_ms)MarkMeshPending(MeshKey(command,mesh)); // (left out whole until it is there: see MarkMeshPending)
             if(wait_ms&&!pipeline.waited){ // (once a pipeline: one that takes longer - minutes on some drivers - is left out as before)
                 if(resolve_worker){RESOLVE_BAIL();return;} // (the executor waits)
                 pipeline.waited=true;
@@ -2830,7 +2917,7 @@ void Draw(const Command& command) {
                 while(!pipeline.pipeline.load(std::memory_order_acquire)&&std::chrono::steady_clock::now()<deadline)std::this_thread::sleep_for(std::chrono::microseconds(200));
                 const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-from).count();hitch.pipeline_wait+=ms/1000;
                 static u32 told=0;if(ms>20&&told++<40)RT_LOG("waited %.0f ms for the pipeline of a draw shading over its depth pre-pass (fragment program %#llx)",ms,(unsigned long long)((*tls_state).stages[1].shader?(*tls_state).stages[1].shader->address:0));}}
-        if(!pipeline.pipeline.load(std::memory_order_acquire)){++stats.pending;++run_note.not_run;return;} // untranslatable, or still compiling
+        if(!pipeline.pipeline.load(std::memory_order_acquire)){if(pipeline.layout)PipelineWorkers().Urgent(&pipeline);++stats.pending;++run_note.not_run;return;} // untranslatable, or still compiling (a draw wants it now: ahead of the others)
         // Anything that may flush runs before the descriptor set is written (below): a flush retires
         // the batch and resets the descriptor pool that set comes from.
         if(!resolve_worker&&gpu_counters.ready&&samples.enabled)EnsureCounterRings();
@@ -3372,6 +3459,7 @@ void Dispatch(u32 gx,u32 gy,u32 gz,u64 indirect=0){
         // Steam Deck, the game frozen meanwhile. Programs past OOT_NOOPT_WORDS (40000; 0: never) are built without the
         // optimizer first (from Hookshot f414a76), and optimized on a worker, which takes over when done.
         static const u64 noopt_words=std::getenv("OOT_NOOPT_WORDS")?std::strtoull(std::getenv("OOT_NOOPT_WORDS"),nullptr,10):40000;
+        // (NVIDIA's driver took as long without the optimizer: 27.8 s against 28.7 s for a cold start's 58 programs)
         bool quick=vk.properties.vendorID==0x1002&&noopt_words&&v.compiled.spirv.size()>noopt_words;
         const auto t0=std::chrono::steady_clock::now();
         VkPipeline created=VK_NULL_HANDLE;
@@ -3399,6 +3487,7 @@ void Dispatch(u32 gx,u32 gy,u32 gz,u64 indirect=0){
         }
         {const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
          if(ms>20){u64 h=0xcbf29ce484222325ull;for(u32 w:v.compiled.spirv)h=(h^w)*0x100000001b3ull;
+             if(std::getenv("OOT_COMPUTE_DEPS")){std::string d;for(const auto& x:v.compiled.dependencies){char b[64];std::snprintf(b,sizeof b," k%u b%u+%#x=%#x",(u32)x.kind,x.bank,x.offset,x.value);d+=b;}RT_LOG("  compute variant: binding base %u, %zu dependencies:%s",v.request.binding_base,v.compiled.dependencies.size(),d.c_str());}
              RT_LOG("compute pipeline for shader %#llx built in %.0f ms (SPIR-V %zu words, hash %016llx%s%s)",(unsigned long long)stage.shader->address,ms,v.compiled.spirv.size(),(unsigned long long)h,
                     v.compiled.global_loads||v.compiled.global_stores?", global memory":"",quick?", without the optimizer":"");}}
         slot_ptr=slot.get();
@@ -4568,8 +4657,8 @@ void ReportSlowFrame(double ms){
     static u64 last_wait=FenceWaitNanoseconds();const u64 wait_now=FenceWaitNanoseconds();const double fence=(wait_now-last_wait)/1e6;last_wait=wait_now;
     extern std::atomic<u64> executor_idle_ns,executor_parked_ns;const double idle=executor_idle_ns.exchange(0)/1e6,parked=executor_parked_ns.exchange(0)/1e6;
     extern std::atomic<u64> image_make_ns_frame;const double made=image_make_ns_frame.exchange(0)/1e6;
-    if(ms>threshold)RT_LOG("slow frame %.0f ms: shader translation %.1f ms, pipeline waits %.1f ms (%llu draws skipped), texture uploads %.1f ms (%llu; staging %.1f, deswizzle %.1f, decode %.1f), image creation %.1f ms, fence waits %.1f ms, executor idle %.1f ms (a queue parked %.1f ms)",
-        ms,hitch.translate*1000,hitch.pipeline_wait*1000,(unsigned long long)pending,up,(unsigned long long)n,st,sw,dc,made,fence,idle,parked);
+    if(ms>threshold)RT_LOG("slow frame %.0f ms: shader translation %.1f ms, pipeline waits %.1f ms (%llu draws skipped), texture uploads %.1f ms (%llu; staging %.1f, deswizzle %.1f, decode %.1f), image creation %.1f ms, fence waits %.1f ms, executor idle %.1f ms (a queue parked %.1f ms); pipeline lookups %.1f ms (shader modules %.1f ms)",
+        ms,hitch.translate*1000,hitch.pipeline_wait*1000,(unsigned long long)pending,up,(unsigned long long)n,st,sw,dc,made,fence,idle,parked,hitch.lookup*1000,hitch.module*1000);
     hitch={};
 }
 u32 TakePrewarmHits(){return prewarm_hits.exchange(0);}
