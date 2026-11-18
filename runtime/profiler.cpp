@@ -255,7 +255,8 @@ std::string ModuleOffset(DWORD64 pc) {
 void Sampler(std::string name) {
     const char* delay = std::getenv("OOT_PROFILE_WALL_DELAY");
     std::this_thread::sleep_for(std::chrono::seconds(delay ? std::atoi(delay) : 20));
-    const HANDLE thread = ThreadByName(name.c_str());
+    HANDLE thread = ThreadByName(name.c_str());
+    for (int i = 0; !thread && i < 240; ++i) { std::this_thread::sleep_for(std::chrono::milliseconds(500)); thread = ThreadByName(name.c_str()); } // (it may start later: up to two minutes)
     if (!thread) { RT_LOG("profiler: no thread named %s", name.c_str()); return; }
     RT_LOG("profiler: sampling thread %s in wall-clock time, 1000 times a second; reports every 10 s in the data directory", name.c_str());
     std::map<std::vector<DWORD64>, unsigned long long> chains;
