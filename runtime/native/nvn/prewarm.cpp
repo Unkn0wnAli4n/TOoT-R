@@ -199,7 +199,7 @@ void PrewarmMain() {
     const u32 total = (u32)work->records.size();
     while (!work->finished && !skip) {
         SDL_Event e;
-        while (SDL_PollEvent(&e)) {
+        while (NextWindowEvent(&e)) {
             if (e.type == SDL_EVENT_QUIT) { plist::Save(true); std::_Exit(0); }
             if ((e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) || e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) skip = true;
             overlay::ProgressEvent(e);

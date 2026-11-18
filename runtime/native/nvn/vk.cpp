@@ -1,3 +1,4 @@
+#include <future>
 #include "../graphics_settings.h"
 #include <chrono>
 #include <atomic>
@@ -477,12 +478,32 @@ VulkanContext& Vk() {
     static std::once_flag once;
     std::call_once(once, [] {
         SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1"); // (controllers also work while the window is unfocused)
-        if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) rt::Fatal("SDL_Init: %s", SDL_GetError());
+        const SDL_WindowFlags window_flags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | // (real pixels on scaled desktops: no compositor stretch)
+                                             (std::getenv("OOT_WINDOW_HIDDEN") ? SDL_WINDOW_HIDDEN : 0);
+#ifdef _WIN32
+        // Windows hands a window's messages to the thread that made it and to no other. The threads that take the
+        // game's input (the presenter, the pad reader) are not that thread, so nothing took them: the first click or
+        // key press left the window "not responding", with only the controller working. The window gets a thread of
+        // its own that does nothing but take its messages into SDL's queue, which the others read (present.cpp).
+        // OOT_WINDOW_OWN_THREAD=0: made on this thread, as before.
+        if (const char* e = std::getenv("OOT_WINDOW_OWN_THREAD"); !e || std::atoi(e) != 0) {
+            std::promise<SDL_Window*> made;
+            std::thread([&made, window_flags] {
+                SDL_Window* window = nullptr;
+                if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) window = SDL_CreateWindow("TOoT:R", 1920, 1080, window_flags);
+                if (!window) RT_LOG("window: not made on a thread of its own (%s)", SDL_GetError());
+                made.set_value(window);
+                if (!window) return;
+                window_pumped.store(true);
+                for (;;) { SDL_PumpEvents(); SDL_Delay(1); }
+            }).detach();
+            vk.window = made.get_future().get();
+            if (vk.window) RT_LOG("window: its messages are taken on a thread of its own");
+        }
+#endif
+        if (!vk.window && !SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) rt::Fatal("SDL_Init: %s", SDL_GetError());
         gfx::Current();
-        vk.window = SDL_CreateWindow("TOoT:R", 1920, 1080,
-                                     SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | // (real pixels on scaled desktops: no compositor stretch)
-                                     
-                                     (std::getenv("OOT_WINDOW_HIDDEN") ? SDL_WINDOW_HIDDEN : 0));
+        if (!vk.window) vk.window = SDL_CreateWindow("TOoT:R", 1920, 1080, window_flags);
         if (!vk.window) rt::Fatal("SDL_CreateWindow: %s", SDL_GetError());
         if (const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(vk.window)); mode && mode->h > 0) gfx::display_ratio.store((double)mode->w / mode->h);
         if (const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(vk.window)); mode && mode->refresh_rate > 1) gfx::display_refresh.store(mode->refresh_rate);

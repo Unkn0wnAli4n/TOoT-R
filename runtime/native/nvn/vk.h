@@ -1,6 +1,7 @@
 // Host Vulkan context for the native NVN implementation.
 #pragma once
 
+#include <atomic>
 #include <mutex>
 
 #include <SDL3/SDL.h>
@@ -65,6 +66,10 @@ inline bool WindowOriginLowerLeft() { return !device_object || *reinterpret_cast
     } while (0)
 
 u32 FindMemoryType(u32 type_bits, VkMemoryPropertyFlags flags);
+// Windows: the window's messages are taken by a thread of its own (vk.cpp); the others only read SDL's queue.
+inline std::atomic<bool> window_pumped{false};
+// Events for the caller: SDL's queue as it is where the window has its own thread, else pumped here.
+inline bool NextWindowEvent(SDL_Event* e) { return window_pumped.load(std::memory_order_relaxed) ? SDL_PeepEvents(e, 1, SDL_GETEVENT, SDL_EVENT_FIRST, SDL_EVENT_LAST) > 0 : SDL_PollEvent(e); }
 // Logs what VK_EXT_device_fault knows about a GPU fault (address, access type).
 void ReportDeviceLost();
 // Driver pipeline cache, loaded from and saved to <data>/pipeline_cache.bin so pipelines built in

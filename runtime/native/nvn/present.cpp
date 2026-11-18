@@ -419,7 +419,7 @@ void PresentPacing() {
         }
     }
     SDL_Event e;
-    while (SDL_PollEvent(&e)) {
+    while (NextWindowEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT) { SavePipelineCacheBlocking(); plist::Save(true); std::_Exit(0); }
         InputEvent(e);
         nvn::overlay::Event(e);
