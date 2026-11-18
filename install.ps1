@@ -141,6 +141,11 @@ foreach ($dir in @([Environment]::GetFolderPath("Programs"), [Environment]::GetF
     $link.Description = "Native PC port built from your own copy of the game"
     $link.Save()
 }
+# (installed from an administrator's PowerShell, the files may be readable by administrators only: the shortcut, run as
+# the player, then could not even open the launcher - "Permission denied" - and needed administrator rights every time.
+# The player's account and the machine's users get full use of the installation.)
+& icacls $Dir /grant "${env:USERNAME}:(OI)(CI)F" /grant "*S-1-5-32-545:(OI)(CI)M" /T /C /Q *> $null
+if ($LASTEXITCODE -ne 0) { Say "could not set the installation's permissions (icacls $LASTEXITCODE); if the game asks for administrator rights, run this installer again without them" }
 Say "installed. Start the game from the Start menu or the desktop shortcut."
 # (run by hand in a console, not by the graphical installer - which starts PowerShell -NonInteractive and has its own
 # Play button: the game can be started from here at once)
