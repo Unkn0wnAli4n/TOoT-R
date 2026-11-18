@@ -93,7 +93,7 @@ function Is-Install($path) { $path -and ((Test-Path -LiteralPath (Join-Path $pat
 $default = Join-Path $env:LOCALAPPDATA "tootr"
 # (installing again, to add DLSS or repair: the default installation is used as it is, without asking - picking it in the
 # folder window made a TOoT-R folder inside it, and the whole game was built again there)
-if (-not $Dir -and (Is-Install $default)) { $Dir = $default; Say "an installation is already in $Dir: it is updated there" }
+if (-not $Dir -and (Is-Install $default)) { $Dir = $default; Say "an installation is already in ${Dir}, so it is updated there" }
 if (-not $Dir) {
     Add-Type -AssemblyName System.Windows.Forms
     $folder = New-Object System.Windows.Forms.FolderBrowserDialog
