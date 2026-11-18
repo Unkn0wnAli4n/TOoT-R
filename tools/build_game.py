@@ -5,11 +5,13 @@
 
 Steps (each skipped when its result is already current):
   1. build the offline tools (recompiler/: oot-extract, recomp)
-  2. extract main/sdk/subsdk0 from the .nup into <data-dir> and check them against data/<version>
+  2. extract main/sdk/subsdk0 from the .nup into <data-dir>, and find this game version's places: every hook site
+     and address the port uses is searched for by what the code around it looks like (tools/signatures.py,
+     data/signatures.txt), so a game update other than the tested one builds too, without what it lacks
   3. generate C++ from the images and compile it into a game_code archive. The archive is cached
-     under <work> by a hash of everything the generated code depends on (recompiler, its data,
-     runtime/ops.h, cmake/GameCode.cmake, compiler version); the ~2 GB of generated sources and the
-     object files are deleted afterwards
+     under <work> by a hash of everything the generated code depends on (the game's code, the places found, the
+     recompiler, its data, runtime/ops.h, cmake/GameCode.cmake, compiler version); the ~2 GB of generated
+     sources and the object files are deleted afterwards
   4. build the runtime against that archive and install the stripped executable into <prefix>
 
 Works on Linux and on Windows inside MSYS2 (CLANG64). Only Python's standard library is used.
@@ -17,7 +19,6 @@ Works on Linux and on Windows inside MSYS2 (CLANG64). Only Python's standard lib
 import argparse, glob, hashlib, os, shutil, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VERSION = "v131072"
 MODULES = [  # name, load base, recompiler output file count
     ("main", "800000000", 512),
     ("subsdk0", "810000000", 8),
@@ -95,18 +96,22 @@ def compiler_id():
         fail("clang++ not found (the installer normally sets it up)")
 
 
-def game_key():
-    """Hash of every input of the generated game code (not the game itself: that is checked by hash)."""
+def game_key(data):
+    """Hash of every input of the generated game code: the tools, and this game's own code and places."""
     h = hashlib.sha256()
     files = []
     for pattern in ["recompiler/*.cpp", "recompiler/CMakeLists.txt", "third_party/dynarmic/**/*",
-                    f"data/{VERSION}/*.overrides", f"data/{VERSION}/*.entries", "tools/module_info.py", "tools/setjmp_targets.py",
+                    "data/names/*.names", "tools/module_info.py", "tools/setjmp_targets.py",
                     "tools/oot_patches.py", "runtime/ops.h", "cmake/GameCode.cmake"]:
         files += [p for p in glob.glob(os.path.join(ROOT, pattern), recursive=True) if os.path.isfile(p)]
     for p in sorted(files):
         h.update(os.path.relpath(p, ROOT).replace("\\", "/").encode())
         with open(p, "rb") as f:
             h.update(f.read())
+    with open(os.path.join(data, "images.sha256")) as f:  # (the code's own hashes: not which file it came from)
+        h.update("".join(sorted(l for l in f if not l.rstrip().endswith(" source"))).encode())
+    with open(os.path.join(data, "addresses.txt"), "rb") as f:
+        h.update(f.read())
     h.update(compiler_id().encode())
     h.update(" ".join(TOOLCHAIN).encode())
     return h.hexdigest()[:16]
@@ -120,29 +125,112 @@ def build_tools(work, jobs):
     return tools
 
 
+def known_versions():
+    """{(main, sdk, subsdk0 hashes): name} of the game versions this project was tested with (data/v*/images.sha256)."""
+    known = {}
+    for path in glob.glob(os.path.join(ROOT, "data", "v*", "images.sha256")):
+        digests = {}
+        with open(path) as f:
+            for line in f:
+                digest, name = line.split()
+                digests[name] = digest
+        known[tuple(digests.get(n + ".img") for n, _, _ in MODULES)] = os.path.basename(os.path.dirname(path))
+    return known
+
+
+def exports(image):
+    """{name: offset} of a module image's exported symbols (its dynamic symbol table)."""
+    import struct
+    with open(image, "rb") as f:
+        img = f.read()
+    mod0 = struct.unpack_from("<I", img, 4)[0]
+    d = mod0 + struct.unpack_from("<i", img, mod0 + 4)[0]
+    tags = {}
+    while True:
+        tag, val = struct.unpack_from("<qQ", img, d)
+        if tag == 0:
+            break
+        tags.setdefault(tag, val)
+        d += 16
+    symtab, strtab, out, i = tags[6], tags[5], {}, 1
+    while symtab + (i + 1) * 24 <= strtab:
+        name, info, other, shndx, value, size = struct.unpack_from("<IBBHQQ", img, symtab + i * 24)
+        if value and shndx:
+            out.setdefault(img[strtab + name:img.index(b"\0", strtab + name)].decode(), value)
+        i += 1
+    return out
+
+
 def extract(nup, tools, data):
-    expected = {}
-    with open(os.path.join(ROOT, "data", VERSION, "images.sha256")) as f:
-        for line in f:
-            digest, name = line.split()
-            expected[name] = digest
-    current = all(os.path.exists(os.path.join(data, n)) and os.path.exists(os.path.join(data, n + ".text-size"))
-                  and sha256_file(os.path.join(data, n)) == d for n, d in expected.items())
+    """The game's code out of the .nup, and what this version of it is: its places (addresses.txt) and whether it is
+    a version this project was tested with."""
+    images = [n + ".img" for n, _, _ in MODULES]
+    stamp_path = os.path.join(data, "images.sha256")
+    # (which game file the images were taken from: another file, or the same one changed, is extracted again)
+    source = ""
+    if nup and os.path.isfile(nup):
+        st = os.stat(nup)
+        source = ("%s %d %d" % (os.path.basename(nup), st.st_size, int(st.st_mtime))).replace(" ", "_")
+    recorded = {}
+    if os.path.exists(stamp_path):
+        with open(stamp_path) as f:
+            for line in f:
+                p = line.rstrip("\n").split(None, 1)
+                if len(p) == 2:
+                    recorded[p[1]] = p[0]
+    have = all(os.path.exists(os.path.join(data, n)) and os.path.exists(os.path.join(data, n + ".text-size")) for n in images)
+    known = known_versions()
+    if have and not recorded:  # (an installation from before other versions were taken: its images are a tested version's or are made again)
+        digests = tuple(sha256_file(os.path.join(data, n)) for n in images)
+        if digests in known:
+            recorded = dict(zip(images, digests))
+            recorded["source"] = source
+    current = have and all(n in recorded for n in images) and (not source or recorded.get("source", "-") in ("-", source))
     if not current:
         if not nup or not os.path.isfile(nup):
             fail("the game file (.nup) was not found: " + str(nup))
         log("extracting the game's code from " + nup)
-        for name in expected:  # (older setups linked these to a development tree)
+        for name in images:  # (older setups linked these to a development tree)
             if os.path.islink(os.path.join(data, name)):
                 os.remove(os.path.join(data, name))
         run([os.path.join(tools, "oot-extract" + EXE), nup, data])
-        for name, digest in expected.items():
-            if sha256_file(os.path.join(data, name)) != digest:
-                fail(f"{name} does not match the supported version ({VERSION}). This build needs "
-                     "The Legend of Zelda: Ocarina of Time for Nintendo Switch 2 with update "
-                     f"{VERSION} (title 0400486024DEC000), dumped as a single .nup.")
-    shutil.copyfile(os.path.join(ROOT, "data", VERSION, "nvn_map.txt"), os.path.join(data, "nvn_map.txt"))
-    log("game code verified")
+        recorded = {n: sha256_file(os.path.join(data, n)) for n in images}
+    recorded["source"] = source or recorded.get("source", "")
+    with open(stamp_path, "w") as f:
+        for n in images:
+            f.write("%s %s\n" % (recorded[n], n))
+        f.write("%s source\n" % (recorded["source"] or "-"))
+    digests = tuple(recorded[n] for n in images)
+    version = known.get(digests)
+    if version:
+        log(f"game code: update {version}, a version this build was tested with")
+    else:
+        log("game code: NOT a version this build was tested with (tested: %s). It is built from what is found in it; "
+            "what this version lacks is left out, and it may not play as the tested version does." % ", ".join(sorted(known.values())))
+    # The places of this game version.
+    sys.path.insert(0, os.path.join(ROOT, "tools"))
+    import signatures
+    found, lost = signatures.find(data, os.path.join(ROOT, "data", "signatures.txt"), os.path.join(data, "addresses.txt"), quiet=True)
+    moved = sum(1 for (m, o), v in found.items() if o != v)
+    log("game code: %d of %d places found%s" % (len(found), len(found) + len(lost), " (%d moved from the tested version's)" % moved if moved else ""))
+    for module, off in lost:
+        log("  not in this game version: %s+%#x (what uses it is left out)" % (module, off))
+    if version and lost:
+        fail("the tested version's own places were not all found: tools/signatures.py or data/signatures.txt is out of date")
+    # The graphics driver's function map: the tested SDK's is shipped; another SDK's is made by the game's first start.
+    names = os.path.join(ROOT, "data", "names", "nvn.names")
+    shutil.copyfile(names, os.path.join(data, "nvn.names"))
+    sdk_map = None
+    for digests_known, name in known.items():
+        if dict(zip(images, digests_known)).get("sdk.img") == recorded["sdk.img"]:
+            sdk_map = os.path.join(ROOT, "data", name, "nvn_map.txt")
+    target = os.path.join(data, "nvn_map.txt")
+    if sdk_map:
+        shutil.copyfile(sdk_map, target)
+    else:
+        if os.path.exists(target):
+            os.remove(target)
+        log("game code: this version's SDK is not the tested one: its graphics functions are mapped when the game first starts")
 
 
 def generate(tools, data, work):
@@ -154,7 +242,15 @@ def generate(tools, data, work):
     for name, _, _ in MODULES:
         for suffix in [".img", ".img.text-size"]:
             shutil.copyfile(os.path.join(data, name + suffix), os.path.join(meta, name + suffix))
-        shutil.copyfile(os.path.join(ROOT, "data", VERSION, name + ".overrides"), os.path.join(meta, name + ".overrides"))
+        # (the SDK functions the runtime implements itself, by name: where each is in this version's module)
+        have = exports(os.path.join(meta, name + ".img"))
+        with open(os.path.join(ROOT, "data", "names", name + ".names")) as f:
+            wanted = [l.strip() for l in f if l.strip()]
+        with open(os.path.join(meta, name + ".overrides"), "w") as f:
+            f.write("".join(sorted("%x %s\n" % (have[n], n) for n in wanted if n in have)))
+        absent = [n for n in wanted if n not in have]
+        if absent:
+            log("  %s: %d of the functions the runtime replaces are not in this version (%s%s)" % (name, len(absent), ", ".join(absent[:3]), ", ..." if len(absent) > 3 else ""))
         run([sys.executable, "-I", os.path.join(ROOT, "tools", "module_info.py"),
              os.path.join(meta, name + ".img"), os.path.join(meta, name + ".functions.txt")])
     run([sys.executable, "-I", os.path.join(ROOT, "tools", "setjmp_targets.py"), meta])
@@ -166,7 +262,11 @@ def generate(tools, data, work):
         cmd = [os.path.join(tools, "recomp" + EXE), os.path.join(meta, name + ".img"), base,
                os.path.join(meta, name + ".functions.txt"), out, name,
                "--overrides", os.path.join(meta, name + ".overrides"), "--files", count, "--text-size", text_size]
-        entries = os.path.join(ROOT, "data", VERSION, name + ".entries")  # (extra block starts: the hook sites of tools/oot_patches.py)
+        entries = os.path.join(meta, name + ".entries")  # (extra block starts: the hook sites of tools/oot_patches.py, where they are in this game)
+        if name == "main":
+            import oot_patches
+            with open(entries, "w") as f:
+                f.write(" ".join("%x" % a for a in oot_patches.block_starts(os.path.join(data, "addresses.txt"))) + "\n")
         if os.path.exists(entries):
             cmd += ["--entries", entries]
         setjmp = os.path.join(meta, name + ".setjmp")
@@ -175,13 +275,13 @@ def generate(tools, data, work):
         log(f"recompiling {name}")
         with open(os.path.join(work, name + ".recomp.log"), "w") as errors:
             run(cmd, stderr=errors)
-    run([sys.executable, "-P", os.path.join(ROOT, "tools", "oot_patches.py"), gen])
+    run([sys.executable, "-P", os.path.join(ROOT, "tools", "oot_patches.py"), gen, os.path.join(data, "addresses.txt")])
     shutil.rmtree(meta, ignore_errors=True)
     return gen
 
 
 def build_game_code(tools, data, work, jobs):
-    key = game_key()
+    key = game_key(data)
     lib_name = "libgame_code.a"
     cached = os.path.join(work, f"game_code-{key}.a")
     if os.path.exists(cached):
