@@ -10,13 +10,15 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer MeshTasks { 
 // destination bit 0: the source is NVN's mesh-task command {task count, first task} (the order of
 // VK_NV_mesh_shader's indirect command; the game's culling writes counts to the first word), written as
 // Vulkan's {count, 1, 1} (a nonzero first task, which Vulkan cannot express, draws nothing).
-layout(push_constant) uniform Parameters { uint64_t source; uint64_t destination; } p;
+layout(push_constant) uniform Parameters { uint64_t source; uint64_t destination; uint keep; } p;
+// keep (mesh tasks only): the share of the tasks drawn, in 1/256ths (256: all) - the Foliage Density setting
 void main() {
     uint x, y, z;
     if ((p.destination & 1ul) != 0ul) {
         MeshTasks s = MeshTasks(p.source);
         x = s.first == 0u ? s.count : 0u; y = 1u; z = 1u;
         if (x > 4194303u) x = 0u;
+        if (p.keep < 256u) x = (x * p.keep + 255u) / 256u;
     } else {
         Grid s = Grid(p.source);
         x = s.x; y = s.y; z = s.z;

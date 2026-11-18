@@ -2339,6 +2339,11 @@ VkDescriptorSet WriteBatchSet(Pipeline& pipeline,std::vector<VkWriteDescriptorSe
 // device buffer: dispatched from there, and copied to the compute driver bank's grid words.
 struct IndirectClamp{VkPipeline pipeline=VK_NULL_HANDLE;VkPipelineLayout layout=VK_NULL_HANDLE;VkBuffer buffer=VK_NULL_HANDLE;VkDeviceMemory memory=VK_NULL_HANDLE;
     VkDeviceAddress address=0;u32 next=0;static constexpr u32 Slots=4096;} indirect_clamp;
+// The Foliage Density setting: the share of the GPU-culled mesh draws' tasks (grass and small plants) drawn, in 1/256ths.
+u64 FoliageKeep(){
+    if(const char* e=std::getenv("OOT_FOLIAGE_DENSITY"))return (u64)std::clamp(std::atoi(e)*256/100,1,256);
+    return 256;
+}
 void InitializeIndirectClamp(){
     auto& vk=Vk();auto& c=indirect_clamp;if(c.pipeline)return;
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};bi.size=IndirectClamp::Slots*16;
@@ -2349,7 +2354,7 @@ void InitializeIndirectClamp(){
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ai.pNext=&flags;ai.allocationSize=req.size;ai.memoryTypeIndex=FindMemoryType(req.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     VK_CHECK(vkAllocateMemory(vk.device,&ai,nullptr,&c.memory));VK_CHECK(vkBindBufferMemory(vk.device,c.buffer,c.memory,0));
     VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};info.buffer=c.buffer;c.address=vkGetBufferDeviceAddress(vk.device,&info);
-    VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT,0,16};
+    VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT,0,24};
     VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};li.pushConstantRangeCount=1;li.pPushConstantRanges=&push;
     VK_CHECK(vkCreatePipelineLayout(vk.device,&li,nullptr,&c.layout));
     VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};mi.codeSize=sizeof indirect_clamp_spv;mi.pCode=indirect_clamp_spv;
@@ -3565,7 +3570,7 @@ void Dispatch(u32 gx,u32 gy,u32 gz,u64 indirect=0){
         u64 slot=0;
         if(indirect){
             auto& c=indirect_clamp;slot=u64(c.next++%IndirectClamp::Slots)*16;
-            const u64 push[2]{indirect_source,c.address+slot};
+            const u64 push[3]{indirect_source,c.address+slot,256};
             vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,c.pipeline);
             vkCmdPushConstants(cmd,c.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof push,push);
             vkCmdDispatch(cmd,1,1,1);
@@ -3835,7 +3840,7 @@ bool ExecuteRenderCommand(const Command& command) {
             VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
             barrier.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT|VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
             vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&barrier,0,nullptr,0,nullptr);
-            const u64 push[2]{source,(c.address+slot)|1};
+            const u64 push[3]{source,(c.address+slot)|1,FoliageKeep()};
             vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,c.pipeline);
             vkCmdPushConstants(cmd,c.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof push,push);
             vkCmdDispatch(cmd,1,1,1);
@@ -4570,7 +4575,7 @@ void ExecuteSegmentsParallel(const std::vector<ParallelSegment>& segments,const 
             vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&barrier,0,nullptr,0,nullptr);
             vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,c.pipeline);
             for(const u64 address:sources){
-                const u64 push[2]{GuestDeviceAddress(address),(c.address+mesh_preclamped[address])|1};
+                const u64 push[3]{GuestDeviceAddress(address),(c.address+mesh_preclamped[address])|1,FoliageKeep()};
                 vkCmdPushConstants(cmd,c.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof push,push);
                 vkCmdDispatch(cmd,1,1,1);}
             barrier.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
