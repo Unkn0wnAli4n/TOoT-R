@@ -389,8 +389,29 @@ static ssize_t GuestPread(int fd, void* buffer, u64 size, s64 offset) {
     return (ssize_t)done;
 }
 namespace nvn { extern std::atomic<s64> last_file_read_ns; } // (present.cpp: no frame cap while the game loads)
+const s64 process_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+struct LoadSpan { s64 first = 0, last = 0; u64 bytes = 0, reads = 0; s64 inside = 0; };
+std::mutex load_span_mutex; LoadSpan load_span;
+void FinishLoadSpan() { // (load_span_mutex held)
+    if (load_span.reads >= 20 && load_span.last > load_span.first)
+        RT_LOG("loading: %.2f s of reading from %.1f s after the start, %.1f MiB in %llu reads (%.2f s inside them, all threads)", (load_span.last - load_span.first) / 1e9, (load_span.first - process_start_ns) / 1e9, load_span.bytes / 1048576.0, (unsigned long long)load_span.reads, load_span.inside / 1e9);
+    load_span = {};
+}
+// (present.cpp, every frame: a stretch whose reads stopped a second ago is reported now)
+void LogLoadingStretch() {
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::lock_guard g{load_span_mutex};
+    if (load_span.reads && now - load_span.last > 1'000'000'000) FinishLoadSpan();
+}
 static u32 DoRead(u64 h, s64 offset, void* buffer, u64 size, u64* read) {
-    nvn::last_file_read_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
+    const s64 read_now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    nvn::last_file_read_ns.store(read_now, std::memory_order_relaxed);
+    {   // (loading stretches: from a read after a second without any to the last read before the next such gap - logged
+        // when the next stretch starts, and by LogLoadingStretch at the frame after the reads stop)
+        std::lock_guard g{load_span_mutex};
+        if (read_now - load_span.last > 1'000'000'000) { FinishLoadSpan(); load_span = {read_now, read_now, 0, 0}; }
+        load_span.last = read_now; load_span.bytes += size; ++load_span.reads;
+    }
     OpenFile* f = FindFile(h);
     if (!f) Fatal("nn::fs::ReadFile on an unknown handle");
     ssize_t n;
@@ -402,6 +423,8 @@ static u32 DoRead(u64 h, s64 offset, void* buffer, u64 size, u64* read) {
     } else {
         n = GuestPread(f->host_fd, buffer, size, offset);
     }
+    { const s64 done_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+      std::lock_guard g{load_span_mutex}; load_span.inside += done_ns - read_now; }
     if (n < 0) return 0x7802;
     if (read) *read = (u64)n;
     return 0;

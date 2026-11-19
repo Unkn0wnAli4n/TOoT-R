@@ -40,6 +40,7 @@ extern "C" volatile unsigned long long oot_dynres_context;
 
 std::atomic<int> profile_present_tid{0}; // (profiler.cpp: OOT_PROFILE_WALL=present)
 namespace cheats { void Tick(); } // (cheats.cpp)
+void LogLoadingStretch(); // (fs.cpp)
 namespace nvn {
 namespace {
 
@@ -336,6 +337,7 @@ static void InputEvent(const SDL_Event& e) {
 }
 
 void PresentPacing() {
+    ::LogLoadingStretch();
     // (game thread time per frame: its own work since the last call, and the waits in here)
     static auto left = std::chrono::steady_clock::now(); static double work_ms = 0, wait_ms = 0; static u32 calls = 0;
     const auto entered = std::chrono::steady_clock::now();

@@ -38,6 +38,11 @@ std::shared_mutex pools_mutex;
 std::map<u64, std::shared_ptr<Pool>> pools_by_address; // storage start -> pool
 u64 next_virtual_address = 0x3000000000ULL;
 bool table_dirty = true; // pools changed since the address table was written
+// (an entry changed or went, not only added: work already submitted may still read it, so the table is written only after
+// a flush. A pool that only came - imported at its first GPU use, or new - is nowhere in that work, and its entries are
+// written in place at once: a load adds hundreds, and each flush ran into the limit of batches in flight, a third of a
+// second of waits in one save load. OOT_TABLE_FLUSH_ALWAYS=1: a flush for every change, as before.)
+bool table_changed = true;
 std::atomic<u64> pool_generation{1}; // bumped with every pool/mapping change (LookupAddress cache)
 
 // Guest NVNmemoryPool objects hold the host pool pointer in their first word.
@@ -783,7 +788,7 @@ bool CreateDeviceCopy(Pool& p) {
         std::unique_lock lock{pools_mutex};
         p.device_memory = memory;
         p.device_buffer = buffer;
-        table_dirty = true; ++pool_generation;
+        table_dirty = true; table_changed = true; ++pool_generation;
     }
     mirrored_bytes += p.import_size;
     return true;
@@ -1008,7 +1013,14 @@ u64 GlobalAddressTable(bool update) {
     if (table_dirty) {
         // Previously recorded shaders still reference this table until their
         // batch completes. Do not replace their mappings while they are pending.
-        lock.unlock();Flush();lock.lock();
+        static const bool always = std::getenv("OOT_TABLE_FLUSH_ALWAYS") != nullptr;
+#ifdef OOT_SHADER_LONGSHOT
+        const bool flush = always || table_changed;
+#else
+        const bool flush = true; // (rewritten whole there)
+#endif
+        if (flush) { lock.unlock(); Flush(); lock.lock(); }
+        table_changed = false;
         { static const bool stats = std::getenv("OOT_TABLE_STATS") != nullptr; static u64 rebuilds = 0; // (diagnostic: each one flushes)
           if (stats && ++rebuilds % 64 == 0) RT_LOG("guest address table: %llu rebuilds", (unsigned long long)rebuilds); }
         u64 count = 0;
@@ -1161,7 +1173,7 @@ BufferRange LookupAddressUncached(u64 address, bool for_gpu) {
         lock.unlock();
         {
             std::unique_lock exclusive{pools_mutex};
-            if (!pool->buffer) { ImportPool(*pool); table_dirty = true; ++pool_generation; }
+            if (!pool->buffer) { ImportPool(*pool); table_dirty = true; ++pool_generation; } // (added: see table_changed)
         }
         return LookupAddressUncached(address, true);
     }
@@ -1228,7 +1240,7 @@ bool MapVirtual(Pool& pool, s32 count, const MappingRequest* requests) {
             pool.mappings[r.virtual_offset] = {r.size, r.physical_offset, pools_by_address.at(source->address)};
         }
     }
-    table_dirty = true; ++pool_generation;
+    table_dirty = true; table_changed = true; ++pool_generation;
     return true;
 }
 
@@ -1759,6 +1771,7 @@ NATIVE("nvnMemoryPoolInitialize") {
         retired = std::move(pools_by_address[p->address]);
         pools_by_address[p->address] = std::move(p);
         table_dirty = true; ++pool_generation;
+        if (retired) table_changed = true; // (a pool in place of another; a new one is only added)
     }
     if (retired && (retired->buffer || retired->host_import || retired->device_buffer)) Flush(); // (as in nvnMemoryPoolFinalize)
     Ret(c, 1);
@@ -1779,7 +1792,7 @@ NATIVE("nvnMemoryPoolFinalize") {
         if (it != pools_by_address.end()) {
             retired = std::move(it->second);
             pools_by_address.erase(it);
-            table_dirty = true; ++pool_generation;
+            table_dirty = true; table_changed = true; ++pool_generation;
         }
     }
     HostPool(c->x[0]) = nullptr;
