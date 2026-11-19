@@ -231,6 +231,45 @@ void NoteFrameForLoading() { // (the game's thread, once a frame)
     const bool is = now < held_until;
     if (is != loading.exchange(is)) { static int told = 0; if (told++ < 8) RT_LOG("frame cap: %s", is ? "off while the game loads" : "back after loading"); }
 }
+// Frame Generation at Dynamic with a frame cap: the cap is what is to be shown. Generated frames come in whole multiples,
+// so the game's own frames are held to cap / k and k - 1 frames made between each two, the least k with which the game
+// keeps up (its cost per frame, the time not spent waiting for the cap, decides; it changes after a while, not frame to
+// frame). Without a cap Dynamic fills up to the display's refresh rate, as before. dynamic_frames: k (0: not in use).
+std::atomic<int> dynamic_frames{0};
+double achievable_ms = 0, cap_slept_ms = 0; // (the game thread's)
+int DynamicTarget() { // (the rate to be shown, or 0)
+    const gfx::Settings& g = gfx::Current();
+    static const char* forced = std::getenv("OOT_FRAME_GEN");
+    if (forced || g.frame_gen != 7 || g.frame_cap <= 0) return 0;
+    int target = g.frame_cap;
+    if (const double hz = gfx::display_refresh.load(std::memory_order_relaxed); hz > 30 && target > hz * 1.04) target = (int)(hz + 0.5);
+    return target;
+}
+void UpdateDynamicFrames() {
+    const int target = DynamicTarget();
+    if (!target || achievable_ms <= 0) { dynamic_frames.store(0, std::memory_order_relaxed); return; }
+    static int k = 1, pending = 0, held = 0;
+    static int since_raise = 0, since_lower = 1 << 30, cooldown = 600; // (frames; see below)
+    ++since_raise; ++since_lower;
+    const double fps = 1000.0 / achievable_ms;
+    int need = std::clamp((int)std::ceil(target / (fps * 0.97)), 1, 6); // (3% to spare: a game just at the cap stutters)
+    // (fewer made frames only with 15% to spare: held lower, the game's frames cost less - the GPU has time over - and
+    // they flipped between 30 and 60 every few seconds)
+    if (need < k) need = std::max(need, std::clamp((int)std::ceil(target * 1.15 / (fps * 0.97)), 1, 6));
+    if (need == k) held = 0;
+    else { if (need != pending) { pending = need; held = 0; }
+        // (up soon; down only when it holds, and not within `cooldown` frames of going up - a drop that has to be undone
+        // within 300 frames doubles it: held lower, a frame costs the game less, and it flipped back and forth)
+        const bool down = need < k;
+        if (down && since_raise < cooldown) held = 0;
+        if (++held >= (down ? 120 : 30)) {
+            if (!down) { if (since_lower < 300) cooldown = std::min(cooldown * 2, 1 << 16); since_raise = 0; }
+            else since_lower = 0;
+            k = need; held = 0; static int told = 0;
+            if (told++ < 20) RT_LOG("frame generation: Dynamic shows %d: the game's frames held to %d, %d made for each", target, target / k, k - 1); } }
+    dynamic_frames.store(k, std::memory_order_relaxed);
+}
+int DynamicFrames() { return DynamicTarget() ? dynamic_frames.load(std::memory_order_relaxed) : 0; }
 int EffectiveFrameCap() {
     static const bool uncapped = std::getenv("OOT_UNCAPPED") != nullptr;
     if (loading.load(std::memory_order_relaxed)) return 0;
@@ -241,6 +280,7 @@ int EffectiveFrameCap() {
         const int cap = gfx::Current().frame_cap; return cap && cap < 60 ? cap : 60; }
     if (uncapped) return 0;
     int cap = gfx::Current().frame_cap;
+    if (const int k = DynamicFrames(); k > 1) cap = std::max(1, DynamicTarget() / k); // (Dynamic: see dynamic_frames)
     // (with generated frames a cap is on the game's own frames - 30 shows as 60 - but menus and movies have no 3D scene
     // to make frames from and were shown at the bare cap: a title movie at 30. They get 60. OOT_CAP_MOVIES=1: the cap.)
     {static const bool keep = std::getenv("OOT_CAP_MOVIES") != nullptr;
@@ -371,6 +411,7 @@ void PresentPacing() {
         if (cap) {
             const auto period = std::chrono::nanoseconds(1000000000LL / cap);
             auto now = std::chrono::steady_clock::now();
+            cap_slept_ms = next > now ? std::chrono::duration<double, std::milli>(next - now).count() : 0.0;
             if (next > now) {
                 // (precise: sleep to just short of the time, then spin; a plain sleep overshoots by a scheduler tick)
                 const auto spin = std::chrono::microseconds(1200);
@@ -389,6 +430,12 @@ void PresentPacing() {
         const auto now = std::chrono::steady_clock::now();
         const float ms = std::chrono::duration<float, std::milli>(now - last).count(); last = now;
         if (ms < 1000) intervals.push_back(ms);
+        if (ms < 250 && !loading.load(std::memory_order_relaxed)) { // (Dynamic: what a frame costs the game, without the cap's wait)
+            const double cost = std::max(1.0, ms - cap_slept_ms);
+            achievable_ms = achievable_ms > 0 ? achievable_ms + (cost - achievable_ms) * 0.05 : cost;
+        }
+        cap_slept_ms = 0;
+        UpdateDynamicFrames();
         if (intervals.size() >= 600) {
             std::vector<float> v = intervals; std::sort(v.begin(), v.end());
             const size_t over20 = v.end() - std::upper_bound(v.begin(), v.end(), 20.0f), over33 = v.end() - std::upper_bound(v.begin(), v.end(), 33.4f);

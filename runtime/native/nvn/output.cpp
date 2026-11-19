@@ -10,6 +10,7 @@
 #include "hdr_pq_spv.h"
 #include "longshot_upscale.h"
 
+namespace nvn { int DynamicFrames(); } // (present.cpp: Frame Generation at Dynamic with a frame cap)
 namespace nvn::output {
 namespace {
 struct Image { VkImage image = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; VkExtent2D extent{}; VkFormat format = VK_FORMAT_UNDEFINED; };
@@ -170,6 +171,7 @@ int Multiplier(double game_fps) {
     static const char* forced = std::getenv("OOT_FRAME_GEN"); // (a multiplier, for tests)
     const int choice = forced ? std::atoi(forced) : gfx::Current().frame_gen;
     if (choice <= 1) return 1;
+    if (const int k = nvn::DynamicFrames(); k > 0 && !forced) return k; // (Dynamic with a frame cap: present.cpp)
     // Never more than the display shows: frames made past its refresh rate are only work (and where the display paces
     // the presents, a brake). Dynamic is just that limit, six at most.
     const double hz = gfx::display_refresh.load(std::memory_order_relaxed) > 30 ? gfx::display_refresh.load(std::memory_order_relaxed) : 0.0;
