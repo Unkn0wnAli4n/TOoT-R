@@ -385,6 +385,21 @@ void CreateDevice(VulkanContext& vk) {
     info.enabledExtensionCount = (u32)extensions.size();
     info.ppEnabledExtensionNames = extensions.data();
     VK_CHECK(vkCreateDevice(vk.physical, &info, nullptr, &vk.device));
+    // OOT_TEST_VRAM_HOG_MB=<n> (test): that much of the card's own memory taken at once and kept, in 256 MiB blocks, so a
+    // large card runs as a small one does (a 12 GB card with 8500 behaves like a 4 GB laptop's: its allocations fail).
+    if (const char* e = std::getenv("OOT_TEST_VRAM_HOG_MB")) {
+        u64 want = std::strtoull(e, nullptr, 10) << 20, got = 0;
+        u32 type = ~0u;
+        for (u32 i = 0; i < vk.memory_properties.memoryTypeCount; ++i)
+            if (vk.memory_properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) { type = i; break; }
+        while (type != ~0u && got < want) {
+            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize = std::min<u64>(256ull << 20, want - got); ai.memoryTypeIndex = type;
+            VkDeviceMemory hog; if (vkAllocateMemory(vk.device, &ai, nullptr, &hog) != VK_SUCCESS) break;
+            got += ai.allocationSize;
+        }
+        RT_LOG("test: %llu MiB of video memory taken and kept", (unsigned long long)(got >> 20));
+        test_vram_hog_bytes = got;
+    }
     if(checkpoints)vk.checkpoint=reinterpret_cast<PFN_vkCmdSetCheckpointNV>(vkGetDeviceProcAddr(vk.device,"vkCmdSetCheckpointNV"));
     vkGetDeviceQueue(vk.device, vk.queue_family, 0, &vk.queue);
     if (queue.queueCount >= 2) vkGetDeviceQueue(vk.device, vk.queue_family, 1, &vk.copy_queue);
@@ -517,6 +532,7 @@ VulkanContext& Vk() {
     return vk;
 }
 
+u64 test_vram_hog_bytes = 0; // (OOT_TEST_VRAM_HOG_MB: left out of what video memory figures report)
 u32 FindMemoryType(u32 type_bits, VkMemoryPropertyFlags flags) {
     const auto& mp = Vk().memory_properties;
     for (u32 i = 0; i < mp.memoryTypeCount; ++i)

@@ -65,6 +65,7 @@ inline bool WindowOriginLowerLeft() { return !device_object || *reinterpret_cast
         if (vk_check_result != VK_SUCCESS) ::rt::Fatal("%s failed: %d", #expr, vk_check_result); \
     } while (0)
 
+extern u64 test_vram_hog_bytes;
 u32 FindMemoryType(u32 type_bits, VkMemoryPropertyFlags flags);
 // Windows: the window's messages are taken by a thread of its own (vk.cpp); the others only read SDL's queue.
 inline std::atomic<bool> window_pumped{false};

@@ -44,7 +44,7 @@ bool VideoMemoryTight(u64* used_out=nullptr,u64* budget_out=nullptr){
         VkPhysicalDeviceMemoryProperties2 mp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};mp.pNext=&b;
         vkGetPhysicalDeviceMemoryProperties2(vk.physical,&mp);
         u32 heap=0;u64 size=0;for(u32 h=0;h<mp.memoryProperties.memoryHeapCount;++h)if((mp.memoryProperties.memoryHeaps[h].flags&VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)&&mp.memoryProperties.memoryHeaps[h].size>size){size=mp.memoryProperties.memoryHeaps[h].size;heap=h;}
-        used.store(b.heapUsage[heap],std::memory_order_relaxed);budget.store(b.heapBudget[heap],std::memory_order_relaxed);}
+        used.store(b.heapUsage[heap]-std::min<u64>(b.heapUsage[heap],test_vram_hog_bytes),std::memory_order_relaxed);budget.store(b.heapBudget[heap]-std::min<u64>(b.heapBudget[heap],test_vram_hog_bytes),std::memory_order_relaxed);}
     static const u64 percent=std::getenv("OOT_VRAM_TIGHT_PERCENT")?std::strtoull(std::getenv("OOT_VRAM_TIGHT_PERCENT"),nullptr,10):85;
     const u64 u=used.load(std::memory_order_relaxed),b=budget.load(std::memory_order_relaxed);
     if(used_out)*used_out=u;if(budget_out)*budget_out=b;
@@ -194,6 +194,18 @@ bool TakeFrom(ImageBlock& b, const VkMemoryRequirements& req, u64* offset) {
 // (32 thousand of them in one long session on a 4 GB card). OOT_FULL_COOLDOWN_MS=0: ask every time, as before.
 std::atomic<s64> device_full_until_ms{0};
 s64 NowMs() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+// Cards with less than 6 GB of their own, short of memory (measured with OOT_TEST_VRAM_HOG_MB=8200 on a 12 GB card, Castle
+// Town, 3D at 50%, DLSS: 19 fps before, 27-30 with both):
+//  - the spare render targets are kept: released, the game's per-frame targets were made again every frame, their
+//    allocations failed (thousands a minute, all render targets) and they landed in memory shared with the system, where
+//    drawing into them is slow; the renderer's time per frame halved with them kept;
+//  - new textures go to the shared memory from then on, so the card's own stays for render targets.
+// On larger cards both stay as they were (releasing the spares there ended 100 ms stalls with High Quality textures).
+// OOT_TIGHT_KEEP_SPARES / OOT_TIGHT_TEXTURES_SHARED = 1 or 0: on or off on any card.
+bool SmallCard();
+bool TightSwitch(const char* name){const char* e=std::getenv(name);return e?e[0]!='0':SmallCard();}
+bool KeepSparesWhenTight(){static const bool on=TightSwitch("OOT_TIGHT_KEEP_SPARES");return on;}
+bool TexturesSharedWhenTight(){static const bool on=TightSwitch("OOT_TIGHT_TEXTURES_SHARED");return on;}
 bool DeviceFullLately() {
     static const bool test = std::getenv("OOT_TEST_DEVICE_FULL") != nullptr; // (every image as if the card were full)
     return test || NowMs() < device_full_until_ms.load(std::memory_order_relaxed);
@@ -203,6 +215,7 @@ void NoteDeviceFull() {
     device_full_until_ms.store(NowMs() + cooldown, std::memory_order_relaxed);
 }
 std::atomic<u64> images_in_shared_memory{0};
+std::atomic<u64> alloc_failures[2]; // (since the last report: sampled textures, render targets)
 bool SubAllocate(const VkMemoryRequirements& req, u32 type, Texture& t, bool may_allocate = true) {
     static const bool off = std::getenv("OOT_DEDICATED_IMAGES") != nullptr;
     if (off || req.size > BlockMax || !(req.memoryTypeBits >> type & 1)) return false;
@@ -604,7 +617,7 @@ void RelieveVideoMemory() {
     // behind the driver's frees; this runs again every half second while memory stays tight)
     TrimImageCache(std::max<u64>(256ull << 20, image_cached_bytes.load() > (160ull << 20) ? image_cached_bytes.load() - (160ull << 20) : 0), false);
     const double trim_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - relief_t0).count();
-    DropSpareImages(8, 128ull << 20);
+    if(!KeepSparesWhenTight())DropSpareImages(8, 128ull << 20);
     {const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - relief_t0).count(); static u32 shown = 0;
      if (ms > 5 && shown++ < 20) RT_LOG("video memory relief took %.1f ms (cache trim %.1f ms)", ms, trim_ms);}
     static u32 told = 0; if (told++ < 6) { u64 used = 0, budget = 0; VideoMemoryTight(&used, &budget); RT_LOG("video memory tight (%llu of %llu MiB): spare and cached images released", (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20)); }
@@ -616,7 +629,6 @@ std::atomic<u64> images_reduced{0};
 //    Texture Detail is High or Ultra;
 //  - after an image allocation failed: one, whatever the setting.
 // OOT_TEXTURE_SKIP=<n>: n levels always (0: never).
-bool SmallCard(); // (below: a card with under 6 GiB of its own)
 u32 MipSkipWanted() {
     static const int forced = std::getenv("OOT_TEXTURE_SKIP") ? std::atoi(std::getenv("OOT_TEXTURE_SKIP")) : -1;
     if (forced >= 0) return (u32)forced;
@@ -631,6 +643,7 @@ bool SmallCard() {
     static const bool small_card = [] {
         auto& vk = Vk(); VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(vk.physical, &p);
         u64 local = 0; for (u32 h = 0; h < vk.memory_properties.memoryHeapCount; ++h) if (vk.memory_properties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) local = std::max<u64>(local, vk.memory_properties.memoryHeaps[h].size);
+        local -= std::min(local, test_vram_hog_bytes); // (OOT_TEST_VRAM_HOG_MB: as the smaller card it stands for)
         const bool small = p.deviceType != VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && local < (6ull << 30);
         if (small) RT_LOG("textures: a card with %llu MiB of video memory: big textures are loaded without their largest level (Texture Detail High or Ultra keeps it)", (unsigned long long)(local >> 20));
         return small; }();
@@ -747,7 +760,7 @@ void CreateImage(Texture& t) {
     // (only images that cannot be render targets: a target placed in the shared memory came out black on NVIDIA's
     // Linux driver - the whole picture, with OOT_TEST_DEVICE_FULL covering them - so those ask the card every time;
     // sampled textures there look and run the same. Room in a block the card already gave is still taken.)
-    const bool full_lately=DeviceFullLately()&&!(ii.usage&(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT));
+    const bool full_lately=(DeviceFullLately()||(TexturesSharedWhenTight()&&VideoMemoryTight()))&&!(ii.usage&(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT));
     if(!(ii.usage&(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))&&SubAllocate(req,ai.memoryTypeIndex,t,!full_lately)){
         t.allocation_size=req.size;image_live_bytes+=req.size;if(t.decoded_astc)image_astc_bytes+=req.size;NoteLive(t,1);
         VK_CHECK(vkBindImageMemory(vk.device,t.image,t.memory,t.memory_offset));
@@ -776,15 +789,16 @@ void CreateImage(Texture& t) {
         // Out of device memory: release every cached image (destroyed after the GPU is done with
         // them), then retry; as a last resort use any memory type the image allows (slower).
         memory_pressure.store(true,std::memory_order_relaxed);
-        RT_LOG("texture allocation failed (%llu MiB requested; live %llu MiB, cached %llu MiB): releasing cached images",
-            (unsigned long long)(req.size>>20),(unsigned long long)(image_live_bytes.load()>>20),(unsigned long long)(image_cached_bytes.load()>>20));
+        {static std::atomic<u32> told{0};if(told++<40)RT_LOG("texture allocation failed (%llu MiB requested, %ux%u fmt %u%s; live %llu MiB, cached %llu MiB): releasing cached images",
+            (unsigned long long)(req.size>>20),t.width,t.height,t.format,attachment?" target":"",(unsigned long long)(image_live_bytes.load()>>20),(unsigned long long)(image_cached_bytes.load()>>20));}
+        alloc_failures[attachment?1:0].fetch_add(1,std::memory_order_relaxed);
         // (No Flush here: CreateImage runs inside Immediate recordings (Transition -> EnsureImage), and
         // submitting the command buffer being recorded crashed the driver. Released images free
         // after the current batch; until then this allocation falls back to other memory.)
         // (the small images the GPU drew once go last: evicted, terrain tiles' maps and HUD labels came back from guest
         // memory as some other texture - the wrong ground texture and stray HUD pieces after a while in Castle Town)
         TrimImageCache(0,false);
-        DropSpareImages();
+        if(!KeepSparesWhenTight())DropSpareImages();
         allocated=vkAllocateMemory(vk.device,&ai,nullptr,&t.memory);
         // (not the small images the GPU drew once as a last resort any more: they are not in the game's memory, and evicted they
         // came back as other textures - a 4 GB card's map covered with flying HUD pieces for seconds. Memory shared with the
@@ -1142,8 +1156,8 @@ void ReportImageCache() {
            (unsigned long long)images_released.exchange(0), (unsigned long long)image_cache_evicted.exchange(0),
            image_cache.size(), image_cached_bytes / 1048576.0, image_live_bytes / 1048576.0, image_astc_bytes / 1048576.0);
     AgeSpareImages();
-    if (const u64 reduced = images_reduced.exchange(0), shared = images_in_shared_memory.exchange(0); reduced || shared)
-        RT_LOG("textures: %llu loaded without their largest level, %llu placed in memory shared with the system (the card's own was full)", (unsigned long long)reduced, (unsigned long long)shared);
+    if (const u64 reduced = images_reduced.exchange(0), shared = images_in_shared_memory.exchange(0); reduced || shared || alloc_failures[0] || alloc_failures[1])
+        RT_LOG("textures: %llu loaded without their largest level, %llu placed in memory shared with the system (the card's own was full); failed allocations: %llu textures, %llu render targets", (unsigned long long)reduced, (unsigned long long)shared, (unsigned long long)alloc_failures[0].exchange(0), (unsigned long long)alloc_failures[1].exchange(0));
     // (a full card: what holds the memory, largest first, at most once a minute and six times - a log sent with a report
     // then says where the video memory went)
     {u64 used=0,budget=0;VideoMemoryTight(&used,&budget);static u64 last_frame=0;static u32 told=0;
@@ -1155,7 +1169,7 @@ void ReportImageCache() {
         for(size_t i=0;i<top.size()&&i<24;++i)RT_LOG("  held %ux%u fmt %u%s%s: %lld images, %.0f MiB",std::get<2>(top[i]),std::get<3>(top[i]),std::get<4>(top[i]),std::get<5>(top[i])?" target-capable":"",std::get<6>(top[i])?" astc":"",(long long)std::get<1>(top[i]),std::get<0>(top[i])/1048576.0);}}
     {u64 used=0,budget=0;const bool tight=VideoMemoryTight(&used,&budget);
      // (short of video memory: what is only kept for speed goes before an allocation fails and the picture stalls)
-     if(tight){DropSpareImages(8, 128ull << 20);static u32 told=0;if(told++<8)RT_LOG("video memory tight: %llu of %llu MiB the system allows in use; spare render targets released",(unsigned long long)(used>>20),(unsigned long long)(budget>>20));}
+     if(tight){if(!KeepSparesWhenTight())DropSpareImages(8, 128ull << 20);static u32 told=0;if(told++<8)RT_LOG("video memory tight: %llu of %llu MiB the system allows in use; spare render targets released",(unsigned long long)(used>>20),(unsigned long long)(budget>>20));}
      if(budget)RT_LOG("video memory: %llu MiB in use of %llu MiB allowed",(unsigned long long)(used>>20),(unsigned long long)(budget>>20));}
     RT_LOG("render target memory: %.1f per frame from spares, %.0f MiB spare", stat_memory_reused.exchange(0) / 300.0, spare_memory_bytes / 1048576.0);
     RT_LOG("images per frame: %.1f created (%.1f render targets), %.1f from spares; spares: %.1f kept, %.1f dropped over the budget, %.1f not kept; %.0f MiB spare",

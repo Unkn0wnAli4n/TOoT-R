@@ -748,6 +748,7 @@ bool CreateDeviceCopy(Pool& p) {
         if (const char* e = std::getenv("OOT_POOL_COPY_MB")) return std::strtoull(e, nullptr, 10) << 20;
         auto& vk = Vk(); u64 local = 0;
         for (u32 h = 0; h < vk.memory_properties.memoryHeapCount; ++h) if (vk.memory_properties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) local = std::max<u64>(local, vk.memory_properties.memoryHeaps[h].size);
+        local -= std::min(local, test_vram_hog_bytes); // (OOT_TEST_VRAM_HOG_MB: as the smaller card it stands for)
         const u64 budget = std::min<u64>(3ull << 30, local / 6);
         RT_LOG("memory pools: up to %llu MiB of device copies (video memory %llu MiB)", (unsigned long long)(budget >> 20), (unsigned long long)(local >> 20));
         return budget; }();
