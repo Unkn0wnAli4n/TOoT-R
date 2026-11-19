@@ -44,6 +44,7 @@ struct Config {
     int gyro_invert_x = 0, gyro_invert_y = 0;
     int mouse_menus = 1;     // 1: over the game's own menus the mouse is a pointer (hover, click, right-click back, wheel)
     int no_centering = 0;    // 1: the camera does not turn back behind Link by itself as he walks
+    int icons = 0;           // the game's A B X Y icons: 0 by the controller at the start, 1 Nintendo, 2 Xbox, 3 PlayStation (button_icons.cpp; read when the game opens its icon font)
 };
 
 const Config& Current();

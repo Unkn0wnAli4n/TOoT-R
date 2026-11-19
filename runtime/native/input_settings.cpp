@@ -37,7 +37,7 @@ constexpr Field fields[] = {
     {"invert_x", &Config::invert_x, 0, 1}, {"invert_y", &Config::invert_y, 0, 1},
     {"deadzone", &Config::deadzone, 0, 40}, {"rumble", &Config::rumble, 0, 150}, {"layout", &Config::layout, 0, 2},
     {"walk_toggle", &Config::walk_toggle, 0, 1}, {"walk_speed", &Config::walk_speed, 15, 90},
-    {"background", &Config::background, 0, 1}, {"menu_chord", &Config::menu_chord, 0, 1}, {"no_centering", &Config::no_centering, 0, 1}, {"mouse_menus", &Config::mouse_menus, 0, 1},
+    {"background", &Config::background, 0, 1}, {"menu_chord", &Config::menu_chord, 0, 1}, {"no_centering", &Config::no_centering, 0, 1}, {"button_icons", &Config::icons, 0, 3}, {"mouse_menus", &Config::mouse_menus, 0, 1},
     {"gyro", &Config::gyro, 0, 3}, {"gyro_sens", &Config::gyro_sens, 10, 400}, {"gyro_invert_x", &Config::gyro_invert_x, 0, 1}, {"gyro_invert_y", &Config::gyro_invert_y, 0, 1},
 };
 

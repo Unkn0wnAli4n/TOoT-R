@@ -276,6 +276,8 @@ const std::vector<InputRow>& PadRows() {
     static const std::vector<InputRow> rows = {
         {"Button Layout", &C::layout, {{"Nintendo (A on the right)", 0}, {"Xbox (A at the bottom)", 1}, {"Custom", 2}},
          "Where the game's A, B, X and Y are on your controller. Nintendo puts them where the console's pad has them; Xbox follows the letters printed on an Xbox pad. Binding a face button yourself makes it Custom."},
+        {"Button Icons", &C::icons, {{"Automatic", 0}, {"Nintendo", 1}, {"Xbox", 2}, {"PlayStation", 3}},
+         "The A, B, X and Y icons the game shows, drawn for your controller and the Button Layout. Automatic goes by the controller connected when the game starts. Takes effect the next time the game starts."},
         {"Stick Dead Zone", &C::deadzone, Percents({0, 5, 10, 15, 20, 25, 30, 40}), "How far a stick moves before it counts. Raise it if the camera or Link drifts with the stick at rest."},
         {"Invert Camera X", &C::invert_x, {{"Off", 0}, {"On", 1}}, "Turns the camera stick's left and right around (the camera keys too)."},
         {"Invert Camera Y", &C::invert_y, {{"Off", 0}, {"On", 1}}, "Turns the camera stick's up and down around (the camera keys too)."},

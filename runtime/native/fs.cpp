@@ -314,6 +314,8 @@ NATIVE("_ZN2nn2fs25GetCurrentThreadFsContextEv") {
 NATIVE("_ZN2nn2fs25SetCurrentThreadFsContextEPKNS0_9FsContextE") {}
 
 // ---- files ---------------------------------------------------------------------------------------
+bool ReadRomFile(const std::string& path, std::vector<unsigned char>& out);
+bool ButtonIconFont(const std::string& path, std::vector<unsigned char>& out);
 NATIVE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci") {
     static const bool trace = std::getenv("OOT_FS_TRACE") != nullptr;
     if (trace) RT_LOG("fs open %s", Ptr<const char>(c, 1));
@@ -334,9 +336,21 @@ NATIVE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci") {
             f.host_fd = ::open(e->host.c_str(), O_RDONLY | O_CLOEXEC);
             if (f.host_fd < 0) return Ret(c, ResultPathNotFound);
         }
+        {static const char* dump=std::getenv("OOT_FS_DUMP"); // (development: copies of the game's files whose path holds OOT_FS_DUMP_MATCH)
+         static const char* match=std::getenv("OOT_FS_DUMP_MATCH");
+         if(dump&&match&&path.find(match)!=std::string::npos){std::vector<unsigned char> bytes;
+            if(ReadRomFile(path,bytes)){std::string name=path;for(char& ch:name)if(ch=='/')ch='_';
+                if(FILE* out=std::fopen((std::string(dump)+"/"+name).c_str(),"wb")){std::fwrite(bytes.data(),1,bytes.size(),out);std::fclose(out);}}}}
         f.rom_offset = e->offset;
         f.rom_size = e->size;
         if (e->codec == 1) f.rom_data = Rom().Contents(*e);
+        if (e->host.empty()) { // (the icon font: its A, B, X and Y drawn for the player's controller - button_icons.cpp)
+            static std::mutex icons_mutex; static std::map<std::string, std::shared_ptr<const std::vector<u8>>> icons;
+            std::lock_guard icons_lock{icons_mutex};
+            auto it = icons.find(path);
+            if (it == icons.end()) { std::vector<u8> changed; it = icons.emplace(path, ButtonIconFont(path, changed) ? std::make_shared<const std::vector<u8>>(std::move(changed)) : nullptr).first; }
+            if (it->second) { f.rom_data = it->second; f.rom_size = it->second->size(); }
+        }
     } else {
         const int flags = (mode & 2) ? O_RDWR : O_RDONLY;
         f.host_fd = ::open(HostPath(m, path).string().c_str(), flags | O_CLOEXEC);

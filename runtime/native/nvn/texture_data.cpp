@@ -735,6 +735,15 @@ void UploadTexelsNow(Texture& t) {
                             output+(u64)r0*t.info.block_h*m.width*4);});}
             }
             upload_decode_ns+=(u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-_t_dc).count();
+            {static const char* dump=std::getenv("OOT_DUMP_TEXTURES"); // (development: decoded ASTC and plain RGBA8 textures, level 0, as raw RGBA files named by the hash of the game's bytes)
+             if(dump&&level==0&&layer==0&&m.depth==1&&!t.decoded_astc&&t.info.vk>=VK_FORMAT_BC1_RGB_UNORM_BLOCK&&t.info.vk<=VK_FORMAT_BC7_SRGB_BLOCK){
+                u64 h=0xcbf29ce484222325ull;for(u8 b:storage)h=(h^b)*0x100000001b3ull; // (BC blocks in rows, as they are uploaded)
+                char path[512];std::snprintf(path,sizeof path,"%s/%016llx-%ux%u-f%u.vk%d",dump,(unsigned long long)h,m.width,m.height,t.format,(int)t.info.vk);
+                if(FILE* f=std::fopen(path,"wb")){std::fwrite(base,1,(size_t)row_bytes*height,f);std::fclose(f);}}
+             if(dump&&level==0&&layer==0&&m.depth==1&&m.width<=4096&&m.height<=4096&&(t.decoded_astc||t.info.vk==VK_FORMAT_R8G8B8A8_UNORM||t.info.vk==VK_FORMAT_R8G8B8A8_SRGB)){
+                const u8* px=t.decoded_astc?output:base;u64 h=0xcbf29ce484222325ull;for(u8 b:storage)h=(h^b)*0x100000001b3ull;
+                char path[512];std::snprintf(path,sizeof path,"%s/%016llx-%ux%u-f%u.rgba",dump,(unsigned long long)h,m.width,m.height,t.format);
+                if(FILE* f=std::fopen(path,"wb")){std::fwrite(px,1,(size_t)m.width*m.height*4,f);std::fclose(f);}}}
             if(encode)EncodeBc3(picture.data(),m.width,m.height,staged);
             if(t.decoded_rgb9e5)DecodeRgb9e5(compressed.data(),compressed.size()/4,reinterpret_cast<u16*>(output));
         }
