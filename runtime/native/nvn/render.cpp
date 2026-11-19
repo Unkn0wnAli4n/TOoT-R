@@ -4484,6 +4484,7 @@ bool ParallelDrawsUsable(){
     static const bool diagnostics=std::getenv("OOT_PASS_HAZARDS")||std::getenv("OOT_GPU_TRACE")||std::getenv("OOT_DRAW_CPU_PROFILE")||std::getenv("OOT_COUNTER_CHECK")||std::getenv("OOT_SKIP_SHADER")||std::getenv("OOT_OLD_PIPELINE")||std::getenv("OOT_SYNC_PIPELINES");
     return ParallelResolveThreads()&&!diagnostics&&!FrameSkipOn()&&!LogThisFrame()&&!GpuProfilingNow()&&(gpu_counters.ready||!samples.enabled)&&ring.buffer&&(TextureWatchUsable()||unwatched);
 }
+void SetCommittingGroup(bool on); // (texture.cpp)
 void ExecuteSegmentsParallel(const std::vector<ParallelSegment>& segments,const std::vector<u64>& report_addresses){
     // OOT_PARALLEL_TIMES=1 (diagnostic): where a group's time goes on the executor.
     static const bool times=std::getenv("OOT_PARALLEL_TIMES")!=nullptr;
@@ -4606,6 +4607,8 @@ void ExecuteSegmentsParallel(const std::vector<ParallelSegment>& segments,const 
         return true;
     };
     bool bailed=false;
+    // (textures released while these draws are committed are destroyed after: their writes were made before - texture.cpp)
+    struct CommittingGroup{CommittingGroup(){SetCommittingGroup(true);}~CommittingGroup(){SetCommittingGroup(false);}} committing_group_scope;
     for(;k<segments.size();++k){
         auto& out=*pool.outputs[k];
         const bool kept=CommitSegment(out,*segments[k].list,segments[k].end,resolutions_hold);

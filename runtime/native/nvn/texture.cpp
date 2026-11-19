@@ -884,9 +884,30 @@ struct CachedImage {
 };
 std::map<ImageKey,CachedImage> image_cache;
 
+// While the executor commits a group of draws resolved on the helper threads, textures whose batch completed are not
+// destroyed yet but after the group: those draws' descriptor writes were made before, and one naming a texture's view
+// destroyed meanwhile crashed NVIDIA's Windows driver in vkUpdateDescriptorSets (a player's RTX 5060 Ti, access
+// violation at 0x1c8 from ExecuteSegmentsParallel; a fast GPU finishes a batch while the group is still committed).
+std::atomic<bool> committing_group{false};
+std::vector<Texture*> destroy_held; // (batch lock)
+void DestroyNow(Texture* t);
+void CommittingGroupImpl(bool on) {
+    static const bool off = std::getenv("OOT_NO_GROUP_HOLD") != nullptr; // (tests: textures destroyed at once, as before)
+    if (on) { if (!off) committing_group.store(true, std::memory_order_relaxed); return; }
+    std::lock_guard lock{BatchMutex()};
+    committing_group.store(false, std::memory_order_relaxed);
+    std::vector<Texture*> held; held.swap(destroy_held);
+    for (Texture* t : held) DestroyNow(t);
+}
 void DestroyLater(Texture* t) {
     ForgetImageHolder(t); // (on its way out: no other object takes its image now)
     AfterFlush([t] {
+        if (committing_group.load(std::memory_order_relaxed)) { destroy_held.push_back(t); return; } // (see above)
+        DestroyNow(t);
+    });
+}
+void DestroyNow(Texture* t) {
+    {
         // (the upscalers' view of it ends here, when the texture really goes: the game ends its render targets a frame
         // ahead of the work that still draws into them, and told at that moment the temporal chain took the scene's depth
         // for gone in the middle of its frame - it skipped that frame's upscale, which the game's own then drew: the
@@ -911,7 +932,7 @@ void DestroyLater(Texture* t) {
             if (image) vkDestroyImage(vk.device, image, nullptr);
             if (free_memory) vkFreeMemory(vk.device, free_memory, nullptr); });
         delete t;
-    });
+    }
 }
 } // namespace
 
@@ -1306,3 +1327,5 @@ namespace nvn { void VideoMemoryNow(u64* used, u64* budget) { VideoMemoryTight(u
 // (texture_data.cpp's uploads ahead: under 72% of what the system allows in use - well clear of the 85% from which
 // spares and caches are let go; without the budget extension: never)
 namespace nvn { bool VideoMemoryRoomy() { u64 used = 0, budget = 0; VideoMemoryTight(&used, &budget); static const u64 percent = std::getenv("OOT_PREUPLOAD_VRAM_PERCENT") ? std::strtoull(std::getenv("OOT_PREUPLOAD_VRAM_PERCENT"), nullptr, 10) : 72; return budget && used < budget / 100 * percent; } }
+
+namespace nvn { void SetCommittingGroup(bool on) { CommittingGroupImpl(on); } } // (render.cpp ExecuteSegmentsParallel)
