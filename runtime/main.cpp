@@ -1,3 +1,4 @@
+#include "platform.h"
 #include "logfile.h"
 #ifdef __linux__
 #include "native/graphics_settings.h"
@@ -71,6 +72,9 @@ namespace rt { void StartProfiler(); }
 using rt::StartProfiler;
 int main(int argc, char** argv) {
     rt::OpenLogFile(); // (<data>/logs/tootr.log, the three runs before it kept)
+#ifdef _WIN32
+    rt::SetThreadName("tootr"); // (the game's main thread runs here: OOT_PROFILE_WALL=tootr finds it by this name, as on Linux)
+#endif
 #ifdef __linux__
     // Steam's Game Mode sets RADV_FORCE_VRS_CONFIG_FILE (its Half Rate Shading switch) for everything it starts, and
     // while that file exists RADV keys every graphics pipeline differently: neither this game's pipeline cache nor the
