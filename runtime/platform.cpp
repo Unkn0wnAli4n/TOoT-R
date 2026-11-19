@@ -295,3 +295,22 @@ void SleepNs(long long ns) { if (ns > 0) std::this_thread::sleep_for(std::chrono
 void SleepUntilNs(long long at) { std::this_thread::sleep_until(std::chrono::steady_clock::time_point(std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::nanoseconds(at)))); }
 } // namespace rt
 #endif
+
+namespace rt {
+std::string SystemMemoryNote() { // (the loading lines: a load that runs out of memory has the system writing to its page file)
+    double total = 0, available = 0;
+#ifdef _WIN32
+    MEMORYSTATUSEX m{}; m.dwLength = sizeof m;
+    if (GlobalMemoryStatusEx(&m)) { total = (double)m.ullTotalPhys; available = (double)m.ullAvailPhys; }
+#else
+    if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+        char key[64]; unsigned long long kib;
+        while (std::fscanf(f, "%63s %llu kB\n", key, &kib) == 2) { if (!std::strcmp(key, "MemTotal:")) total = kib * 1024.0; else if (!std::strcmp(key, "MemAvailable:")) available = kib * 1024.0; }
+        std::fclose(f);
+    }
+#endif
+    char note[96];
+    std::snprintf(note, sizeof note, "PC memory %.1f GiB free of %.1f", available / 1073741824.0, total / 1073741824.0);
+    return note;
+}
+} // namespace rt

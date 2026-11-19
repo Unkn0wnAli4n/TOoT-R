@@ -394,7 +394,7 @@ struct LoadSpan { s64 first = 0, last = 0; u64 bytes = 0, reads = 0; s64 inside 
 std::mutex load_span_mutex; LoadSpan load_span;
 void FinishLoadSpan() { // (load_span_mutex held)
     if (load_span.reads >= 20 && load_span.last > load_span.first)
-        RT_LOG("loading: %.2f s of reading from %.1f s after the start, %.1f MiB in %llu reads (%.2f s inside them, all threads)", (load_span.last - load_span.first) / 1e9, (load_span.first - process_start_ns) / 1e9, load_span.bytes / 1048576.0, (unsigned long long)load_span.reads, load_span.inside / 1e9);
+        RT_LOG("loading: %.2f s of reading from %.1f s after the start, %.1f MiB in %llu reads (%.2f s inside them, all threads); %s", (load_span.last - load_span.first) / 1e9, (load_span.first - process_start_ns) / 1e9, load_span.bytes / 1048576.0, (unsigned long long)load_span.reads, load_span.inside / 1e9, rt::SystemMemoryNote().c_str());
     load_span = {};
 }
 // (present.cpp, every frame: a stretch whose reads stopped a second ago is reported now)

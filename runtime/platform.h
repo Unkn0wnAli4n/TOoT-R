@@ -76,5 +76,7 @@ void* ThreadByName(const char* name); // (the profiler: a handle of the last thr
 // ones the time passed yielding the core. Elsewhere the system's own sleep, which is that exact already.
 // OOT_PLAIN_SLEEPS=1: the system's own on Windows too, as before.
 void SleepNs(long long nanoseconds);
+// The PC's memory, as text for the log ("PC memory 10.3 GiB free of 31.2").
+std::string SystemMemoryNote();
 void SleepUntilNs(long long steady_clock_nanoseconds); // (a std::chrono::steady_clock time since its epoch)
 } // namespace rt
