@@ -4445,7 +4445,9 @@ struct ResolvePool {
             // (groups follow each other within a frame: spin through the gaps, sleep between frames)
             int spins=0;u64 now;
             while((now=generation.load())==seen){
-                static const int spin_limit=std::getenv("OOT_RESOLVE_SPIN")?std::atoi(std::getenv("OOT_RESOLVE_SPIN")):20000;
+                // (0 by default since 2026-11-19: helpers that spun 20000 pauses between groups took cores from the game's own thread -
+                // 45 against 54 fps with the game held to 6 CPU threads, no difference with 16)
+                static const int spin_limit=std::getenv("OOT_RESOLVE_SPIN")?std::atoi(std::getenv("OOT_RESOLVE_SPIN")):0;
                 if(++spins<spin_limit){
 #if defined(__x86_64__)||defined(__i386__)
                     __builtin_ia32_pause();
@@ -4542,13 +4544,18 @@ void ExecuteSegmentsParallel(const std::vector<ParallelSegment>& segments,const 
     if(times){t1=clock();u32 all=0,most=0;for(const auto& seg:segments){u32 d=0;for(size_t i=seg.begin;i<seg.end;++i)d+=IsDrawCommand((Op)seg.list->commands[i].op);all+=d;most=std::max(most,d);}td+=all;tmax+=all?most*100/all:0;}
     pool.Work();
     if(times)t2=clock();
-    while(pool.done.load()<pool.count){
+    // (waiting for the helpers' last pieces: a short spin, then the core is offered to them - where cores are few, as on a
+    // 6-core laptop, a spinning executor held up the very threads it waited for. OOT_EXECUTOR_SPIN=<n>: pauses before yielding)
+    static const u32 executor_spin=std::getenv("OOT_EXECUTOR_SPIN")?(u32)std::atoi(std::getenv("OOT_EXECUTOR_SPIN")):256;
+    for(u32 spins=0;pool.done.load()<pool.count;++spins){
+        if(spins>=executor_spin){std::this_thread::yield();continue;}
 #if defined(__x86_64__)||defined(__i386__)
         __builtin_ia32_pause();
 #endif
     }
     pool.open.store(false);
-    while(pool.active.load()){
+    for(u32 spins=0;pool.active.load();++spins){
+        if(spins>=executor_spin){std::this_thread::yield();continue;}
 #if defined(__x86_64__)||defined(__i386__)
         __builtin_ia32_pause();
 #endif
