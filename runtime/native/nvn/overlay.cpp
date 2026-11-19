@@ -25,6 +25,15 @@
 #include "../input_settings.h"
 #include "../achievements.h"
 #include <ctime>
+#include <chrono>
+#include <thread>
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#else
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 
 bool ReadRomFile(const std::string& path, std::vector<unsigned char>& out); // fs.cpp
 
@@ -649,6 +658,65 @@ void AchievementPopup() {
     ImGui::PopStyleVar(3);
 }
 
+// CPU and memory use for the counter's Details, sampled once a second: the game's share of the whole CPU and the system's,
+// as Task Manager shows them; the game's memory (its working set / resident size) and the system's in use of its total.
+struct Usage { float game_cpu = -1, all_cpu = -1; double game_ram = 0, used_ram = 0, total_ram = 0; };
+Usage SampleUsage() {
+    static Usage last;
+    static std::chrono::steady_clock::time_point at{};
+    const auto now = std::chrono::steady_clock::now();
+    if (at.time_since_epoch().count() && now - at < std::chrono::seconds(1)) return last;
+    const double wall = at.time_since_epoch().count() ? std::chrono::duration<double>(now - at).count() : 0;
+    at = now;
+    const unsigned cores = std::max(1u, std::thread::hardware_concurrency());
+#ifdef _WIN32
+    auto ticks = [](const FILETIME& f) { return (double)(((u64)f.dwHighDateTime << 32) | f.dwLowDateTime) * 1e-7; }; // (seconds)
+    static double game0 = -1, idle0 = 0, busy0 = 0;
+    FILETIME created, exited, kernel, user;
+    if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) {
+        const double game = ticks(kernel) + ticks(user);
+        if (game0 >= 0 && wall > 0) last.game_cpu = (float)std::clamp((game - game0) / (wall * cores) * 100.0, 0.0, 100.0);
+        game0 = game;
+    }
+    FILETIME idle, sys_kernel, sys_user; // (kernel time includes idle time)
+    if (GetSystemTimes(&idle, &sys_kernel, &sys_user)) {
+        const double i = ticks(idle), busy = ticks(sys_kernel) + ticks(sys_user) - i, all = busy + i;
+        if (busy0 > 0 && all - (busy0 + idle0) > 0) last.all_cpu = (float)std::clamp((busy - busy0) / (all - busy0 - idle0) * 100.0, 0.0, 100.0);
+        busy0 = busy; idle0 = i;
+    }
+    PROCESS_MEMORY_COUNTERS counters{}; counters.cb = sizeof counters;
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof counters)) last.game_ram = (double)counters.WorkingSetSize;
+    MEMORYSTATUSEX memory{}; memory.dwLength = sizeof memory;
+    if (GlobalMemoryStatusEx(&memory)) { last.total_ram = (double)memory.ullTotalPhys; last.used_ram = (double)(memory.ullTotalPhys - memory.ullAvailPhys); }
+#else
+    static double game0 = -1;
+    rusage r{};
+    if (getrusage(RUSAGE_SELF, &r) == 0) {
+        const double game = r.ru_utime.tv_sec + r.ru_utime.tv_usec * 1e-6 + r.ru_stime.tv_sec + r.ru_stime.tv_usec * 1e-6;
+        if (game0 >= 0 && wall > 0) last.game_cpu = (float)std::clamp((game - game0) / (wall * cores) * 100.0, 0.0, 100.0);
+        game0 = game;
+    }
+    static unsigned long long busy0 = 0, all0 = 0;
+    if (FILE* f = std::fopen("/proc/stat", "r")) {
+        unsigned long long v[8] = {};
+        if (std::fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]) == 8) {
+            const unsigned long long all = v[0] + v[1] + v[2] + v[3] + v[4] + v[5] + v[6] + v[7], busy = all - v[3] - v[4];
+            if (all0 && all > all0) last.all_cpu = (float)std::clamp((double)(busy - busy0) / (double)(all - all0) * 100.0, 0.0, 100.0);
+            busy0 = busy; all0 = all;
+        }
+        std::fclose(f);
+    }
+    if (FILE* f = std::fopen("/proc/self/statm", "r")) { unsigned long long size = 0, resident = 0; if (std::fscanf(f, "%llu %llu", &size, &resident) == 2) last.game_ram = (double)resident * (double)sysconf(_SC_PAGESIZE); std::fclose(f); }
+    if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+        char key[64]; unsigned long long kib; double total = 0, available = 0;
+        while (std::fscanf(f, "%63s %llu kB\n", key, &kib) == 2) { if (!std::strcmp(key, "MemTotal:")) total = kib * 1024.0; else if (!std::strcmp(key, "MemAvailable:")) available = kib * 1024.0; }
+        std::fclose(f);
+        last.total_ram = total; last.used_ram = total - available;
+    }
+#endif
+    return last;
+}
+
 // The FPS counter: a corner of the picture, no input. (ImGui's own average of the last frames.)
 // The FPS counter (the Display rows FPS Counter and FPS Counter Position): the rate and frame time; with Graph the last
 // 240 frame times as a plot; with Details also what a frame costs and the video memory in use.
@@ -710,6 +778,10 @@ void Counter() {
                 // (over what the system allows: the driver moves pictures to the PC's memory and everything slows down)
                 const bool over = used > budget;
                 ImGui::TextColored(over ? ImVec4(1.0f, 0.55f, 0.45f, 1.0f) : ImGui::GetStyleColorVec4(ImGuiCol_Text), "video memory %.1f of %.1f GiB%s", used / 1073741824.0, budget / 1073741824.0, over ? " (full)" : "");
+            }
+            if (const Usage u = SampleUsage(); u.game_cpu >= 0) {
+                ImGui::Text("CPU game %.0f%%   all %.0f%%", u.game_cpu, std::max(0.0f, u.all_cpu));
+                if (u.total_ram > 0) ImGui::Text("RAM game %.1f GiB   all %.1f of %.1f GiB", u.game_ram / 1073741824.0, u.used_ram / 1073741824.0, u.total_ram / 1073741824.0);
             }
             if (const int render = gfx::EffectiveRenderScale(); render > 0 && render < 100) ImGui::Text("%.0f x %.0f   3D at %d%%", display.x, display.y, render);
             else ImGui::Text("%.0f x %.0f", display.x, display.y);
