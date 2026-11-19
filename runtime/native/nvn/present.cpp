@@ -41,6 +41,7 @@ extern "C" volatile unsigned long long oot_dynres_context;
 std::atomic<int> profile_present_tid{0}; // (profiler.cpp: OOT_PROFILE_WALL=present)
 namespace cheats { void Tick(); } // (cheats.cpp)
 void LogLoadingStretch(); // (fs.cpp)
+void WaitForGameWrites(); // (fs.cpp)
 namespace nvn {
 namespace {
 
@@ -483,12 +484,13 @@ void PresentPacing() {
         nvn::overlay::leave_request.store(test_leave); }
      if (const int leave = nvn::overlay::leave_request.exchange(0)) {
         RT_LOG("%s from the settings window", leave == 2 ? "restart" : "quit");
+        ::WaitForGameWrites(); // (fs.cpp: a save being written is finished first)
         SavePipelineCacheBlocking(); plist::Save(true);
         if (leave == 2) rt::RestartProcess();
         std::_Exit(0); } }
     SDL_Event e;
     while (NextWindowEvent(&e)) {
-        if (e.type == SDL_EVENT_QUIT) { SavePipelineCacheBlocking(); plist::Save(true); std::_Exit(0); }
+        if (e.type == SDL_EVENT_QUIT) { ::WaitForGameWrites(); SavePipelineCacheBlocking(); plist::Save(true); std::_Exit(0); }
         InputEvent(e);
         nvn::overlay::Event(e);
     }

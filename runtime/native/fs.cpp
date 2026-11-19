@@ -257,12 +257,18 @@ bool Split(const char* full, Mount& mount, std::string& path) {
     return true;
 }
 
+// (files of the game's own data the game has open for writing, and its last write: a quit or a restart from the settings
+// window waits for them - WaitForGameWrites - so it never ends the game halfway through writing a save)
+std::atomic<int> game_writers{0};
+std::atomic<long long> game_last_write_ns{0};
+long long SteadyNs() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 struct OpenFile {
     bool rom;
     u64 rom_offset = 0, rom_size = 0;
     std::shared_ptr<const std::vector<u8>> rom_data; // (a compressed file: unpacked)
     int host_fd = -1;
     int mode = 0;
+    bool writer = false; // (counted in game_writers; last: OpenFile f{rom} sets the first field)
 };
 struct OpenDir {
     std::vector<std::pair<std::string, std::pair<bool, u64>>> items; // name -> (is_dir, size)
@@ -357,6 +363,7 @@ NATIVE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci") {
         const int flags = (mode & 2) ? O_RDWR : O_RDONLY;
         f.host_fd = ::open(HostPath(m, path).string().c_str(), flags | O_CLOEXEC);
         if (f.host_fd < 0) return Ret(c, ResultPathNotFound);
+        if (mode & 2) { f.writer = true; ++game_writers; game_last_write_ns = SteadyNs(); }
     }
     const u64 h = next_handle++;
     {
@@ -442,6 +449,7 @@ NATIVE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvmRKNS0_10ReadOptionE") {
 NATIVE("_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE") {
     OpenFile* f = FindFile(c->x[0]);
     if (!f || f->rom) Fatal("nn::fs::WriteFile on a read-only file");
+    game_last_write_ns = SteadyNs();
     const ssize_t n = pwrite(f->host_fd, Ptr(c, 2), c->x[3], (off_t)c->x[1]);
     Ret(c, n == (ssize_t)c->x[3] ? 0 : 0x7802);
 }
@@ -454,6 +462,7 @@ NATIVE("_ZN2nn2fs9CloseFileENS0_10FileHandleE") {
     auto it = files.find(c->x[0]);
     if (it == files.end()) return;
     if (!it->second.rom) ::close(it->second.host_fd);
+    if (it->second.writer) { --game_writers; game_last_write_ns = SteadyNs(); }
     files.erase(it);
 }
 NATIVE("_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE") {
@@ -608,3 +617,16 @@ bool ReadRomFile(const std::string& path, std::vector<unsigned char>& out) {
 }
 // The save root (graphics settings are stored beside the save data).
 std::string SettingsDirectory() { return DataRoot().string(); }
+
+// A quit or a restart from the settings window: no file of the game's open for writing and a quarter of a second without a
+// write (a save is several files, and Commit), at most five seconds.
+void WaitForGameWrites() {
+    const long long start = SteadyNs();
+    bool told = false;
+    while (SteadyNs() - start < 5'000'000'000LL) {
+        if (game_writers.load() == 0 && SteadyNs() - game_last_write_ns.load() > 250'000'000LL) return;
+        if (!told) { told = true; RT_LOG("quit: waiting for the game to finish writing its save"); }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    RT_LOG("quit: the game's files still open after 5 s");
+}

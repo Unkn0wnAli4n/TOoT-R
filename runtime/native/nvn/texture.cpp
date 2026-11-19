@@ -59,7 +59,10 @@ void NoteLive(const Texture& t,s64 sign){ // (always: a map update per image mad
 // GPU-written images kept for re-created texture objects (history buffers, transient targets).
 // 256 MiB / 512 entries evicted this game's per-frame targets (2560x1440 RGBA16F alone is 29 MiB):
 // temporal effects (volume fog, anti-aliasing and exposure history) restarted from empty images.
-const u64 ImageCacheBudget=std::getenv("OOT_IMAGE_CACHE_MB")?std::strtoull(std::getenv("OOT_IMAGE_CACHE_MB"),nullptr,10)<<20:512ull<<20;
+bool SmallCard();
+// (the image cache's room: 512 MiB, 192 MiB on a card under 6 GB - a player's 4 GB card was over its limit with 628 MiB of
+// cached images, 800 MiB after a longer play. OOT_IMAGE_CACHE_MB: that room)
+u64 ImageCacheBudget(){static const u64 v=std::getenv("OOT_IMAGE_CACHE_MB")?std::strtoull(std::getenv("OOT_IMAGE_CACHE_MB"),nullptr,10)<<20:(SmallCard()?192ull:512ull)<<20;return v;}
 const size_t ImageCacheEntries=std::getenv("OOT_IMAGE_CACHE_ENTRIES")?std::strtoull(std::getenv("OOT_IMAGE_CACHE_ENTRIES"),nullptr,10):1024;
 std::atomic<u64> image_cache_adopted{0},image_cache_evicted{0},image_astc_bytes{0};
 }
@@ -889,7 +892,7 @@ std::list<ImageKey> cache_order;
 std::list<ImageKey> small_order;
 u64 small_cached_bytes = 0;
 const u64 SmallImageMax = 4ull << 20;
-const u64 SmallCacheBudget = std::getenv("OOT_SMALL_IMAGE_CACHE_MB") ? std::strtoull(std::getenv("OOT_SMALL_IMAGE_CACHE_MB"), nullptr, 10) << 20 : 512ull << 20;
+u64 SmallCacheBudget() { static const u64 v = std::getenv("OOT_SMALL_IMAGE_CACHE_MB") ? std::strtoull(std::getenv("OOT_SMALL_IMAGE_CACHE_MB"), nullptr, 10) << 20 : (SmallCard() ? 128ull : 512ull) << 20; return v; } // (128 MiB on a card under 6 GB)
 constexpr size_t SmallCacheEntries = 8192;
 struct CachedImage {
     std::unique_ptr<Texture> texture;
@@ -1012,14 +1015,14 @@ void RetireTexture(Texture* t) {
         (it->second.small ? small_order : cache_order).erase(it->second.position);
         image_cache.erase(it);
     }
-    const bool small=SmallCacheBudget&&t->allocation_size<=SmallImageMax;
+    const bool small=SmallCacheBudget()&&t->allocation_size<=SmallImageMax;
     auto& order=small?small_order:cache_order;
     order.push_back(key);
     image_cache.emplace(key,CachedImage{std::unique_ptr<Texture>(t),std::prev(order.end()),small});
     image_cached_bytes+=t->allocation_size;if(small)small_cached_bytes+=t->allocation_size;
     t->object = 0;
-    while (!cache_order.empty()&&(cache_order.size() > ImageCacheEntries||image_cached_bytes-small_cached_bytes>ImageCacheBudget)) EvictOldest(false);
-    while (!small_order.empty()&&(small_order.size() > SmallCacheEntries||small_cached_bytes>SmallCacheBudget)) EvictOldest(true);
+    while (!cache_order.empty()&&(cache_order.size() > ImageCacheEntries||image_cached_bytes-small_cached_bytes>ImageCacheBudget())) EvictOldest(false);
+    while (!small_order.empty()&&(small_order.size() > SmallCacheEntries||small_cached_bytes>SmallCacheBudget())) EvictOldest(true);
 }
 // ---- one image per memory and description, as on the console ----------------------------------------
 // OoT makes new texture objects over the same memory every frame (its render targets) while older objects
