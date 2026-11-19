@@ -203,6 +203,7 @@ s64 NowMs() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::
 // On larger cards both stay as they were (releasing the spares there ended 100 ms stalls with High Quality textures).
 // OOT_TIGHT_KEEP_SPARES / OOT_TIGHT_TEXTURES_SHARED = 1 or 0: on or off on any card.
 bool SmallCard();
+bool TinyCard();
 bool TightSwitch(const char* name){const char* e=std::getenv(name);return e?e[0]!='0':SmallCard();}
 bool KeepSparesWhenTight(){static const bool on=TightSwitch("OOT_TIGHT_KEEP_SPARES");return on;}
 bool TexturesSharedWhenTight(){static const bool on=TightSwitch("OOT_TIGHT_TEXTURES_SHARED");return on;}
@@ -633,6 +634,9 @@ u32 MipSkipWanted() {
     static const int forced = std::getenv("OOT_TEXTURE_SKIP") ? std::atoi(std::getenv("OOT_TEXTURE_SKIP")) : -1;
     if (forced >= 0) return (u32)forced;
     const int detail = gfx::Current().texture_detail;
+    // (Lowest, and Original or Low on a card under 5 GB: big textures without their two largest levels, a sixteenth of the
+    // memory. Castle Town on a 4 GB-like card: 22-25 -> 34-35 fps, half as many render targets out of room)
+    if (detail == 5 || (TinyCard() && (detail == 0 || detail == 1))) return 2;
     if (detail == 1) return 1;
     const bool small_card = SmallCard();
     if (small_card && detail != 3 && detail != 4) return 1;
@@ -648,6 +652,16 @@ bool SmallCard() {
         if (small) RT_LOG("textures: a card with %llu MiB of video memory: big textures are loaded without their largest level (Texture Detail High or Ultra keeps it)", (unsigned long long)(local >> 20));
         return small; }();
     return small_card;
+}
+bool TinyCard() { // (under 5 GB of video memory, as SmallCard reckons it)
+    static const bool tiny = [] {
+        auto& vk = Vk(); VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(vk.physical, &p);
+        u64 local = 0; for (u32 h = 0; h < vk.memory_properties.memoryHeapCount; ++h) if (vk.memory_properties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) local = std::max<u64>(local, vk.memory_properties.memoryHeaps[h].size);
+        local -= std::min(local, test_vram_hog_bytes);
+        const bool t = p.deviceType != VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && local < (5ull << 30);
+        if (t) RT_LOG("textures: under 5 GB of video memory: big textures are loaded without their two largest levels on Original and Low (Medium or above keeps more)");
+        return t; }();
+    return tiny;
 }
 // From what size a texture is loaded without its largest level: 1024; 512 where the card is small or full (a 4 GB card in
 // Castle Town held 187 textures of 768 x 768 at full size, 187 MiB, while it was out of memory).

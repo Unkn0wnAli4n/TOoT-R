@@ -49,7 +49,7 @@ Settings Sanitized(Settings s) {
     { int cap = 0; if (s.frame_cap > 0) for (int c : FrameCaps) if (c && s.frame_cap <= c) { cap = c; break; } s.frame_cap = cap; } // (the next cap up; past the highest: no limit)
     s.vsync = std::clamp(s.vsync, 0, 2);
     s.filtering = std::clamp(s.filtering, 0, 6);
-    s.texture_detail = std::clamp(s.texture_detail, 0, 4);
+    s.texture_detail = std::clamp(s.texture_detail, 0, 5);
     s.texture_memory = std::clamp(s.texture_memory, 0, 2);
     s.handheld = s.handheld ? 1 : 0;
     s.upscaling = std::clamp(s.upscaling, 0, 3);
@@ -164,7 +164,7 @@ int EffectiveRenderScale() {
 float LodBias() {
     // (Low: big textures are loaded without their largest level - nvn/texture.cpp MipSkipWanted - which is a whole
     // level of bias for them already; with the 0.5 here they look as Low's 1.5 did, and the small ones a little sharper)
-    static constexpr float bias[] = {0.0f, 0.5f, 0.75f, 0.0f, -0.5f};
+    static constexpr float bias[] = {0.0f, 0.5f, 0.75f, 0.0f, -0.5f, 0.0f}; // (Lowest: two levels gone already)
     float b = bias[current.texture_detail];
     // (a temporal upscaler rebuilds detail finer than the 3D's pixels from many frames: textures are sampled as sharp as
     // the finished picture wants them, log2 of the 3D's share, as NVIDIA's and AMD's guides ask)
