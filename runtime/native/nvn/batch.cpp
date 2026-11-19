@@ -1020,6 +1020,9 @@ void NoteWriteBack(u64 address, u64 size) {
 // back first). OOT_EAGER_WRITEBACK=1: every batch copies all back (as before).
 namespace {
 std::map<u64, u64> device_ahead;           // binding start -> end: GPU-written, not yet (all) in guest memory
+// (the longest of them: how far back from an address a search has to look. The fixed 64 MiB it was had the searches walk
+// thousands of small bindings below the address - 6% of the renderer thread's time on a player's laptop)
+u64 device_ahead_reach = 0;
 std::set<u64> cpu_pages;                   // pages of GPU results the CPU reads (copied back every time; by address:
                                            // the game binds the same memory at other offsets frame to frame)
 u64 deferred_bytes = 0, recalled_bytes = 0, eager_bytes = 0;
@@ -1036,7 +1039,7 @@ bool RecallDeviceAhead(u64 address, u64 size) {
     while (it != device_ahead.begin()) {
         --it;
         const u64 start = it->first, end = it->second;
-        if (end <= first) { if (start + (64ull << 20) < first) break; continue; } // (bindings are at most 64 MiB)
+        if (end <= first) { if (start + device_ahead_reach < first) break; continue; } // (none reaches further back)
         const u64 lo = std::max(start, first), hi = std::min(end, last);
         if (lo >= hi) continue;
         // (pages already known go back with the batches writing them: waiting for those is enough)
@@ -1089,6 +1092,7 @@ void NotePendingWrite(u64 address, u64 size, bool write_back) {
     if (write_back && DeferWriteBack()) {
         u64& end = device_ahead[address];
         if (end < address + size) { end = address + size; ProtectDeviceAhead(address, end, &cpu_pages); }
+        device_ahead_reach = std::max(device_ahead_reach, end - address);
         deferred_bytes += size;
         for (auto page = cpu_pages.lower_bound(address & ~(Page - 1)); page != cpu_pages.end() && *page < address + size; ++page) {
             const u64 lo = std::max(*page, address), hi = std::min(*page + Page, address + size); // (pages the CPU reads: back with this batch)
@@ -1191,7 +1195,7 @@ bool HasPendingWrite(u64 address, u64 size) {
             auto it = device_ahead.lower_bound(last);
             while (it != device_ahead.begin()) {
                 --it;
-                if (it->second <= first) { if (it->first + (64ull << 20) < first) break; continue; }
+                if (it->second <= first) { if (it->first + device_ahead_reach < first) break; continue; }
                 const u64 lo = std::max(it->first, first), hi = std::min(it->second, last);
                 for (u64 page = lo & ~(Page - 1); page < hi; page += Page) if (!cpu_pages.count(page)) { RESOLVE_BAIL(); return true; }
             }
