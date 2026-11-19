@@ -1019,10 +1019,27 @@ void NoteWriteBack(u64 address, u64 size) {
 // once are copied back eagerly from then on; the rest stays inaccessible to the CPU (a touch copies that page
 // back first). OOT_EAGER_WRITEBACK=1: every batch copies all back (as before).
 namespace {
-std::map<u64, u64> device_ahead;           // binding start -> end: GPU-written, not yet (all) in guest memory
-// (the longest of them: how far back from an address a search has to look. The fixed 64 MiB it was had the searches walk
-// thousands of small bindings below the address - 6% of the renderer thread's time on a player's laptop)
-u64 device_ahead_reach = 0;
+// Binding start -> end: GPU-written, not yet (all) in guest memory. Bindings overlap, so a search for an address walks back
+// as far as the longest binding could reach. Kept in two maps: the many small bindings (reach at most 1 MiB) and the few
+// large ones, each searched with its own reach. One map with one reach had every search walk back over thousands of
+// small bindings as far as the longest large one reached - 6-7% of the renderer thread on a player's 4 GB laptop
+// (123 MiB of results kept a frame). OOT_AHEAD_SPLIT_KIB=<n>: the size from which a binding counts as large.
+struct AheadSet { std::map<u64, u64> map; u64 reach = 0; };
+AheadSet ahead_small, ahead_large;
+u64 AheadSplit() { static const u64 split = std::getenv("OOT_AHEAD_SPLIT_KIB") ? std::strtoull(std::getenv("OOT_AHEAD_SPLIT_KIB"), nullptr, 10) << 10 : 1ull << 20; return split; }
+bool AheadEmpty() { return ahead_small.map.empty() && ahead_large.map.empty(); }
+// Calls f(start, end) for each binding overlapping [first, last) (newest key first within each map); stops when f returns true.
+template <class F> bool ForAhead(u64 first, u64 last, F&& f) {
+    for (AheadSet* set : {&ahead_small, &ahead_large}) {
+        auto it = set->map.lower_bound(last);
+        while (it != set->map.begin()) {
+            --it;
+            if (it->second <= first) { if (it->first + set->reach < first) break; continue; } // (none reaches further back)
+            if (f(it->first, it->second)) return true;
+        }
+    }
+    return false;
+}
 std::set<u64> cpu_pages;                   // pages of GPU results the CPU reads (copied back every time; by address:
                                            // the game binds the same memory at other offsets frame to frame)
 u64 deferred_bytes = 0, recalled_bytes = 0, eager_bytes = 0;
@@ -1031,17 +1048,13 @@ constexpr u64 Page = 4096;
 // (batch lock held) [address, address + size) of GPU results still on the GPU comes back with the open batch; those
 // pages are copied back eagerly from then on (OoT reads a few words at the start of buffers of megabytes).
 bool RecallDeviceAhead(u64 address, u64 size) {
-    if (device_ahead.empty() || !size) return false;
+    if (AheadEmpty() || !size) return false;
     bool any = false;
     // (whole pages, and every binding on them: a page becomes accessible as a whole)
     const u64 first = address & ~(Page - 1), last = (address + size + Page - 1) & ~(Page - 1);
-    auto it = device_ahead.lower_bound(last);
-    while (it != device_ahead.begin()) {
-        --it;
-        const u64 start = it->first, end = it->second;
-        if (end <= first) { if (start + device_ahead_reach < first) break; continue; } // (none reaches further back)
+    ForAhead(first, last, [&](u64 start, u64 end) {
         const u64 lo = std::max(start, first), hi = std::min(end, last);
-        if (lo >= hi) continue;
+        if (lo >= hi) return false;
         // (pages already known go back with the batches writing them: waiting for those is enough)
         for (u64 page = lo & ~(Page - 1); page < hi; page += Page) {
             if (cpu_pages.count(page)) continue;
@@ -1057,16 +1070,18 @@ bool RecallDeviceAhead(u64 address, u64 size) {
         static int shown = 0;
         if (any && shown++ < 24) RT_LOG("GPU results %#llx-%#llx (of %#llx+%#llx) are read on the CPU: those pages copied back from now on",
                                         (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)start, (unsigned long long)(end - start));
-    }
+        return false;
+    });
     return any;
 }
 } // namespace
 void DropDeviceAhead(u64 address, u64 size) { // (a pool goes: its results are not wanted)
     std::lock_guard lock{BatchMutex()};
-    for (auto it = device_ahead.lower_bound(address); it != device_ahead.end() && it->first < address + size;) {
-        SettleDeviceAhead(it->first, it->second);
-        it = device_ahead.erase(it);
-    }
+    for (AheadSet* set : {&ahead_small, &ahead_large})
+        for (auto it = set->map.lower_bound(address); it != set->map.end() && it->first < address + size;) {
+            SettleDeviceAhead(it->first, it->second);
+            it = set->map.erase(it);
+        }
 }
 void ReportDeviceAhead() {
     std::lock_guard lock{BatchMutex()};
@@ -1090,9 +1105,14 @@ void NotePendingWrite(u64 address, u64 size, bool write_back) {
     std::lock_guard lock{BatchMutex()};
     AddRange(batch.pending_writes, address, address + size);
     if (write_back && DeferWriteBack()) {
-        u64& end = device_ahead[address];
+        u64 end = 0;
+        const auto small = ahead_small.map.find(address), large = ahead_large.map.find(address);
+        if (small != ahead_small.map.end()) end = small->second; else if (large != ahead_large.map.end()) end = large->second;
         if (end < address + size) { end = address + size; ProtectDeviceAhead(address, end, &cpu_pages); }
-        device_ahead_reach = std::max(device_ahead_reach, end - address);
+        if (end - address > AheadSplit()) {
+            if (small != ahead_small.map.end()) ahead_small.map.erase(small);
+            ahead_large.map[address] = end; ahead_large.reach = std::max(ahead_large.reach, end - address);
+        } else { ahead_small.map[address] = end; ahead_small.reach = std::max(ahead_small.reach, end - address); }
         deferred_bytes += size;
         for (auto page = cpu_pages.lower_bound(address & ~(Page - 1)); page != cpu_pages.end() && *page < address + size; ++page) {
             const u64 lo = std::max(*page, address), hi = std::min(*page + Page, address + size); // (pages the CPU reads: back with this batch)
@@ -1190,15 +1210,14 @@ bool HasPendingWrite(u64 address, u64 size) {
     if (resolve_worker) {
         if (resolve_checked) resolve_checked->push_back({address, size});
         // (GPU results the CPU has not read yet would be recalled here, which records: the executor's to do)
-        if (!device_ahead.empty() && size) {
+        if (!AheadEmpty() && size) {
             const u64 first = address & ~(Page - 1), last = (address + size + Page - 1) & ~(Page - 1);
-            auto it = device_ahead.lower_bound(last);
-            while (it != device_ahead.begin()) {
-                --it;
-                if (it->second <= first) { if (it->first + device_ahead_reach < first) break; continue; }
-                const u64 lo = std::max(it->first, first), hi = std::min(it->second, last);
-                for (u64 page = lo & ~(Page - 1); page < hi; page += Page) if (!cpu_pages.count(page)) { RESOLVE_BAIL(); return true; }
-            }
+            const bool unread = ForAhead(first, last, [&](u64 start, u64 end) {
+                const u64 lo = std::max(start, first), hi = std::min(end, last);
+                for (u64 page = lo & ~(Page - 1); page < hi; page += Page) if (!cpu_pages.count(page)) return true;
+                return false;
+            });
+            if (unread) { RESOLVE_BAIL(); return true; }
         }
         if (Overlaps(batch.pending_writes, address, size)) return true;
         for (const auto& f : in_flight) if (Overlaps(f.writes, address, size)) return true;
@@ -1220,10 +1239,12 @@ bool HasPendingWriteAny(const std::vector<std::pair<u64, u64>>& ranges) {
     u64 lo = ~0ull, hi = 0;
     for (const auto& [address, size] : ranges) { lo = std::min(lo, address); hi = std::max(hi, address + size); }
     const auto clear = [&] {
-        if (!device_ahead.empty()) {
+        if (!AheadEmpty()) {
             const u64 first = lo & ~(Page - 1), last = (hi + Page - 1) & ~(Page - 1);
-            auto it = device_ahead.upper_bound(last);
-            if (it != device_ahead.begin() && std::prev(it)->second > first) return false;
+            for (AheadSet* set : {&ahead_small, &ahead_large}) {
+                auto it = set->map.upper_bound(last);
+                if (it != set->map.begin() && std::prev(it)->second > first) return false;
+            }
         }
         if (Overlaps(batch.pending_writes, lo, hi - lo)) return false;
         for (const auto& f : in_flight) if (Overlaps(f.writes, lo, hi - lo)) return false;
