@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include "../native.h"
+#include "achievements.h"
 
 namespace fs = std::filesystem;
 using namespace rt;
@@ -293,7 +294,7 @@ fs::path HostPath(const Mount& m, const std::string& path) { return m.host / pat
 NATIVE("_ZN2nn2fs22QueryMountRomCacheSizeEPm") { *Ptr<u64>(c, 0) = 0x1000; Ret(c, 0); }
 NATIVE("_ZN2nn2fs8MountRomEPKcPvm") { Rom(); Ret(c, AddMount(Ptr<const char>(c, 0), Mount{true, {}})); }
 NATIVE("_ZN2nn2fs8MountRomEPKc") { Rom(); Ret(c, AddMount(Ptr<const char>(c, 0), Mount{true, {}})); }
-NATIVE("_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE") { Ret(c, HostMount(Ptr<const char>(c, 0), DataRoot() / "save")); }
+NATIVE("_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE") { Ret(c, HostMount(Ptr<const char>(c, 0), DataRoot() / "save")); achievements::Start(); }
 NATIVE("_ZN2nn2fs21MountTemporaryStorageEPKc") { Ret(c, HostMount(Ptr<const char>(c, 0), DataRoot() / "temporary")); }
 NATIVE("_ZN2nn2fs7UnmountEPKc") {
     std::lock_guard lock{fs_mutex};
@@ -303,6 +304,7 @@ NATIVE("_ZN2nn2fs6CommitEPKc") {
 #ifndef _WIN32
     sync();
 #endif
+    achievements::SavesWritten(); // (achievements.cpp reads the saves again)
     Ret(c, 0);
 }
 NATIVE("_ZN2nn2fs12SetAllocatorEPFPvmEPFvS1_mE") {}

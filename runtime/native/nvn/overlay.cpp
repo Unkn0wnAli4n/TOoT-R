@@ -23,6 +23,8 @@
 #include "../debug_tools.h"
 #include "../graphics_settings.h"
 #include "../input_settings.h"
+#include "../achievements.h"
+#include <ctime>
 
 bool ReadRomFile(const std::string& path, std::vector<unsigned char>& out); // fs.cpp
 
@@ -532,6 +534,7 @@ void ToolRows(const char*& help) {
     if (!said.empty()) ImGui::TextWrapped("%s", said.c_str());
 }
 
+void AchievementsTab(const char*& help);
 void Window(bool appeared) {
     const float scale = ImGui::GetStyle().FramePadding.y / 3.0f;
     const ImVec2 display = ImGui::GetIO().DisplaySize;
@@ -562,6 +565,7 @@ void Window(bool appeared) {
         page("Hacks", [&] { SettingRows([](const char* section) { return !std::strcmp(section, "Hacks"); }, help); });
         page("Controller", [&] { ControllerTab(help); });
         page("Keyboard & Mouse", [&] { KeyboardTab(help); });
+        page("Achievements", [&] { AchievementsTab(help); });
         ImGui::EndTabBar();
     }
     ImGui::Separator();
@@ -586,6 +590,63 @@ void Window(bool appeared) {
     ImGui::PopTextWrapPos();
     ImGui::End();
     if (!open) { shown = false; capture_kind = 0; }
+}
+
+// The Achievements tab: each with its state, the date it was unlocked, and the pop-up switch.
+void AchievementsTab(const char*& help) {
+    int total = 0;
+    const int have = achievements::Unlocked(&total);
+    ImGui::Text("%d of %d unlocked", have, total);
+    ImGui::SameLine();
+    bool popups = achievements::PopupsOn();
+    if (ImGui::Checkbox("Pop-ups", &popups)) achievements::SetPopups(popups);
+    if (ImGui::IsItemHovered() || ImGui::IsItemFocused()) help = "Show a short notice at the top of the screen when an achievement is unlocked.";
+    ImGui::TextDisabled("Read from your saves: new ones appear when the game saves.");
+    ImGui::Separator();
+    if (!ImGui::BeginTable("achievements", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) return;
+    ImGui::TableSetupColumn("what", ImGuiTableColumnFlags_WidthStretch, 3.0f);
+    ImGui::TableSetupColumn("when", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+    for (const auto& a : achievements::List()) {
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        if (a.unlocked) ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.35f, 1.0f), "%s", a.title);
+        else ImGui::TextDisabled("%s", a.title);
+        ImGui::TextWrapped("%s", a.description);
+        ImGui::TableSetColumnIndex(1);
+        if (a.unlocked && a.when > 0) {
+            const std::time_t t = (std::time_t)a.when;
+            char date[32] = "";
+            if (const std::tm* tm = std::localtime(&t)) std::strftime(date, sizeof date, "%Y-%m-%d", tm);
+            ImGui::TextUnformatted(date);
+        } else if (a.unlocked) ImGui::TextUnformatted("Unlocked");
+        else ImGui::TextDisabled("Locked");
+    }
+    ImGui::EndTable();
+}
+
+// A new achievement's pop-up: top middle of the picture, no input, faded in and out.
+void AchievementPopup() {
+    float age = 0;
+    const achievements::Shown* a = achievements::Popup(age);
+    if (!a) return;
+    const float scale = ImGui::GetStyle().FramePadding.y / 3.0f;
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const float alpha = std::clamp(std::min(age / 0.3f, (6.0f - age) / 0.6f), 0.0f, 1.0f);
+    ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, 28 * scale), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.8f * alpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(18 * scale, 12 * scale));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10 * scale);
+    if (ImGui::Begin("##achievement", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoSavedSettings)) {
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.35f, 1.0f), "Achievement unlocked");
+        ImGui::SetWindowFontScale(1.25f);
+        ImGui::TextUnformatted(a->title);
+        ImGui::SetWindowFontScale(1.0f);
+        ImGui::TextDisabled("%s", a->description);
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(3);
 }
 
 // The FPS counter: a corner of the picture, no input. (ImGui's own average of the last frames.)
@@ -773,9 +834,11 @@ void ReleaseSwapchainViews() {
 
 void Record(VkCommandBuffer cmd, VkImage dst, VkFormat format, VkExtent2D extent, VkRect2D) {
     const bool counter = gfx::Current().show_fps != 0;
+    float popup_age = 0;
+    const bool popup = achievements::Popup(popup_age) != nullptr;
     if (!shown) {
         if (ui.context) { std::lock_guard lock{events_mutex}; events.clear(); }
-        if (!counter) return;
+        if (!counter && !popup) return;
     }
     if (!ui.context) CreateContext(extent);
     InitVulkan(format);
@@ -796,6 +859,7 @@ void Record(VkCommandBuffer cmd, VkImage dst, VkFormat format, VkExtent2D extent
     if (shown) Window(!was_shown);
     was_shown = shown;
     if (counter) Counter();
+    if (popup) AchievementPopup();
     ImGui::Render();
     Draw(cmd, dst, format, extent);
 }

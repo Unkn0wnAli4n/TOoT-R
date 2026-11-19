@@ -782,6 +782,7 @@ void PresentWindowTexture(u64 window, s32 index) {
     struct Spikes { bool on = false; int cells = 6, after = 0, level = 48; };
     static const Spikes spikes = [] { Spikes w; if (const char* e = std::getenv("OOT_PRESENT_SPIKES")) w.on = std::sscanf(e, "%d,%d,%d", &w.cells, &w.after, &w.level) >= 1; return w; }();
     const bool dumping = snap || watch.on || spikes.on;
+    if (snap && !every) RT_LOG("present: snapshot taken");
     VkImageLayout last = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     if (dumping) {
         EnsureDumpBuffer((VkDeviceSize)sc.extent.width * sc.extent.height * 4);
