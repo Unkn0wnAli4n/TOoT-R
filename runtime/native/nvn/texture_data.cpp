@@ -515,7 +515,7 @@ void EnsureUploaded(Texture& t) {
         const u32 now = TextureWriteSequence();
         if (now != t.checked_sequence) {
             t.checked_sequence = now;
-            if (TextureMemoryWritten(t.storage, t.storage_size, t.upload_sequence)) { t.uploaded = false; ++cpu_reuploads;
+            if (TextureMemoryWritten(t.storage, t.storage_size, t.upload_sequence)) { t.uploaded = false; ++cpu_reuploads; t.reupload_reason = 1;
                 static const bool log = std::getenv("OOT_REUPLOAD_LOG") != nullptr; static std::atomic<u32> shown{0};
                 if (log && shown++ < 60) RT_LOG("re-upload (the game wrote it): %ux%u fmt %u levels %u layers %u, %.1f MiB at %#llx, frame %llu", t.width, t.height, t.format, t.levels, t.layers, t.storage_size / 1048576.0, (unsigned long long)t.storage, (unsigned long long)CurrentFrameNumber()); }
         }
@@ -531,6 +531,27 @@ void EnsureUploaded(Texture& t) {
         std::vector<u8> bytes(std::min<u64>(t.storage_size, 1u << 20)); ReadStorage(t.storage, bytes.data(), bytes.size());
         u64 nonzero = 0; for (u8 b : bytes) nonzero += b != 0;
         static u32 shown = 0; if (shown++ < 40) RT_LOG("R8 upload %ux%u at %#llx: %llu/%zu nonzero bytes (frame %llu)", t.width, t.height, (unsigned long long)t.storage, (unsigned long long)nonzero, bytes.size(), (unsigned long long)CurrentFrameNumber());
+    }
+    {   // (diagnostic OOT_REUPLOAD_STATS: each upload by why - first of this texture object, the game wrote its memory, or
+        // another reason - and for the written ones whether its bytes are what they were at the upload before)
+        static const bool stats = std::getenv("OOT_REUPLOAD_STATS") != nullptr;
+        if (stats && t.storage && t.storage_size) {
+            const auto range = LookupAddressCpu(t.storage);
+            u64 h = 0;
+            if (range.pool && range.available >= t.storage_size) { const u64* w = reinterpret_cast<const u64*>(range.cpu_address);
+                h = 0x9e3779b97f4a7c15ull ^ t.storage_size; for (u64 i = 0, n = t.storage_size / 8; i < n; ++i) h = (h ^ w[i]) * 0x100000001b3ull + (h >> 29); }
+            static std::atomic<u64> first{0}, written_same{0}, written_changed{0}, other{0}, bytes_same{0}, bytes_changed{0}, why[8]{}, same_why[8]{};
+            if (!t.stats_uploaded) ++first;
+            else if (t.reupload_reason == 1) { if (h && h == t.stats_hash) { ++written_same; bytes_same += t.storage_size; } else { ++written_changed; bytes_changed += t.storage_size; } }
+            else { ++other; ++why[t.reupload_reason & 7]; if (h && h == t.stats_hash) ++same_why[t.reupload_reason & 7]; }
+            t.stats_uploaded = true; t.stats_hash = h; t.reupload_reason = 0;
+            static std::atomic<u64> n{0};
+            if (n % 1000 == 999) RT_LOG("uploads, other by why (same bytes): untagged %llu (%llu), descriptor retired %llu (%llu), image taken %llu (%llu), idle dropped %llu (%llu), made whole %llu (%llu), API write %llu (%llu)",
+                (unsigned long long)why[0].load(),(unsigned long long)same_why[0].load(),(unsigned long long)why[2].load(),(unsigned long long)same_why[2].load(),(unsigned long long)why[3].load(),(unsigned long long)same_why[3].load(),
+                (unsigned long long)why[4].load(),(unsigned long long)same_why[4].load(),(unsigned long long)why[5].load(),(unsigned long long)same_why[5].load(),(unsigned long long)why[6].load(),(unsigned long long)same_why[6].load());
+            if (++n % 1000 == 0) RT_LOG("uploads by why: %llu first, %llu written but the same bytes (%.0f MiB), %llu written and changed (%.0f MiB), %llu other",
+                (unsigned long long)first.load(), (unsigned long long)written_same.load(), bytes_same.load() / 1048576.0, (unsigned long long)written_changed.load(), bytes_changed.load() / 1048576.0, (unsigned long long)other.load());
+        }
     }
     const auto t0 = std::chrono::steady_clock::now();
     UploadTexels(t);
@@ -895,6 +916,10 @@ void Transfer(Cpu* c, bool write, bool strided) {
     const u32 mip_w = (m.width + t->info.block_w - 1) / t->info.block_w, mip_h = (m.height + t->info.block_h - 1) / t->info.block_h;
     const bool whole = x0 == 0 && y0 == 0 && width == mip_w && height == mip_h; // (a write needs no read first)
     std::atomic<bool> outside{false};
+    // (a write that leaves the texture's bytes as they were - most of them: 8759 of 10642 in a save load and 20 s of play -
+    // is neither stored nor uploaded again: each was a whole upload. OOT_TEXEL_WRITE_ALWAYS=1: every write uploads, as before)
+    static const bool always = std::getenv("OOT_TEXEL_WRITE_ALWAYS") != nullptr;
+    bool changed = false;
     for (s32 z = 0; z < region.depth; ++z) {
         const u32 layer = array ? view.layers_base + region.z + z : 0;
         const u32 slice = array ? 0 : region.z + z;
@@ -919,9 +944,14 @@ void Transfer(Cpu* c, bool write, bool strided) {
         if (height <= Band) rows(0, height);
         else ParallelFor((height + Band - 1) / Band, [&](u32 b) { rows(b * Band, std::min(height, (b + 1) * Band)); });
         if (outside) Fatal("texture transfer exceeds mip storage");
-        if (write) WriteStorage(address, buffer, m.storage_size);
+        if (write) {
+            bool same = false;
+            if (!always) { const auto range = LookupAddressCpu(address);
+                same = range.pool && range.available >= m.storage_size && std::memcmp(reinterpret_cast<const void*>(range.cpu_address), buffer, m.storage_size) == 0; }
+            if (!same) { WriteStorage(address, buffer, m.storage_size); changed = true; }
+        }
     }
-    if (write) { t->uploaded = false; EnsureUploaded(*t); }
+    if (write && changed) { t->uploaded = false; t->reupload_reason = 6; EnsureUploaded(*t); }
 }
 }
 } // namespace nvn

@@ -39,6 +39,7 @@ struct Texture : std::enable_shared_from_this<Texture> {
     VkImageView view = VK_NULL_HANDLE; // full view with the texture's own format and swizzle
     std::vector<std::pair<TextureView, VkImageView>> views;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    u8 reupload_reason = 0; bool stats_uploaded = false; u64 stats_hash = 0; // (OOT_REUPLOAD_STATS diagnostic: texture_data.cpp)
     VkImageUsageFlags usage = 0;
     bool gpu_written = false; // rendered to: contents live on the host GPU
     bool uploaded = false;

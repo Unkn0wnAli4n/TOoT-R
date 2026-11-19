@@ -267,7 +267,7 @@ void RetireDescriptorImage(Texture& texture) {
     image->owner_finalized=false;image->gpu_retirement_pending=false;
     texture.image=VK_NULL_HANDLE;texture.memory=VK_NULL_HANDLE;texture.view=VK_NULL_HANDLE;texture.block=nullptr;
     texture.views.clear();texture.allocation_size=0;
-    texture.layout=VK_IMAGE_LAYOUT_UNDEFINED;texture.uploaded=texture.gpu_written=false;
+    texture.layout=VK_IMAGE_LAYOUT_UNDEFINED;texture.uploaded=texture.gpu_written=false;texture.reupload_reason=2;
     RetireTexture(image);
 }
 }
@@ -1062,7 +1062,7 @@ void ReuseOverlapping(Texture& t, bool take) {
                 t.image = h->image; t.memory = h->memory; t.block = h->block; t.memory_offset = h->memory_offset; t.allocation_size = h->allocation_size;
                 t.view = h->view; t.views = std::move(h->views); t.layout = h->layout; t.usage = h->usage;
                 t.skip = h->skip; t.decoded_astc = h->decoded_astc; t.bc3 = h->bc3; t.decoded_rgb9e5 = h->decoded_rgb9e5; t.info = h->info;
-                t.uploaded = t.gpu_written = false; // (a new image as far as its contents go)
+                t.uploaded = t.gpu_written = false; t.reupload_reason = 3; // (a new image as far as its contents go)
                 h->image = VK_NULL_HANDLE; h->memory = VK_NULL_HANDLE; h->block = nullptr; h->view = VK_NULL_HANDLE; h->views.clear(); h->allocation_size = 0;
                 h->layout = VK_IMAGE_LAYOUT_UNDEFINED; h->uploaded = h->gpu_written = false;
                 auto it = holders.find(KeyOf(*h)); if (it != holders.end() && it->second == h) holders.erase(it);
@@ -1083,7 +1083,7 @@ void ReuseOverlapping(Texture& t, bool take) {
         // (what the GPU drew into it is gone with the image, and the game's memory never held it: used again, it starts
         // as a new target does, not with 32 MiB of that memory read, deswizzled and copied - 22 ms for a 4K one)
         if (h->gpu_written) h->lost_gpu_image = true;
-        h->layout = VK_IMAGE_LAYOUT_UNDEFINED; h->uploaded = h->gpu_written = false;
+        h->layout = VK_IMAGE_LAYOUT_UNDEFINED; h->uploaded = h->gpu_written = false; h->reupload_reason = 4;
         image->object = 0;
         DestroyLater(image);
         ++images_released;
@@ -1100,7 +1100,7 @@ void WantFullImage(Texture& t) {
           Unlist(&t); }
         auto* image = new Texture(t);
         t.image = VK_NULL_HANDLE; t.memory = VK_NULL_HANDLE; t.block = nullptr; t.view = VK_NULL_HANDLE; t.views.clear(); t.allocation_size = 0;
-        t.layout = VK_IMAGE_LAYOUT_UNDEFINED; t.uploaded = t.gpu_written = false;
+        t.layout = VK_IMAGE_LAYOUT_UNDEFINED; t.uploaded = t.gpu_written = false; t.reupload_reason = 5;
         image->object = 0; image->owner_finalized = false; image->gpu_retirement_pending = false;
         DestroyLater(image);
         ++binding_generation;
