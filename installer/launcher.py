@@ -68,7 +68,18 @@ def log_dir():
     return path
 
 
+def private(text):
+    """The text with the user's home folder written as ~ (logs are posted on public issue trackers)."""
+    home = os.path.expanduser("~")
+    if len(home) < 4:
+        return text
+    for spelling in {home, home.replace("\\", "/"), home.replace("/", "\\")}:
+        text = text.replace(spelling, "~")
+    return text
+
+
 def say(msg):
+    msg = private(str(msg))
     print(f"[TOoT:R] {msg}", flush=True)
     try:  # (kept, with the time: a console window that closed took its lines with it)
         logs = log_dir()

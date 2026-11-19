@@ -34,10 +34,16 @@ constexpr Field fields[] = {
 
 void Save(const Settings& s) {
     std::filesystem::create_directories(std::filesystem::path(Path()).parent_path());
-    if (FILE* f = std::fopen(Path().c_str(), "w")) {
+    // (written beside and moved over the old one: a crash or a kill while it was written left the file empty or cut short,
+    // and every setting back at its default)
+    const std::string temp = Path() + ".new";
+    if (FILE* f = std::fopen(temp.c_str(), "w")) {
         std::fprintf(f, "# Ocarina of Time recomp graphics settings (the Graphics screen in the pause menu's System tab)\n");
         for (const auto& field : fields) std::fprintf(f, "%s=%d\n", field.name, s.*field.member);
+        const bool ok = std::fflush(f) == 0 && !std::ferror(f);
         std::fclose(f);
+        std::error_code ec;
+        if (ok) std::filesystem::rename(temp, Path(), ec); else std::filesystem::remove(temp, ec);
     }
 }
 

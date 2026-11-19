@@ -45,7 +45,8 @@ std::string Path() { return rt::DataDir() + "/input.ini"; }
 
 void Save(const Config& c) {
     std::filesystem::create_directories(std::filesystem::path(Path()).parent_path());
-    FILE* f = std::fopen(Path().c_str(), "w");
+    const std::string temp = Path() + ".new"; // (written beside and moved over the old one, as graphics.ini)
+    FILE* f = std::fopen(temp.c_str(), "w");
     if (!f) return;
     std::fprintf(f, "# Controls (the settings window's Controller and Keyboard & Mouse tabs).\n"
                     "# key_<button>: SDL scancodes; 4097..4101 the mouse's buttons, 4112 / 4113 the wheel up / down; 0 none.\n"
@@ -55,7 +56,10 @@ void Save(const Config& c) {
         std::fprintf(f, "key_%s=%d,%d\n", names[a].saved, c.key[a][0], c.key[a][1]);
         std::fprintf(f, "pad_%s=%d,%d\n", names[a].saved, c.pad[a][0], c.pad[a][1]);
     }
+    const bool ok = std::fflush(f) == 0 && !std::ferror(f);
     std::fclose(f);
+    std::error_code ec;
+    if (ok) std::filesystem::rename(temp, Path(), ec); else std::filesystem::remove(temp, ec);
 }
 
 Config Sanitized(Config c) {

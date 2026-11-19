@@ -1,4 +1,5 @@
 #include "logfile.h"
+#include "rt.h"
 
 #include <atomic>
 #include <chrono>
@@ -70,7 +71,7 @@ void OpenLogFile() {
     {
         const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
         char stamp[64]; std::strftime(stamp, sizeof stamp, "%Y-%m-%d %H:%M:%S", std::localtime(&now));
-        std::fprintf(stderr, "[rt] log of %s (%s)\n", stamp, log_path.c_str());
+        rt::LogLine("[rt] log of %s (%s)", stamp, log_path.c_str());
     }
     if (console >= 0) std::thread([console, path] {
 #ifdef _WIN32
@@ -121,3 +122,41 @@ void ShowFatal(const char* message) {
 #endif
 }
 } // namespace rt
+
+// ---- log lines without the user's account name ----
+// (the home folder - C:\Users\<name> or /home/<name> - is written as ~ in every line: paths in the log named the player's
+// account, and logs are posted on public issue trackers. Both slash directions on Windows.)
+#include <cstdarg>
+namespace {
+std::vector<std::string> HomeSpellings() {
+    std::vector<std::string> out;
+    const char* home = std::getenv("USERPROFILE");
+    if (!home || !*home) home = std::getenv("HOME");
+    if (!home || std::strlen(home) < 4) return out;
+    std::string h = home;
+    while (!h.empty() && (h.back() == '/' || h.back() == '\\')) h.pop_back();
+    out.push_back(h);
+    std::string forward = h; for (char& ch : forward) if (ch == '\\') ch = '/';
+    if (forward != h) out.push_back(forward);
+    std::string back = h; for (char& ch : back) if (ch == '/') ch = '\\';
+    if (back != h) out.push_back(back);
+    return out;
+}
+}
+void rt::LogLine(const char* format, ...) {
+    static const std::vector<std::string> homes = HomeSpellings();
+    char stack[1024];
+    va_list args; va_start(args, format);
+    va_list again; va_copy(again, args);
+    const int n = std::vsnprintf(stack, sizeof stack, format, args);
+    va_end(args);
+    std::string line;
+    if (n < 0) { va_end(again); return; }
+    if ((size_t)n < sizeof stack) line.assign(stack, (size_t)n);
+    else { line.resize((size_t)n + 1); std::vsnprintf(line.data(), line.size(), format, again); line.resize((size_t)n); }
+    va_end(again);
+    for (const std::string& h : homes)
+        for (size_t at = line.find(h); at != std::string::npos; at = line.find(h, at + 1)) line.replace(at, h.size(), "~");
+    line += '\n';
+    std::fwrite(line.data(), 1, line.size(), stderr);
+}

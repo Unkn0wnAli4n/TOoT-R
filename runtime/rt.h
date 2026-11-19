@@ -46,7 +46,9 @@ struct Module {
 };
 
 // Logging
-#define RT_LOG(...) (std::fprintf(stderr, "[rt] " __VA_ARGS__), std::fputc('\n', stderr))
+// (logfile.cpp: one line with the user's home folder written as ~, so a log posted with a report names no account)
+void LogLine(const char* format, ...) __attribute__((format(printf, 1, 2)));
+#define RT_LOG(...) ::rt::LogLine("[rt] " __VA_ARGS__)
 [[noreturn]] void Fatal(const char* fmt, ...);
 
 // Memory (identity mapped guest memory)
