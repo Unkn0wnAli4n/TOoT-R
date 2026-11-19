@@ -969,6 +969,9 @@ void AdoptCachedImage(Texture& t) {
     t.block = cached.block; t.memory_offset = cached.memory_offset; cached.block = nullptr;
     t.allocation_size=cached.allocation_size;image_cached_bytes-=cached.allocation_size;if(it->second.small)small_cached_bytes-=cached.allocation_size;
     t.layout = cached.layout; t.usage = cached.usage; t.gpu_written = contents && cached.gpu_written; t.uploaded = contents && cached.uploaded;
+    if (t.uploaded && !t.gpu_written) { // (its upload's marks: writes since then are found as for any uploaded texture)
+        t.upload_sequence = cached.upload_sequence; t.checked_sequence = cached.upload_sequence; t.content_hash = cached.content_hash;
+        t.hash_frame = 0; t.upload_frame = cached.upload_frame; }
     t.skip = cached.skip; t.decoded_astc = cached.decoded_astc; t.bc3 = cached.bc3; t.decoded_rgb9e5 = cached.decoded_rgb9e5; t.info = cached.info;
     cached.image = VK_NULL_HANDLE; cached.memory = VK_NULL_HANDLE; cached.view = VK_NULL_HANDLE; cached.views.clear();
     (it->second.small ? small_order : cache_order).erase(it->second.position);
@@ -978,7 +981,14 @@ void AdoptCachedImage(Texture& t) {
 
 void RetireTexture(Texture* t) {
     ForgetImageHolder(t); // (cached or destroyed: either way no longer a holder)
-    if (!t->image || !t->gpu_written) { DestroyLater(t); return; }
+    // (uploaded ones too, since 2026-11-19: the game ends a texture object and makes another over the same memory and
+    // description, and the new one uploaded the same texels again - 687 times in a save load and 20 s of play. Taken
+    // back, its upload's sequence comes along: the game's writes since then still have it uploaded again.
+    // OOT_CACHE_UPLOADED=0: only images the GPU drew into, as before)
+    static const bool uploaded_too = [] { const char* e = std::getenv("OOT_CACHE_UPLOADED"); return !e || e[0] != '0'; }();
+    // (not on a small card: there the cached images took the room the render targets need - Castle Town on a 4 GB-like
+    // card 23.6 -> 21 fps, more of them in shared memory)
+    if (!t->image || !(t->gpu_written || (uploaded_too && !SmallCard() && t->uploaded && t->storage && t->samples == 1))) { DestroyLater(t); return; }
     std::lock_guard lock{cache_mutex};
     const ImageKey key = KeyOf(*t);
     auto it=image_cache.find(key);
