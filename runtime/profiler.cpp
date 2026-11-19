@@ -215,7 +215,7 @@ void StartProfiler() {
 } // namespace rt
 #elif defined(_WIN32)
 // Windows: OOT_PROFILE_WALL=<thread name> (nvn-exec: the renderer's thread) samples that thread in wall-clock time,
-// a thousand times a second: the thread is stopped for a moment, its call chain read from the unwind tables, and
+// a thousand times a second: the thread is stopped for a moment, its call chain read from its stack, and
 // every 10 s the chains are written to <data>/profile-<n>.txt as "<count> <module>+<offset> <module>+<offset> ..."
 // (innermost first), the most frequent first. Offsets are within each module, so a build of the same source with
 // debug information names them (llvm-symbolizer --obj=tootr.exe --relative-address). OOT_PROFILE_WALL_DELAY=<s>:
@@ -260,6 +260,10 @@ void Sampler(std::string name) {
     if (!thread) { RT_LOG("profiler: no thread named %s", name.c_str()); return; }
     RT_LOG("profiler: sampling thread %s in wall-clock time, 1000 times a second; reports every 10 s in the data directory", name.c_str());
     std::map<std::vector<DWORD64>, unsigned long long> chains;
+    // (this program's code: where return addresses on the stack point)
+    const auto* image = reinterpret_cast<const unsigned char*>(GetModuleHandleW(nullptr));
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(image + reinterpret_cast<const IMAGE_DOS_HEADER*>(image)->e_lfanew);
+    const DWORD64 code_begin = reinterpret_cast<DWORD64>(image) + nt->OptionalHeader.BaseOfCode, code_size = nt->OptionalHeader.SizeOfCode;
     auto written = std::chrono::steady_clock::now(); int file = 0;
     unsigned long long random = 0x9e3779b97f4a7c15ull;
     for (;;) {
@@ -269,18 +273,19 @@ void Sampler(std::string name) {
         std::vector<DWORD64> chain;
         if (SuspendThread(thread) != (DWORD)-1) {
             CONTEXT context{}; context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+            // (the call chain read from the stack, not unwound: the system's unwinder, run on a thread stopped anywhere -
+            // inside the graphics driver too - read a bad address now and then and ended the game. The stack's words that
+            // point into this program's code are its return addresses, give or take a stale one: the innermost frames
+            // first. Only the stack's own committed pages are read.)
             if (GetThreadContext(thread, &context)) {
-                for (int depth = 0; depth < 28 && context.Rip; ++depth) {
-                    chain.push_back(context.Rip);
-                    DWORD64 image = 0;
-                    // (no allocation and no lock of ours while the thread is stopped: it may hold the heap's)
-                    const PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &image, nullptr);
-                    if (!function) { // (a leaf: its return address is on top of the stack)
-                        if (IsBadReadPtr(reinterpret_cast<void*>(context.Rsp), 8)) break;
-                        context.Rip = *reinterpret_cast<DWORD64*>(context.Rsp); context.Rsp += 8; continue;
+                chain.push_back(context.Rip);
+                MEMORY_BASIC_INFORMATION info{};
+                if (VirtualQuery(reinterpret_cast<void*>(context.Rsp), &info, sizeof info) && info.State == MEM_COMMIT && !(info.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+                    const DWORD64 end = std::min<DWORD64>(reinterpret_cast<DWORD64>(info.BaseAddress) + info.RegionSize, context.Rsp + 0x8000);
+                    for (DWORD64 at = context.Rsp & ~7ull; at + 8 <= end && chain.size() < 28; at += 8) {
+                        const DWORD64 word = *reinterpret_cast<const DWORD64*>(at);
+                        if (word - code_begin < code_size) chain.push_back(word);
                     }
-                    void* handler_data = nullptr; DWORD64 frame = 0;
-                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, context.Rip, function, &context, &handler_data, &frame, nullptr);
                 }
             }
             ResumeThread(thread);
