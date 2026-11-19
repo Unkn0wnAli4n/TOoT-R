@@ -202,6 +202,7 @@ std::map<ArbiterWaitKey, ArbiterWaitStat> arbiter_wait_stats; // OOT_ARB_PROFILE
 struct ArbiterOp { double t; u64 thread, addr, lr; u32 op, type; s64 value, count; u32 before, after; s32 result; };
 std::unordered_map<u64, std::deque<ArbiterOp>> arbiter_history; // last operations per address; k_lock held
 double ArbNow() { static const auto t0 = Clock::now(); return std::chrono::duration<double>(Clock::now() - t0).count(); }
+bool ArbProfile() { static const bool on = std::getenv("OOT_ARB_PROFILE") != nullptr; return on; } // (once: it was read on every wait)
 void NoteArbiterOp(u32 op, u32 type, u64 addr, s64 value, s64 count, u32 before, s32 result, u64 lr) {
     static const bool on = std::getenv("OOT_ARB_TRACE") != nullptr; if (!on) return;
     auto& h = arbiter_history[addr];
@@ -231,7 +232,7 @@ void StartArbiterWatchdog() {
                 if (AudioUpdateCount) RT_LOG("watchdog: %llu audio renderer updates so far", AudioUpdateCount());
                 std::lock_guard lock{k_lock};
                 const auto now = Clock::now();
-                if (std::getenv("OOT_ARB_PROFILE")) {
+                if (ArbProfile()) {
                     std::vector<std::pair<ArbiterWaitKey, ArbiterWaitStat>> top(arbiter_wait_stats.begin(), arbiter_wait_stats.end());
                     std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.waited > b.second.waited; });
                     RT_LOG("arbiter profile: %zu wait sites", top.size());
@@ -860,14 +861,14 @@ u32 SvcWaitForAddressImpl(Cpu* c) {
     StartArbiterWatchdog();
     const auto wait_start = Clock::now();
     if (!Block(lock, w, Deadline(timeout))) {
-        if (std::getenv("OOT_ARB_PROFILE")) {
+        if (ArbProfile()) {
             const u64 waited = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - wait_start).count();
             auto& stat = arbiter_wait_stats[{addr, c->x[30], current_thread ? current_thread->id : 0, type}]; ++stat.calls; stat.waited += waited; stat.max_waited = std::max(stat.max_waited, waited);
         }
         RemoveAddressWaiter(&w);
         return ResultTimedOut;
     }
-    if (std::getenv("OOT_ARB_PROFILE")) {
+    if (ArbProfile()) {
         const u64 waited = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - wait_start).count();
         auto& stat = arbiter_wait_stats[{addr, c->x[30], current_thread ? current_thread->id : 0, type}]; ++stat.calls; stat.waited += waited; stat.max_waited = std::max(stat.max_waited, waited);
     }
