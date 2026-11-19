@@ -1021,6 +1021,15 @@ int dlss_fg_frames(VkCommandBuffer cmd, VkImage color, VkImageView color_view, u
     }
     if (g.inputs == g.used || !g.rw) return g.no_inputs++, skip(FG_SKIP_INPUTS);
     g.used = g.inputs;
+    // (TOoT:R) inputs larger than the picture (the scene drawn at 2560x1440 for a 1920x1080 window, no upscaler): DLSS-G
+    // takes depth and motion at most the size of its output. Made that way on a player's RTX 5060 Ti the game froze at
+    // the first made frame, the screen black. The renderer's own frame generation (FSR 3.1's) makes them instead.
+    if (g.rw > w || g.rh > h) {
+        static bool told = false;
+        if (!told) { told = true; logf("vk: DLSS Frame Gen (NGX): the scene (%ux%u) is larger than the picture (%ux%u): FSR 3.1's frame generation makes the frames instead", g.rw, g.rh, w, h); }
+        if (g.feature) fg_release(g);
+        return g.refused++, skip(FG_SKIP_REFUSED);
+    }
     if (g.feature && (g.fw != w || g.fh != h)) fg_release(g);
     if (!g.feature) {
         if (g.create_failures >= 3) return g.refused++, skip(FG_SKIP_REFUSED);
