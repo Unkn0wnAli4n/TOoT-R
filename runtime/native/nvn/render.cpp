@@ -1969,7 +1969,7 @@ struct UniformSlot { u32 write; StageState* stage; u32 bank; };
 thread_local std::vector<UniformSlot> uniform_write_slots;
 // Writes that are one texture whose handle a small program computes from the draw's constants (most of the game's
 // material textures): the fast path evaluates the handle again and patches the write when it names another texture.
-// OOT_FAST_TEXTURES=1 turns it on (off by default).
+// OOT_FAST_TEXTURES=0 turns it off.
 struct TextureSlot { u32 write, read; ShaderVariant* shader; const nvshader::Resource* resource; u32 handle; VkImage image; };
 thread_local std::vector<TextureSlot> texture_write_slots;
 // State that only chooses the pipeline (vertex format, blending, depth and stencil, polygon state): the fast path
@@ -1987,7 +1987,9 @@ thread_local std::vector<StorageSlot> storage_write_slots;
 // Whether the last resolution holds nothing but uniform buffers, driver banks and single textures: what a later draw
 // of the same pipeline can take over whole (ResolveCache below).
 thread_local bool descriptor_cacheable = false;
-bool FastTextures(){static const bool on=std::getenv("OOT_FAST_TEXTURES")!=nullptr;return on;} // (off unless asked for: no frame rate gained on an 8-core CPU, ~2% with two helper threads)
+// (on by default since 2026-11-19: 2-4% more frames with the game held to 6 CPU threads, as on a 6-core laptop, ~1% on 16;
+// pictures the same. OOT_FAST_TEXTURES=0: off)
+bool FastTextures(){static const bool on=[]{const char* e=std::getenv("OOT_FAST_TEXTURES");return !e||e[0]!='0';}();return on;}
 thread_local bool descriptor_fast_eligible = false;
 // Guest ranges [start, end) of the buffers bound by the last WriteDescriptors, and the images it
 // writes: compute dispatches use them to skip barriers between independent dispatches.
