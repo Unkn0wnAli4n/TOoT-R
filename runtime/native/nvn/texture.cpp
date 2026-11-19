@@ -786,7 +786,11 @@ void CreateImage(Texture& t) {
         TrimImageCache(0,false);
         DropSpareImages();
         allocated=vkAllocateMemory(vk.device,&ai,nullptr,&t.memory);
-        if(allocated!=VK_SUCCESS){TrimImageCache(0);allocated=vkAllocateMemory(vk.device,&ai,nullptr,&t.memory);}
+        // (not the small images the GPU drew once as a last resort any more: they are not in the game's memory, and evicted they
+        // came back as other textures - a 4 GB card's map covered with flying HUD pieces for seconds. Memory shared with the
+        // system, below, takes the image instead. OOT_EVICT_SMALL_LAST=1: as before.)
+        {static const bool old_way=std::getenv("OOT_EVICT_SMALL_LAST")!=nullptr;
+         if(allocated!=VK_SUCCESS&&old_way){TrimImageCache(0);allocated=vkAllocateMemory(vk.device,&ai,nullptr,&t.memory);}}
         if(allocated!=VK_SUCCESS){NoteDeviceFull();ai.memoryTypeIndex=FindMemoryType(req.memoryTypeBits,0);allocated=vkAllocateMemory(vk.device,&ai,nullptr,&t.memory);
             if(allocated==VK_SUCCESS){++images_in_shared_memory;static std::atomic<u32> told{0};if(told++<20)RT_LOG("texture placed in non-device-local memory");}}
     }
