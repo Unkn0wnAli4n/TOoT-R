@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -553,6 +554,44 @@ void ToolRows(const char*& help) {
 }
 
 void AchievementsTab(const char*& help);
+// The Mods tab: the folders in <data>/mods (OOT_MODS: another folder), each switched on or off - a folder whose name starts
+// with '_' is left out by the loader (fs.cpp AddMods), so switching renames it. Takes effect at the next start.
+void ModsTab(const char*& help) {
+    namespace sfs = std::filesystem;
+    const char* env = std::getenv("OOT_MODS");
+    const sfs::path root = env && *env ? sfs::path(env) : sfs::path(rt::DataDir()) / "mods";
+    std::error_code ec;
+    sfs::create_directories(root, ec);
+    ImGui::TextWrapped("Mods made for the game's files (a folder with romfs inside, as emulators use) go in the mods folder. Switch them on or off here; changes apply the next time the game starts.");
+    if (ImGui::Button("Open Mods Folder")) {
+        std::string url = "file://" + root.generic_string();
+#ifdef _WIN32
+        url = "file:///" + root.generic_string();
+#endif
+        SDL_OpenURL(url.c_str());
+    }
+    if (ImGui::IsItemHovered() || ImGui::IsItemFocused()) help = "Opens the folder mods go in.";
+    ImGui::Separator();
+    std::vector<sfs::path> folders;
+    for (const auto& e : sfs::directory_iterator(root, sfs::directory_options::skip_permission_denied, ec)) if (e.is_directory(ec)) folders.push_back(e.path());
+    std::sort(folders.begin(), folders.end(), [](const sfs::path& a, const sfs::path& b) {
+        auto key = [](const sfs::path& p) { std::string n = p.filename().string(); return n.empty() || (n[0] != '_' && n[0] != '-') ? n : n.substr(1); };
+        return key(a) < key(b); });
+    if (folders.empty()) ImGui::TextDisabled("No mods yet.");
+    for (const sfs::path& folder : folders) {
+        const std::string name = folder.filename().string();
+        const bool off = !name.empty() && (name[0] == '_' || name[0] == '-');
+        const std::string shown = off ? name.substr(1) : name;
+        bool on = !off;
+        if (ImGui::Checkbox((shown + "##mod").c_str(), &on)) {
+            const sfs::path to = folder.parent_path() / (on ? shown : "_" + name);
+            sfs::rename(folder, to, ec);
+            if (ec) RT_LOG("mods: %s could not be renamed (%s)", name.c_str(), ec.message().c_str());
+            else restart_notice = true;
+        }
+        if (ImGui::IsItemHovered() || ImGui::IsItemFocused()) help = "On: the mod's files replace the game's at the next start. Mods whose folder names sort later win where two change the same file.";
+    }
+}
 void Window(bool appeared) {
     const float scale = ImGui::GetStyle().FramePadding.y / 3.0f;
     const ImVec2 display = ImGui::GetIO().DisplaySize;
@@ -583,6 +622,7 @@ void Window(bool appeared) {
         page("Hacks", [&] { SettingRows([](const char* section) { return !std::strcmp(section, "Hacks"); }, help); });
         page("Controller", [&] { ControllerTab(help); });
         page("Keyboard & Mouse", [&] { KeyboardTab(help); });
+        page("Mods", [&] { ModsTab(help); });
         page("Achievements", [&] { AchievementsTab(help); });
         ImGui::EndTabBar();
     }
