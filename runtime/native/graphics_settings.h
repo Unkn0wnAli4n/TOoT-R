@@ -42,6 +42,8 @@ struct Settings {
     int hud_edges = 1;       // on a picture wider than 16:9: 1 the HUD's side groups at the screen's edges, 0 in the middle 16:9
     int upscaler = 0;        // what makes the picture from the 3D scene: 0 the game's own network, 1 NVIDIA DLSS (DLAA at Upscaler Quality Native), 3 AMD FSR 3.1, 4 AMD FSR 4, 6 none (a plain stretch), 7 none + FXAA
     int upscale_quality = 0; // (older files only: the step of the Upscaler Quality row, now a share on the Render Resolution row - Sanitized)
+    int neural_render = 0;   // NVIDIA DLSS 5 neural rendering after the upscale: 0 off, 1 on (only in builds with its SDK: nvn/neural_render.cpp)
+    int neural_strength = 50; // its Structure / Tone Intensity, percent (0..100)
     int dlss_model = 0;      // DLSS's network: 0 the default (K), 1 K, 2 M, 3 L (Longshot's upscaler_rows.h)
     int frame_gen = 0;       // frames shown for each of the game's: 0 off, 2, 3, 4, 6, 7 dynamic (up to the display's refresh rate)
     int frame_gen_by = 0;    // who makes those frames: 0 auto (NVIDIA DLSS Frame Generation where it runs, else AMD FSR 3.1's), 1 AMD FSR 3.1

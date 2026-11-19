@@ -97,6 +97,8 @@ int env_fsr4() { static const int v = env_switch("RX_VK_FSR4"); return v; }
 int env_xess() { static const int v = xess_rules::env_mode(getenv("RX_VK_XESS")); return v; }
 }  // namespace
 
+NeuralStageFn neural_stage = nullptr;
+
 bool temporal_env_chosen() {
     // (only where the engine asked for runs: else a saved FSR 3.1 stays, not the game's own. DLSS before FSR 4 before XeSS,
     // as below)
@@ -1448,6 +1450,8 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
     // (NVIDIA DLSS Frame Generation through NGX, vk_dlss.cpp: this frame's depth, motion and camera for the present's made
     // frames. Nothing unless the run asked for it)
     dlss_fg_inputs(cmd, f, cam.projection, cam.current, cam.jitter, motion);
+    // (TOoT:R) the stage after the upscale, if the runtime set one (vk_temporal.h neural_stage)
+    if (neural_stage) neural_stage(cmd, f, motion);
     // (longshot) and AMD FSR 3.1's frame interpolation: this motion, the skinned draws' own in it, over the camera's alone that
     // its own inputs made at this dispatch (vk_fsr3_inputs.h take_motion). Nothing unless it is asked for
     if (motion && fsr3fi::frames_wanted()) (void)fsr3_inputs::take_motion(cmd, f.motion.image, rw, rh);

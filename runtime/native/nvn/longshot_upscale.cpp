@@ -30,6 +30,7 @@
 struct LsAllocation { VkDeviceMemory memory = VK_NULL_HANDLE; u64 size = 0; void* mapped = nullptr; bool coherent = true; };
 
 namespace nvn { bool LsReadSubmitted(u64 address, void* dst, u64 size); } // (render.cpp)
+namespace nvn::neural { void Install(); bool Available(); } // (neural_render.cpp)
 
 namespace mkwvk {
 Device dev;
@@ -188,6 +189,7 @@ void Start() {
         d.push_descriptor = vk.push_descriptor_set != nullptr; d.max_push_descriptors = vk.max_push_descriptors;
         d.subgroup_max = vk.subgroup_max ? vk.subgroup_max : 32; d.subgroup_size = d.subgroup_max;
         d.vk12.bufferDeviceAddress = VK_TRUE; d.vk13.synchronization2 = VK_TRUE; d.vk13.dynamicRendering = VK_TRUE;
+        nvn::neural::Install(); // (DLSS 5's stage after the upscale, in builds that have it: neural_render.cpp)
     });
 }
 mkwvk::Texture* Texture(nvn::Texture& t) {

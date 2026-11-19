@@ -28,6 +28,7 @@ constexpr Field fields[] = {
     {"show_fps", &Settings::show_fps}, {"ai_upscaler", &Settings::ai_upscaler}, {"volume", &Settings::volume},
     {"anti_aliasing", &Settings::anti_aliasing}, {"aspect", &Settings::aspect}, {"shadow_quality", &Settings::shadow_quality},
     {"foliage_shadows", &Settings::foliage_shadows}, {"fov", &Settings::fov}, {"text_speed", &Settings::text_speed},
+    {"neural_render", &Settings::neural_render}, {"neural_strength", &Settings::neural_strength},
     {"camera_speed", &Settings::camera_speed}, {"mute_background", &Settings::mute_background}, {"occlusion", &Settings::occlusion}, {"probe_rate", &Settings::probe_rate}, {"skip_opening", &Settings::skip_opening}, {"hud_edges", &Settings::hud_edges}, {"hdr", &Settings::hdr}, {"upscaler", &Settings::upscaler}, {"dlss_model", &Settings::dlss_model}, {"upscale_quality", &Settings::upscale_quality}, {"cheat_health", &Settings::cheat_health}, {"cheat_rupees", &Settings::cheat_rupees}, {"cheat_magic", &Settings::cheat_magic}, {"game_speed", &Settings::game_speed}, {"audio_device", &Settings::audio_device}, {"output_height", &Settings::output_height}, {"gpu", &Settings::gpu}, {"low_latency", &Settings::low_latency}, {"text_size", &Settings::text_size}, {"fps_corner", &Settings::fps_corner}, {"language", &Settings::language}, {"move_speed", &Settings::move_speed}, {"autosave", &Settings::autosave}, {"damage_taken", &Settings::damage_taken}, {"frame_gen", &Settings::frame_gen}, {"frame_gen_by", &Settings::frame_gen_by}, {"smooth_motion", &Settings::smooth_motion}, {"hdr_peak", &Settings::hdr_peak}, {"hdr_paper", &Settings::hdr_paper}, {"hdr_boost", &Settings::hdr_boost},
 };
 
@@ -82,7 +83,7 @@ Settings Sanitized(Settings s) {
     s.hud_edges = s.hud_edges ? 1 : 0;
     s.frame_gen = s.frame_gen == 2 || s.frame_gen == 3 || s.frame_gen == 4 || s.frame_gen == 6 || s.frame_gen == 7 ? s.frame_gen : 0; s.smooth_motion = s.smooth_motion ? 1 : 0;
     s.cheat_health = !!s.cheat_health; s.cheat_rupees = !!s.cheat_rupees; s.cheat_magic = !!s.cheat_magic; s.game_speed = std::clamp(s.game_speed, 25, 300); s.audio_device = std::clamp(s.audio_device, 0, 16); s.output_height = std::clamp(s.output_height, 0, 4320); s.gpu = std::clamp(s.gpu, 0, 8); s.low_latency = std::clamp(s.low_latency, 0, 2); s.text_size = std::clamp(s.text_size, 100, 175); s.fps_corner = std::clamp(s.fps_corner, 0, 3); s.language = std::clamp(s.language, 0, 15); s.move_speed = std::clamp(s.move_speed, 100, 400); s.autosave = std::clamp(s.autosave, 0, 1); s.damage_taken = std::clamp(s.damage_taken, 0, 4);
-    s.upscaler = std::clamp(s.upscaler, 0, 7); s.dlss_model = std::clamp(s.dlss_model, 0, 3); s.upscale_quality = std::clamp(s.upscale_quality, 0, 5);
+    s.upscaler = std::clamp(s.upscaler, 0, 7); s.dlss_model = std::clamp(s.dlss_model, 0, 3); s.neural_render = s.neural_render ? 1 : 0; s.neural_strength = std::clamp(s.neural_strength, 0, 100); s.upscale_quality = std::clamp(s.upscale_quality, 0, 5);
     s.hdr = s.hdr ? 1 : 0; s.hdr_peak = std::clamp(s.hdr_peak, 300, 4000); s.hdr_paper = std::clamp(s.hdr_paper, 80, 500); s.hdr_boost = std::clamp(s.hdr_boost, 0, 100);
     s.probe_rate = s.probe_rate >= 4 ? 4 : s.probe_rate >= 2 ? 2 : 1;
     return s;

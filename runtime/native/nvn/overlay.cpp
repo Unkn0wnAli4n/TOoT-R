@@ -38,6 +38,7 @@
 bool ReadRomFile(const std::string& path, std::vector<unsigned char>& out); // fs.cpp
 
 namespace nvn { void VideoMemoryNow(u64* used, u64* budget); const std::vector<std::string>& GpuNames(); }
+namespace nvn::neural { bool Available(); } // (neural_render.cpp)
 namespace nvn::overlay {
 namespace {
 
@@ -114,7 +115,7 @@ std::vector<Choice> Percents(std::initializer_list<int> values) { static std::de
     for (int v : values) { names.push_back(std::to_string(v) + "%"); c.push_back({names.back().c_str(), v}); } return c; }
 const std::vector<Row>& Rows() {
     using S = gfx::Settings;
-    static const std::vector<Row> rows = {
+    static const std::vector<Row> rows = [] { std::vector<Row> all = {
         {"", "Preset", &S::preset, {{"Original", gfx::PresetOriginal}, {"Steam Deck", gfx::PresetDeck}, {"Low", gfx::PresetLow}, {"Medium", gfx::PresetMedium}, {"High", gfx::PresetHigh}, {"Ultra", gfx::PresetUltra}, {"Custom", gfx::PresetCustom}},
          "Original is the game as it ships. Steam Deck and Low use the handheld profile, a fixed lower scene resolution, small shadow maps and a fast anti-aliasing filter.", false, false},
 
@@ -183,6 +184,14 @@ const std::vector<Row>& Rows() {
         {"Audio", "Volume", &S::volume, Percents({0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100}), "The game's master volume.", false, false},
         {"Audio", "Mute in Background", &S::mute_background, {{"Off", 0}, {"On", 1}}, "No sound while another window has the focus.", false, false},
     };
+    // (NVIDIA DLSS 5 neural rendering: only where a build has its SDK and the GPU runs it - neural_render.cpp)
+    if (nvn::neural::Available()) {
+        size_t at = 0; while (at < all.size() && all[at].member != &S::dlss_model) ++at;
+        all.insert(all.begin() + std::min(at + 1, all.size()), {
+            {"Resolution and anti-aliasing", "DLSS 5 Neural Rendering", &S::neural_render, {{"Off", 0}, {"On", 1}}, "NVIDIA's neural rendering after the upscale: richer lighting and materials, on GeForce RTX 50 GPUs. The HUD is not touched.", false, false},
+            {"Resolution and anti-aliasing", "Neural Rendering Strength", &S::neural_strength, Percents({0, 25, 50, 75, 100}), "How strongly DLSS 5 changes the picture.", false, false}});
+    }
+    return all; }();
     return rows;
 }
 int ValueIndex(const gfx::Settings& s, int r) {

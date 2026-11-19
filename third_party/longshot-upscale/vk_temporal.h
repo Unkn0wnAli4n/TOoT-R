@@ -121,6 +121,11 @@ struct TemporalFrame {
     /// else that reads this frame's depth (frame generation, other passes) must look here, not assume the plain depth
     bool depth_reversed = false;
 };
+/// (TOoT:R) a stage after the upscale, on the finished picture before the game draws its HUD over it: frame.output holds
+/// the picture (GENERAL layout, written by a compute dispatch just before), with this frame's colour, depth and motion
+/// (motion: whether frame.motion was made this frame). Null: none. Set by the runtime (runtime/native/nvn/neural_render.cpp)
+using NeuralStageFn = void (*)(VkCommandBuffer cmd, const TemporalFrame& frame, bool motion);
+extern NeuralStageFn neural_stage;
 /// An engine: plain functions, each called with the chain's lock held, on the recording thread
 struct TemporalEngine {
     const char* name;           // (for the log and the status line: "NVIDIA DLSS", "AMD FSR 4")
