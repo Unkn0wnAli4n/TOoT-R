@@ -237,6 +237,10 @@ const char* SymbolAt(unsigned long long rva, unsigned long long* offset_out) {
     if (offset_out) *offset_out = rva - table[lo].rva;
     return table[lo].name.c_str();
 }
+void NamedThreads(std::vector<std::pair<std::string, void*>>& out) {
+    const unsigned count = std::min(named_thread_count.load(), 256u);
+    for (unsigned i = 0; i < count; ++i) if (named_threads[i].handle) out.push_back({named_threads[i].name, named_threads[i].handle});
+}
 void* ThreadByName(const char* name) {
     const unsigned count = std::min(named_thread_count.load(), 256u);
     for (unsigned i = count; i-- > 0;) if (!std::strcmp(named_threads[i].name, name) && named_threads[i].handle) return named_threads[i].handle;

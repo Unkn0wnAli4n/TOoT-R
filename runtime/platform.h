@@ -7,6 +7,9 @@
 // Shared (file-backed) mappings are not provided; kernel.cpp handles their one use separately.
 #pragma once
 #include <string>
+#include <utility>
+#include <vector>
+#include <string>
 
 #ifdef _WIN32
 #include <cstddef>
@@ -74,6 +77,7 @@ bool SetThreadNice(int thread_id, int nice);
 // there is no such file. offset_out: how far into the function.
 const char* SymbolAt(unsigned long long rva, unsigned long long* offset_out);
 void* ThreadByName(const char* name); // (the profiler: a handle of the last thread that took that name; null when none)
+void NamedThreads(std::vector<std::pair<std::string, void*>>& out); // (every named thread: its name and a handle)
 #endif
 // Sleeps of the length asked for. Windows wakes a sleeping thread only on its timer tick, 15.6 ms apart unless a
 // program asks for finer, and its Sleep counts whole milliseconds: the game's job system waits for its workers in
@@ -84,5 +88,7 @@ void* ThreadByName(const char* name); // (the profiler: a handle of the last thr
 void SleepNs(long long nanoseconds);
 // The PC's memory, as text for the log ("PC memory 10.3 GiB free of 31.2").
 std::string SystemMemoryNote();
+// Every thread's call chain into the log (profiler.cpp; a freeze: nvn/present.cpp's watchdog).
+void DumpThreadStacks(const char* why);
 void SleepUntilNs(long long steady_clock_nanoseconds); // (a std::chrono::steady_clock time since its epoch)
 } // namespace rt

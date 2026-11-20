@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -212,6 +213,46 @@ void StartProfiler() {
     setitimer(ITIMER_PROF, &timer, nullptr);
     RT_LOG("profiler: sampling CPU time at 2 kHz; reports every 10 s in the data directory");
 }
+
+// A freeze (nvn/present.cpp's watchdog: no picture for a while): every thread's call chain into the log, as offsets in
+// the executable (addr2line -f -C -e tootr <offsets>), so a log sent after a freeze says where each thread waits. No
+// signal is sent (one interrupted the game's own waits, and the game failed on the early return): a thread blocked in
+// the system shows its instruction and stack pointers in /proc, and the words on its stack that point into this
+// program's code are its return addresses, give or take a stale one, the innermost first.
+void DumpThreadStacks(const char* why) {
+    if (!base) { Dl_info info{}; if (dladdr(reinterpret_cast<void*>(&DumpThreadStacks), &info)) { base = reinterpret_cast<uintptr_t>(info.dli_fbase); text_end = base + (512ull << 20); } }
+    static std::mutex one; std::lock_guard lock{one};
+    std::vector<int> tids;
+    if (DIR* d = opendir("/proc/self/task")) { while (dirent* e = readdir(d)) if (const int tid = std::atoi(e->d_name); tid > 0) tids.push_back(tid); closedir(d); }
+    std::vector<std::pair<uintptr_t, uintptr_t>> readable; // (the process's readable regions: a scan stays inside the stack's own)
+    if (FILE* f = std::fopen("/proc/self/maps", "r")) { char l[512]; while (std::fgets(l, sizeof l, f)) { unsigned long a = 0, b = 0; char perm[8] = "";
+        if (std::sscanf(l, "%lx-%lx %7s", &a, &b, perm) == 3 && perm[0] == 'r') readable.push_back({a, b}); } std::fclose(f); }
+    RT_LOG("freeze: %s; the threads' call chains (%zu threads):", why, tids.size());
+    for (const int tid : tids) {
+        char path[64], name[32] = "?", call[256] = "";
+        std::snprintf(path, sizeof path, "/proc/self/task/%d/comm", tid);
+        if (FILE* f = std::fopen(path, "r")) { if (std::fgets(name, sizeof name, f)) name[std::strcspn(name, "\n")] = 0; std::fclose(f); }
+        std::snprintf(path, sizeof path, "/proc/self/task/%d/syscall", tid);
+        if (FILE* f = std::fopen(path, "r")) { if (!std::fgets(call, sizeof call, f)) call[0] = 0; std::fclose(f); }
+        // ("<nr> <six arguments> <sp> <pc>", or "running")
+        unsigned long long v[9]{}; long nr = -1;
+        const int got = std::sscanf(call, "%ld %llx %llx %llx %llx %llx %llx %llx %llx", &nr, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]);
+        std::string line;
+        if (got == 9) {
+            const uintptr_t sp = (uintptr_t)v[6], pc = (uintptr_t)v[7];
+            char t[48]; std::snprintf(t, sizeof t, " [system call %ld]", nr); line += t;
+            line += ' '; line += Off(pc);
+            int n = 0;
+            uintptr_t end = 0;
+            for (auto& [a, b] : readable) if (sp >= a && sp < b) { end = std::min<uintptr_t>(b, sp + 0x8000); break; }
+            for (uintptr_t at = sp & ~uintptr_t(7); at + 8 <= end && n < Depth; at += 8) {
+                uintptr_t word; std::memcpy(&word, reinterpret_cast<const void*>(at), 8);
+                if (word > base && word < text_end) { line += ' '; line += Off(word); ++n; }
+            }
+        } else line = " (running)";
+        RT_LOG("freeze:   %s (%d):%s", name, tid, line.c_str());
+    }
+}
 } // namespace rt
 #elif defined(_WIN32)
 // Windows: OOT_PROFILE_WALL=<thread name> (nvn-exec: the renderer's thread) samples that thread in wall-clock time,
@@ -228,6 +269,7 @@ void StartProfiler() {
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -327,7 +369,38 @@ void Sampler(std::string name) {
 void StartProfiler() {
     if (const char* wall = std::getenv("OOT_PROFILE_WALL")) std::thread(Sampler, std::string(wall)).detach();
 }
+
+void DumpThreadStacks(const char* why) {
+    static std::mutex one; std::lock_guard lock{one};
+    const auto* image = reinterpret_cast<const unsigned char*>(GetModuleHandleW(nullptr));
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(image + reinterpret_cast<const IMAGE_DOS_HEADER*>(image)->e_lfanew);
+    const DWORD64 code_begin = reinterpret_cast<DWORD64>(image) + nt->OptionalHeader.BaseOfCode, code_size = nt->OptionalHeader.SizeOfCode;
+    std::vector<std::pair<std::string, void*>> threads; NamedThreads(threads);
+    RT_LOG("freeze: %s; the threads' call chains (%zu named threads; offsets: llvm-symbolizer --obj=tootr.exe --relative-address):", why, threads.size());
+    const HANDLE self = GetCurrentThread(); const DWORD self_id = GetCurrentThreadId();
+    for (auto& [name, handle] : threads) {
+        HANDLE thread = static_cast<HANDLE>(handle);
+        if (GetThreadId(thread) == self_id) continue; (void)self;
+        std::string line;
+        if (SuspendThread(thread) == (DWORD)-1) continue;
+        CONTEXT context{}; context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER; std::vector<DWORD64> chain;
+        if (GetThreadContext(thread, &context)) {
+            chain.push_back(context.Rip);
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(reinterpret_cast<void*>(context.Rsp), &info, sizeof info) && info.State == MEM_COMMIT && !(info.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+                const DWORD64 end = std::min<DWORD64>(reinterpret_cast<DWORD64>(info.BaseAddress) + info.RegionSize, context.Rsp + 0x8000);
+                for (DWORD64 at = context.Rsp & ~7ull; at + 8 <= end && chain.size() < 20; at += 8) {
+                    const DWORD64 word = *reinterpret_cast<const DWORD64*>(at);
+                    if (word - code_begin < code_size) chain.push_back(word);
+                }
+            }
+        }
+        ResumeThread(thread);
+        for (DWORD64 pc : chain) { line += ' '; line += ModuleOffset(pc); }
+        RT_LOG("freeze:   %s:%s", name.c_str(), line.c_str());
+    }
+}
 } // namespace rt
 #else
-namespace rt { void StartProfiler() {} }
+namespace rt { void StartProfiler() {} void DumpThreadStacks(const char*) {} }
 #endif

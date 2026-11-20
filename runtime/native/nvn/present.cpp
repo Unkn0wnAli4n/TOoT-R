@@ -689,8 +689,37 @@ void FgPost(int slot, int made, double interval) {
 float ShownFps() { return fgp.shown_fps.load(std::memory_order_relaxed); }
 std::atomic<float> cost_gpu{0}, cost_record{0}, cost_submits{0};
 FrameCosts LastFrameCosts() { return {cost_gpu.load(std::memory_order_relaxed), cost_record.load(std::memory_order_relaxed), cost_submits.load(std::memory_order_relaxed)}; }
+// A freeze: no picture for 10 s while the game runs (a hang after a load, seen with Frame Generation and without) left a
+// log that ended mid-sentence. A watchdog now writes every thread's call chain to the log when that happens (three
+// times at most in a run, again only after pictures came back), so the log sent after a freeze says where each one
+// waits. OOT_NO_FREEZE_WATCH=1: off; OOT_FREEZE_WATCH_SECS=<s>: another time (10).
+std::atomic<u64> pictures_presented{0};
+void StartFreezeWatch() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        if (std::getenv("OOT_NO_FREEZE_WATCH")) return;
+        std::thread([] {
+            rt::SetThreadName("freeze-watch");
+            static const int after = std::getenv("OOT_FREEZE_WATCH_SECS") ? std::max(1, std::atoi(std::getenv("OOT_FREEZE_WATCH_SECS"))) : 10;
+            u64 seen = pictures_presented.load(); int still = 0, told = 0; bool armed = true;
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                const u64 now = pictures_presented.load();
+                if (now != seen) { seen = now; still = 0; armed = true; continue; }
+                if (++still >= after && armed && told < 3) {
+                    armed = false; ++told;
+                    char why[96]; std::snprintf(why, sizeof why, "no picture shown for %d s (after %llu)", still, (unsigned long long)now);
+                    rt::DumpThreadStacks(why);
+                }
+            }
+        }).detach();
+    });
+}
 void PresentWindowTexture(u64 window, s32 index) {
     rt::CoreRelease release; // waits on the swapchain
+    { const u64 n = pictures_presented.fetch_add(1, std::memory_order_relaxed) + 1; StartFreezeWatch();
+      static const u64 test_at = std::getenv("OOT_TEST_STACKS_AT") ? std::strtoull(std::getenv("OOT_TEST_STACKS_AT"), nullptr, 10) : 0; // (test: the dump at that picture)
+      if (test_at && n == test_at) std::thread([] { rt::DumpThreadStacks("a test (OOT_TEST_STACKS_AT)"); }).detach(); }
     if (nvn::TimelineOn()) RT_LOG("T %.2f present", nvn::TimelineMs());
     { 
 #ifdef __linux__
