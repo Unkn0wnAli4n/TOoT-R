@@ -746,7 +746,7 @@ bool CopyEligible(const Pool& p) {
 // texture data never get one). Earlier work of the open batch may have used the imported pages;
 // a copy recorded here carries their contents over.
 bool CreateDeviceCopy(Pool& p) {
-    // (a sixth of the card's own memory, at most 3 GiB: the fixed 3 GiB let a 4 GB card give 1 GiB to these copies
+    // (a sixth of the card's own memory (a twelfth under 6 GB), at most 3 GiB: the fixed 3 GiB let a 4 GB card give 1 GiB to these copies
     // while its textures no longer fitted. Pools past the budget are used where they are, as on shared-memory GPUs.
     // OOT_POOL_COPY_MB=<n>: the budget.)
     static const u64 Budget = []() -> u64 {
@@ -754,7 +754,10 @@ bool CreateDeviceCopy(Pool& p) {
         auto& vk = Vk(); u64 local = 0;
         for (u32 h = 0; h < vk.memory_properties.memoryHeapCount; ++h) if (vk.memory_properties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) local = std::max<u64>(local, vk.memory_properties.memoryHeaps[h].size);
         local -= std::min(local, test_vram_hog_bytes); // (OOT_TEST_VRAM_HOG_MB: as the smaller card it stands for)
-        const u64 budget = std::min<u64>(3ull << 30, local / 6);
+        // (under 6 GB a twelfth: on a 4 GB card the sixth, 680 MiB, left its render targets no room after an area change,
+        // and those went to the shared memory - Hyrule Field at 59-80 fps, GPU 12-15 ms; with 340 MiB 91-113 fps, GPU 7-9 ms,
+        // with the settings of a 4 GB laptop. 200 MiB was slower again: GPU 10-11 ms.)
+        const u64 budget = std::min<u64>(3ull << 30, local < (6ull << 30) ? local / 12 : local / 6);
         RT_LOG("memory pools: up to %llu MiB of device copies (video memory %llu MiB)", (unsigned long long)(budget >> 20), (unsigned long long)(local >> 20));
         return budget; }();
     if (mirrored_bytes + p.import_size > Budget) { p.copy_failed = true; return false; }
