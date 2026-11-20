@@ -210,6 +210,21 @@ struct BcEncoder {
     VkBuffer out = VK_NULL_HANDLE; VkDeviceMemory out_memory = VK_NULL_HANDLE; bool fresh = true;
 } bc_encoder;
 constexpr u32 BcScratchDim = 2048;
+// The encoder is made at the first big texture, which on a 4 GB card can be when its memory is full (a load in Kokiri
+// ended the game there: vkAllocateMemory out of device memory). Its scratch then goes to the shared memory (slower,
+// but only while textures are encoded).
+VkResult AllocateOrShared(VkMemoryAllocateInfo ai, u32 type_bits, VkDeviceMemory* out, const char* what) {
+    auto& vk = Vk();
+    VkResult r = vkAllocateMemory(vk.device, &ai, nullptr, out);
+    if (r != VK_ERROR_OUT_OF_DEVICE_MEMORY) return r;
+    const u32 shared = FindMemoryType(type_bits, 0);
+    if (shared == ai.memoryTypeIndex) return r;
+    ai.memoryTypeIndex = shared;
+    r = vkAllocateMemory(vk.device, &ai, nullptr, out);
+    RT_LOG("textures: the card's memory is full: %s (%llu MiB) is in the shared memory%s", what,
+           (unsigned long long)(ai.allocationSize >> 20), r == VK_SUCCESS ? "" : ", and that failed too");
+    return r;
+}
 void EnsureBcEncoder() {
     auto& vk = Vk(); auto& e = bc_encoder;
     if (e.pipeline) return;
@@ -234,7 +249,7 @@ void EnsureBcEncoder() {
     VkMemoryRequirements req; vkGetImageMemoryRequirements(vk.device, e.scratch, &req);
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize = req.size;
     ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    VK_CHECK(vkAllocateMemory(vk.device, &ai, nullptr, &e.scratch_memory)); VK_CHECK(vkBindImageMemory(vk.device, e.scratch, e.scratch_memory, 0));
+    VK_CHECK(AllocateOrShared(ai, req.memoryTypeBits, &e.scratch_memory, "the BC3 encoder's scratch image")); VK_CHECK(vkBindImageMemory(vk.device, e.scratch, e.scratch_memory, 0));
     VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO}; vi.image = e.scratch; vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     vi.format = VK_FORMAT_R8G8B8A8_UNORM; vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     VK_CHECK(vkCreateImageView(vk.device, &vi, nullptr, &e.scratch_view));
@@ -243,7 +258,7 @@ void EnsureBcEncoder() {
     VK_CHECK(TracedCreateBuffer(&bi,&e.out,__FILE__,__LINE__));
     vkGetBufferMemoryRequirements(vk.device, e.out, &req); ai.allocationSize = req.size;
     ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    VK_CHECK(vkAllocateMemory(vk.device, &ai, nullptr, &e.out_memory)); VK_CHECK(vkBindBufferMemory(vk.device, e.out, e.out_memory, 0));
+    VK_CHECK(AllocateOrShared(ai, req.memoryTypeBits, &e.out_memory, "the BC3 encoder's block buffer")); VK_CHECK(vkBindBufferMemory(vk.device, e.out, e.out_memory, 0));
     RT_LOG("textures: big ASTC textures are kept as BC3, re-encoded on the GPU (OOT_ASTC_RGBA8=1: as RGBA8)");
 }
 void FullBarrier(VkCommandBuffer cmd) {
