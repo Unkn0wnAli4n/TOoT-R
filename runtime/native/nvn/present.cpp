@@ -19,6 +19,7 @@ extern "C" volatile unsigned long long oot_dynres_context;
 
 #include <thread>
 #include <chrono>
+#include <ctime>
 #include <cstdio>
 #include <cstdlib>
 #include <utility>
@@ -95,6 +96,33 @@ void EnsureDumpBuffer(VkDeviceSize size) {
     dump.size = size;
 }
 
+// F12: a screenshot of the presented picture (the HUD in, the settings window and the FPS counter out when they are
+// hidden), written as a PNG to <data>/screenshots by a thread of its own, so the game does not wait for the file.
+std::atomic<bool> screenshot_asked{false};
+void WritePng(std::string path, u32 w, u32 h, std::vector<u8> bgra) {
+    // (uncompressed: zlib's stored blocks - a 1080p picture is 6 MiB - written as the image is, no library needed)
+    static u32 table[256]; static std::once_flag once;
+    std::call_once(once, [] { for (u32 n = 0; n < 256; ++n) { u32 c = n; for (int k = 0; k < 8; ++k) c = c & 1 ? 0xedb88320u ^ (c >> 1) : c >> 1; table[n] = c; } });
+    const auto crc = [&](const u8* d, size_t n, u32 c) { for (size_t i = 0; i < n; ++i) c = table[(c ^ d[i]) & 0xff] ^ (c >> 8); return c; };
+    std::vector<u8> raw; raw.reserve((size_t)(w * 3 + 1) * h);
+    for (u32 y = 0; y < h; ++y) { raw.push_back(0); const u8* in = bgra.data() + (size_t)y * w * 4;
+        for (u32 x = 0; x < w; ++x) { raw.push_back(in[x * 4 + 2]); raw.push_back(in[x * 4 + 1]); raw.push_back(in[x * 4]); } }
+    std::vector<u8> z{0x78, 0x01}; u32 a = 1, b = 0;
+    for (u8 v : raw) { a = (a + v) % 65521; b = (b + a) % 65521; }
+    for (size_t at = 0; at < raw.size() || at == 0;) { const size_t n = std::min<size_t>(65535, raw.size() - at); const bool last = at + n >= raw.size();
+        z.push_back(last ? 1 : 0); z.push_back(n & 0xff); z.push_back(n >> 8); z.push_back(~n & 0xff); z.push_back((~n >> 8) & 0xff);
+        z.insert(z.end(), raw.begin() + at, raw.begin() + at + n); at += n; if (last) break; }
+    const u32 adler = b << 16 | a; for (int k = 3; k >= 0; --k) z.push_back((adler >> (k * 8)) & 0xff);
+    FILE* f = std::fopen((path + ".part").c_str(), "wb"); if (!f) return;
+    const auto u32be = [&](u32 v) { const u8 o[4] = {u8(v >> 24), u8(v >> 16), u8(v >> 8), u8(v)}; std::fwrite(o, 1, 4, f); };
+    const auto chunk = [&](const char* type, const u8* d, size_t n) { u32be((u32)n); std::fwrite(type, 1, 4, f); if (n) std::fwrite(d, 1, n, f);
+        u32 c = crc(reinterpret_cast<const u8*>(type), 4, 0xffffffffu); c = crc(d, n, c); u32be(c ^ 0xffffffffu); };
+    static const u8 sig[8] = {0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a}; std::fwrite(sig, 1, 8, f);
+    const u8 ihdr[13] = {u8(w >> 24), u8(w >> 16), u8(w >> 8), u8(w), u8(h >> 24), u8(h >> 16), u8(h >> 8), u8(h), 8, 2, 0, 0, 0};
+    chunk("IHDR", ihdr, 13); chunk("IDAT", z.data(), z.size()); chunk("IEND", nullptr, 0);
+    std::fclose(f); std::rename((path + ".part").c_str(), path.c_str());
+    RT_LOG("screenshot: %s", path.c_str()); // (the log line puts ~ for the home folder)
+}
 void WriteDump(u64 frame) {
     const std::string path = std::string(dump.dir) + "/frame-" + std::to_string(frame) + ".ppm", partial = path + ".part";
     FILE* f = std::fopen(partial.c_str(), "wb");
@@ -376,6 +404,7 @@ static void InputEvent(const SDL_Event& e) {
     case SDL_EVENT_KEY_DOWN:
         if (e.key.repeat) break;
         if (e.key.scancode == SDL_SCANCODE_ESCAPE && input::captured.load()) input::release_asked = true;
+        if (e.key.scancode == SDL_SCANCODE_F12) screenshot_asked = true;
         if (e.key.scancode == SDL_SCANCODE_F11 || (e.key.scancode == SDL_SCANCODE_RETURN && (e.key.mod & SDL_KMOD_ALT))) {
             gfx::Settings g = gfx::Current(); g.display_mode = g.display_mode ? 0 : 1; gfx::Set(g);
         }
@@ -786,7 +815,16 @@ void PresentWindowTexture(u64 window, s32 index) {
     // the swapchain is this thread's: a set still being shown ends first.
     if (!fg) {
         if (!swap_lock.owns_lock()) swap_lock.lock();
-        fg_have_before = false; std::lock_guard lock{fgp.m}; fgp.pending = false; fgp.shown_fps = 0.0f; // (nothing posted before is shown after this frame)
+        fg_have_before = false; { std::lock_guard lock{fgp.m}; fgp.pending = false; fgp.shown_fps = 0.0f; } // (nothing posted before is shown after this frame)
+        // (frame generation off for 120 presents: its pictures - ten at the window's size, 150 MiB at 1440p, 330 at 4K -
+        // let go; made again if it comes back on)
+        static u32 off_for = 0;
+        if (fg_extent.width && ++off_for >= 120) {
+            { std::lock_guard lock{vk.queue_mutex}; std::lock_guard copy{vk.copy_mutex}; vkDeviceWaitIdle(vk.device); }
+            const u64 freed = output::fg::Release(); fg_extent = {}; fg_ok = false; off_for = 0;
+            RT_LOG("frame generation: off - its pictures let go (%.0f MiB)", freed / 1048576.0);
+        }
+        if (fg_extent.width == 0) off_for = 0;
     } else if (swap_lock.owns_lock()) swap_lock.unlock();
     const int fg_slot = fg ? (int)(fg_next++ % output::fg::Slots) : -1;
     { const double _ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_pt).count(); if(_ms>30)RT_LOG("present step previous blit fence: %.1f ms",_ms); _pt=std::chrono::steady_clock::now(); }
@@ -873,13 +911,18 @@ void PresentWindowTexture(u64 window, s32 index) {
     struct Watch { bool on = false; int box[4]{}; int limit = 1 << 30; int after = 0; };
     static const Watch watch = [] { Watch w; if (const char* e = std::getenv("OOT_PRESENT_WATCH")) w.on = std::sscanf(e, "%d,%d,%d,%d,%d,%d", &w.box[0], &w.box[1], &w.box[2], &w.box[3], &w.limit, &w.after) >= 4; return w; }();
     const bool snap = dump.dir && ((every && (sc.frames + 1) % 300 == 0) || std::remove((std::string(dump.dir) + "/snap").c_str()) == 0);
+    const bool hdr_picture = sc.format != VK_FORMAT_B8G8R8A8_UNORM && sc.format != VK_FORMAT_B8G8R8A8_SRGB;
+    { static const u64 test_at = std::getenv("OOT_TEST_SCREENSHOT_AT") ? std::strtoull(std::getenv("OOT_TEST_SCREENSHOT_AT"), nullptr, 10) : 0; // (test: F12 at that picture)
+      if (test_at && sc.frames == test_at) screenshot_asked = true; }
+    bool shot = screenshot_asked.exchange(false);
+    if (shot && hdr_picture) { shot = false; RT_LOG("screenshot: not taken - the picture is in HDR"); }
     // OOT_PRESENT_SPIKES=<cells>[,<after frame>[,<level>]] (diagnostic): one-frame faults of any kind. Every presented image
     // is read back and reduced to a 160x90 grid; a frame is a spike where a cell differs by more than `level` (default 48
     // of 255) from BOTH its neighbours in time while those two agree (within level/3). Spikes of at least `cells` cells
     // are logged with their box, and written with the frame before (16 at most).
     struct Spikes { bool on = false; int cells = 6, after = 0, level = 48; };
     static const Spikes spikes = [] { Spikes w; if (const char* e = std::getenv("OOT_PRESENT_SPIKES")) w.on = std::sscanf(e, "%d,%d,%d", &w.cells, &w.after, &w.level) >= 1; return w; }();
-    const bool dumping = snap || watch.on || spikes.on;
+    const bool dumping = snap || shot || watch.on || spikes.on;
     if (snap && !every) RT_LOG("present: snapshot taken");
     VkImageLayout last = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     if (dumping) {
@@ -995,7 +1038,14 @@ void PresentWindowTexture(u64 window, s32 index) {
     }
     if (dumping) {
         vkWaitForFences(vk.device, 1, &sc.fence, VK_TRUE, UINT64_MAX);
-        bool write = snap;
+        if (shot) {
+            const u32 w = sc.extent.width, h = sc.extent.height;
+            std::vector<u8> pixels(dump.mapped, dump.mapped + (size_t)w * h * 4);
+            const auto now = std::time(nullptr); char stamp[32]; std::strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", std::localtime(&now));
+            std::error_code ec; std::filesystem::create_directories(rt::DataDir() + "/screenshots", ec);
+            std::thread(WritePng, rt::DataDir() + "/screenshots/TOoT-R-" + stamp + ".png", w, h, std::move(pixels)).detach();
+        }
+        bool write = snap && dump.dir;
         if (watch.on) {
             const double sx = sc.extent.width / 1920.0, sy = sc.extent.height / 1080.0; u32 white = 0;
             const u32 x0 = (u32)(watch.box[0] * sx), x1 = std::min<u32>(sc.extent.width, (u32)(watch.box[2] * sx)), y0 = (u32)(watch.box[1] * sy), y1 = std::min<u32>(sc.extent.height, (u32)(watch.box[3] * sy));

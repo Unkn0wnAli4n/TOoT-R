@@ -520,6 +520,7 @@ VulkanContext& Vk() {
         gfx::Current();
         if (!vk.window) vk.window = SDL_CreateWindow("TOoT:R", 1920, 1080, window_flags);
         if (!vk.window) rt::Fatal("SDL_CreateWindow: %s", SDL_GetError());
+        SDL_DisableScreenSaver(); // (a game played with a controller alone is no activity to the system: the display stays on)
         if (const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(vk.window)); mode && mode->h > 0) gfx::display_ratio.store((double)mode->w / mode->h);
         if (const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(vk.window)); mode && mode->refresh_rate > 1) gfx::display_refresh.store(mode->refresh_rate);
         CreateInstance(vk);

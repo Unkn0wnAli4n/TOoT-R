@@ -191,6 +191,13 @@ bool Size(VkExtent2D extent, VkFormat composition) {
     return true;
 }
 VkImage Compose() { return f.compose.image; }
+u64 Release() {
+    u64 bytes = 0; auto& vk = Vk();
+    const auto drop = [&](Image& i) { if (!i.image) return; VkMemoryRequirements req; vkGetImageMemoryRequirements(vk.device, i.image, &req); bytes += req.size; Destroy(i); };
+    drop(f.compose); for (auto& i : f.frame) drop(i); for (auto& i : f.made) drop(i);
+    f.extent = {}; f.fresh = true;
+    return bytes;
+}
 void Stored(VkCommandBuffer cmd, int slot, VkImageLayout layout) {
     if (f.fresh) { f.fresh = false;
         for (auto& i : f.frame) Barrier(cmd, i.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);

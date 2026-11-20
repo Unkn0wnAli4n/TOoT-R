@@ -1422,7 +1422,15 @@ VkPipeline CreateGraphicsPipeline(const PipelineDesc& d,VkPipelineLayout layout,
     VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};ri.colorAttachmentCount=d.color_count;ri.pColorAttachmentFormats=colors;ri.depthAttachmentFormat=(VkFormat)d.depth_format;ri.stencilAttachmentFormat=(VkFormat)d.stencil_format;
     VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};pi.pNext=&ri;StagePins pinned;const auto& pinned_stages=pinned.Apply(stages);pi.stageCount=pinned_stages.size();pi.pStages=pinned_stages.data();pi.pVertexInputState=mesh?nullptr:&vi;pi.pInputAssemblyState=mesh?nullptr:&ia;pi.pViewportState=&vp;pi.pRasterizationState=&rs;pi.pMultisampleState=&ms;pi.pDepthStencilState=&ds;pi.pColorBlendState=&cb;pi.pDynamicState=&dy;pi.layout=layout;
     VkPipeline created=VK_NULL_HANDLE;
-    const VkResult result=vkCreateGraphicsPipelines(vk.device,PipelineCache(),1,&pi,nullptr,&created);
+    VkResult result=vkCreateGraphicsPipelines(vk.device,PipelineCache(),1,&pi,nullptr,&created);
+    // (AMD's Windows compiler fails on some of the game's programs - the Market's and Kakariko's dogs - with its optimizer
+    // on, and builds them with it off: one more try that way, not after running out of memory. OOT_NO_PIPELINE_RETRY=1: not)
+    {static const bool off=std::getenv("OOT_NO_PIPELINE_RETRY")!=nullptr;
+     if(result!=VK_SUCCESS&&!off&&result!=VK_ERROR_OUT_OF_HOST_MEMORY&&result!=VK_ERROR_OUT_OF_DEVICE_MEMORY){
+        pi.flags|=VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;created=VK_NULL_HANDLE;
+        const VkResult again=vkCreateGraphicsPipelines(vk.device,PipelineCache(),1,&pi,nullptr,&created);
+        static std::atomic<u32> told{0};if(told++<10)RT_LOG("pipeline: the driver could not build one (%d)%s",(int)result,again==VK_SUCCESS?"; built without its optimizer":", not without its optimizer either");
+        result=again;}}
     if(fatal)VK_CHECK(result);else if(result!=VK_SUCCESS)return VK_NULL_HANDLE;
     return created;
 }

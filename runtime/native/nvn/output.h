@@ -29,6 +29,7 @@ constexpr int Slots = 3, MostMade = 7;
 int Multiplier(double game_fps);                    // frames shown for each of the game's, by the setting (1: off)
 bool Size(VkExtent2D extent, VkFormat composition); // (device idle) the images for this window size; false: cannot run here
 VkImage Compose();                                  // where the frame is composed (the swapchain's format)
+u64 Release();                                      // (device idle) the images let go - frame generation is off; bytes freed
 void Stored(VkCommandBuffer cmd, int slot, VkImageLayout compose_layout); // the composed frame into the ring
 // `count` frames between the ring's last picture and `slot`'s: how many were made (0: none - no scene this frame, or the
 // engines cannot). blend: the picture before is the frame before's.
