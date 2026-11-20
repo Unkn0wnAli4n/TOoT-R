@@ -1149,8 +1149,11 @@ void TrimClearedTargets() {
     std::vector<Texture*> idle;
     {
         std::lock_guard lock{holders_mutex};
+        // (and a big image nothing used for 1800 frames: a 12288x12288 depth target of 288 MiB is drawn once as the Market
+        // loads and not used again there - 8% of a 4 GB card; used again, it is made anew, as a new target)
         for (Texture* t : with_images)
-            if (t->image && t->allocation_size && t->cleared_only && !t->gpu_written && now - t->used_frame >= 600) idle.push_back(t);
+            if (t->image && t->allocation_size && ((t->cleared_only && !t->gpu_written && now - t->used_frame >= 600) ||
+                                                   (t->allocation_size >= (64ull << 20) && now - t->used_frame >= 1800))) idle.push_back(t);
         for (Texture* t : idle) {
             auto it = holders.find(KeyOf(*t)); if (it != holders.end() && it->second == t) holders.erase(it);
             Unlist(t);
@@ -1162,18 +1165,22 @@ void TrimClearedTargets() {
         bytes += t->allocation_size;
         auto* image = new Texture(*t);
         t->image = VK_NULL_HANDLE; t->memory = VK_NULL_HANDLE; t->block = nullptr; t->view = VK_NULL_HANDLE; t->views.clear(); t->allocation_size = 0;
-        t->layout = VK_IMAGE_LAYOUT_UNDEFINED; t->uploaded = false; t->cleared_only = false; t->reupload_reason = 6;
+        if (t->gpu_written) t->lost_gpu_image = true;
+        t->layout = VK_IMAGE_LAYOUT_UNDEFINED; t->uploaded = t->gpu_written = false; t->cleared_only = false; t->reupload_reason = 6;
         image->object = 0; image->owner_finalized = false; image->gpu_retirement_pending = false;
         DestroyLater(image);
     }
     ++binding_generation;
     static u32 told = 0;
-    if (told++ < 20) RT_LOG("video memory tight (%llu of %llu MiB): %zu render targets nothing drew into released (%.0f MiB; made and cleared again if used)",
+    if (told++ < 20) RT_LOG("video memory tight (%llu of %llu MiB): %zu idle render targets released (%.0f MiB; made again if used)",
                             (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20), idle.size(), bytes / 1048576.0);
 }
 void ReportImageAges() {
     std::lock_guard lock{holders_mutex};
     const u64 now = CurrentFrameNumber();
+    for (Texture* t : with_images) if (t->image && t->allocation_size >= (100ull << 20))
+        RT_LOG("  big image %ux%u fmt %u (%.0f MiB): unused for %llu frames, GPU-written %d, at %#llx", t->width, t->height, t->format, t->allocation_size / 1048576.0,
+               (unsigned long long)(now - t->used_frame), (int)t->gpu_written, (unsigned long long)t->storage);
     std::map<std::tuple<u32,u32,u32>, std::array<u64,4>> ages; // (<60, <600, older frames; bytes)
     for (Texture* t : with_images) if (t->image) {
         auto& a = ages[{t->width, t->height, t->format}];
