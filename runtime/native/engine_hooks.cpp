@@ -700,6 +700,49 @@ bool CompactNotDue() {
 } // namespace highfps
 } // namespace
 
+// ---- the neighbouring map preloaded (site 117) -----------------------------------------------------------------------
+// The game preloads one neighbouring map on a thread of its own: its preload manager's update picks, each frame, among up
+// to 16 neighbours whose radius Link is in, the one he moves towards, else the nearest; asking for another one than the
+// one loading or loaded throws that one away and loads the other from the start. In the Market's plaza Link stands in
+// Hyrule Field's and Hyrule Castle's radius at once, and walking or turning there flipped the choice back and forth: the
+// loader read and set up the two maps over and over, most of a core on a 4-core CPU. A different choice is now taken only
+// once it has stayed the choice for OOT_MAP_PRELOAD_HOLD_MS (2000; 0: the game's own at every frame); until then the
+// update goes on with the map already asked for. A first choice and the game's direct requests stay the game's.
+// x21: the chosen unit (bit 31: none), x19: the manager (its units at +0x408, 0x128 bytes each: +0 in use, +0x10 the
+// layout's path; +0x28 bit 0 a direct request, +0x2c its state, +0x70 the current unit's path, +0x1e8 the next one's).
+namespace mapload {
+std::mutex mutex; int candidate = -2; s64 since_ns = 0;
+int Held(u64 mgr) {
+    if (Load<u8>(mgr + 0x28) & 1) return -1;
+    const u64 next = Load<u64>(mgr + 0x1e8), current = Load<u64>(mgr + 0x70); const u32 state = Load<u32>(mgr + 0x2c);
+    u64 want = 0;
+    if (Readable(next) && Load<u8>(next)) want = next;
+    else if (state >= 1 && state <= 4 && Readable(current) && Load<u8>(current)) want = current;
+    if (!want) return -1;
+    for (int k = 0; k < 16; ++k) {
+        const u64 slot = mgr + 0x408 + 0x128ull * k;
+        if (Load<u8>(slot) != 1) continue;
+        const u64 path = Load<u64>(slot + 0x10);
+        if (!Readable(path)) continue;
+        if (std::strncmp(reinterpret_cast<const char*>(path), reinterpret_cast<const char*>(want), 0x100) == 0) return k;
+    }
+    return -1;
+}
+void Pick(Cpu* c) {
+    static const s64 hold_ns = (std::getenv("OOT_MAP_PRELOAD_HOLD_MS") ? std::atoll(std::getenv("OOT_MAP_PRELOAD_HOLD_MS")) : 2000) * 1000000ll;
+    const u64 mgr = c->x[19];
+    if (hold_ns <= 0 || !Readable(mgr)) return;
+    const int chosen = (u32)c->x[21] >> 31 ? -1 : (int)(u32)c->x[21];
+    const int held = Held(mgr);
+    std::lock_guard lock{mutex};
+    if (held < 0 || chosen == held) { candidate = -2; return; }
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (candidate != chosen) { candidate = chosen; since_ns = now; }
+    if (now - since_ns >= hold_ns) { candidate = -2; return; }
+    c->x[21] = (c->x[21] & ~0xffffffffull) | (u32)held; // (the held map goes on being the one asked for)
+    static u64 n = 0; if (++n % 600 == 1) RT_LOG("map preload: the next map kept while the choice flickers (%llu times)", (unsigned long long)n);
+}
+} // namespace mapload
 // (debug_tools.cpp's player hook: Link's components, at each of his updates)
 void oot_note_link(unsigned long long components) {
     highfps::link_updates.fetch_add(1, std::memory_order_relaxed);
@@ -751,6 +794,7 @@ extern "C" void oot_site(Cpu* c, int id) {
     case 112: highfps::LoopStep(c, 0); break;
     case 113: highfps::LoopPose(c); break;
     case 114: case 115: highfps::DriveTarget(c); break;
+    case 117: mapload::Pick(c); break;
     case 87: tools::Life(c, true); break;
     case 88: tools::Life(c, false); break;
     case 89: case 90: tools::Speed(c, c->x[0], false); break;

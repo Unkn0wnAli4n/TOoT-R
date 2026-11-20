@@ -122,6 +122,7 @@ BLOCK_SITES = (  # (block start, id)
     # above 60 frames a second: an animation clock's two advances (x20 the entry; the step in s8, the speed in s1 / s0) and
     # the drawn time's store (s0, at x22); the two copies of the driven-body path (Link's ledge pull-up; x20 the controller)
     (0x2afe04, 111), (0x2b01d0, 112), (0x924e50, 113), (0x4d51e4, 114), (0x4d5e9c, 115),
+    (0x3299dc8, 117),                                   # the map preload manager's choice of a neighbour (w21; x19 the manager)
 )
 CALL_SITES = ((0x436910, 30), (0x436da4, 31), (0x436f1c, 32), (0x437098, 33), (0xa7ca9c, 34),
               (0x3b5b440, 35), (0xb523ac, 36))  # the Graphics module heap being made (its size in x0), and the heap made of its rest  # (the call's return address, id)
@@ -152,7 +153,7 @@ FEATURES = (
     ((87, 88), "Damage Taken and Infinite Health"), ((89, 92), "Movement Speed"), ((93, 94), "sound above 60 frames a second"),
     ((95, 98), "the Cheats tab's tools (teleport, flight, free camera, ...)"), ((99, 99), "the Autosave switch"),
     ((101, 106), "Output Resolution"), ((107, 115), "correct game logic above 60 frames a second"),
-    ((116, 116), "texture heap repacking once a second"),
+    ((116, 116), "texture heap repacking once a second"), ((117, 117), "steady preloading of the next map"),
 )
 
 
