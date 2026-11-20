@@ -22,6 +22,7 @@
 #include <atomic>
 #include <cstdlib>
 #include "texture.h"
+#include "pipeline_list.h"
 #include "longshot_upscale.h"
 #include "batch.h"
 
@@ -60,9 +61,14 @@ void NoteLive(const Texture& t,s64 sign){ // (always: a map update per image mad
 // 256 MiB / 512 entries evicted this game's per-frame targets (2560x1440 RGBA16F alone is 29 MiB):
 // temporal effects (volume fog, anti-aliasing and exposure history) restarted from empty images.
 bool SmallCard();
+// An integrated GPU (the Steam Deck's): its video memory is the PC's own RAM, shared with the game and the system. The
+// Deck went from 2.4 GiB of RAM free in Kokiri to 0.3 after Hyrule Field and the Market (images 2.0 -> 3.5 GiB), then
+// swapped: a 3.8 s frame. It is treated as a card under 5 GB for textures and caches.
+bool SharedMemoryGpu() { static const bool on = [] { VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(Vk().physical, &p);
+    const char* e = std::getenv("OOT_SHARED_MEMORY_GPU"); return e ? std::atoi(e) != 0 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU; }(); return on; }
 // (the image cache's room: 512 MiB, 192 MiB on a card under 6 GB - a player's 4 GB card was over its limit with 628 MiB of
 // cached images, 800 MiB after a longer play. OOT_IMAGE_CACHE_MB: that room)
-u64 ImageCacheBudget(){static const u64 v=std::getenv("OOT_IMAGE_CACHE_MB")?std::strtoull(std::getenv("OOT_IMAGE_CACHE_MB"),nullptr,10)<<20:(SmallCard()?192ull:512ull)<<20;return v;}
+u64 ImageCacheBudget(){static const u64 v=std::getenv("OOT_IMAGE_CACHE_MB")?std::strtoull(std::getenv("OOT_IMAGE_CACHE_MB"),nullptr,10)<<20:(SmallCard()||SharedMemoryGpu()?192ull:512ull)<<20;return v;}
 const size_t ImageCacheEntries=std::getenv("OOT_IMAGE_CACHE_ENTRIES")?std::strtoull(std::getenv("OOT_IMAGE_CACHE_ENTRIES"),nullptr,10):1024;
 std::atomic<u64> image_cache_adopted{0},image_cache_evicted{0},image_astc_bytes{0};
 }
@@ -639,7 +645,7 @@ u32 MipSkipWanted() {
     const int detail = gfx::Current().texture_detail;
     // (Lowest, and Original or Low on a card under 5 GB: big textures without their two largest levels, a sixteenth of the
     // memory. Castle Town on a 4 GB-like card: 22-25 -> 34-35 fps, half as many render targets out of room)
-    if (detail == 5 || (TinyCard() && (detail == 0 || detail == 1))) return 2;
+    if (detail == 5 || ((TinyCard() || SharedMemoryGpu()) && (detail == 0 || detail == 1))) return 2;
     if (detail == 1) return 1;
     const bool small_card = SmallCard();
     if (small_card && detail != 3 && detail != 4) return 1;
@@ -671,7 +677,7 @@ bool TinyCard() { // (under 5 GB of video memory, as SmallCard reckons it)
 u32 MipSkipFrom() {
     static const int forced = std::getenv("OOT_TEXTURE_SKIP_FROM") ? std::atoi(std::getenv("OOT_TEXTURE_SKIP_FROM")) : 0;
     if (forced > 0) return (u32)forced;
-    return SmallCard() || memory_pressure.load(std::memory_order_relaxed) ? 512 : 1024;
+    return SmallCard() || SharedMemoryGpu() || memory_pressure.load(std::memory_order_relaxed) ? 512 : 1024;
 }
 void CreateImage(Texture& t) {
     RelieveVideoMemory();
@@ -893,7 +899,7 @@ std::list<ImageKey> cache_order;
 std::list<ImageKey> small_order;
 u64 small_cached_bytes = 0;
 const u64 SmallImageMax = 4ull << 20;
-u64 SmallCacheBudget() { static const u64 v = std::getenv("OOT_SMALL_IMAGE_CACHE_MB") ? std::strtoull(std::getenv("OOT_SMALL_IMAGE_CACHE_MB"), nullptr, 10) << 20 : (SmallCard() ? 128ull : 512ull) << 20; return v; } // (128 MiB on a card under 6 GB)
+u64 SmallCacheBudget() { static const u64 v = std::getenv("OOT_SMALL_IMAGE_CACHE_MB") ? std::strtoull(std::getenv("OOT_SMALL_IMAGE_CACHE_MB"), nullptr, 10) << 20 : (SmallCard() || SharedMemoryGpu() ? 128ull : 512ull) << 20; return v; } // (128 MiB on a card under 6 GB or an integrated GPU)
 constexpr size_t SmallCacheEntries = 8192;
 struct CachedImage {
     std::unique_ptr<Texture> texture;
@@ -1140,7 +1146,43 @@ void WantFullImage(Texture& t) {
 // used again, so nothing is lost. (A 12288x12288 depth target of 288 MiB is made and cleared once and then never used
 // in the fields and towns: 8% of a 4 GB card, whose new render targets went to the PC's memory for want of room.)
 // From the executor (the frame's report), as ReuseOverlapping lets go of idle images. OOT_KEEP_CLEARED_TARGETS=1: kept.
+// An integrated GPU's images are the PC's RAM (SharedMemoryGpu). The game keeps the neighbouring area loaded, and with it
+// the images of the area just left: on the Steam Deck, walking between Kokiri Forest and Hyrule Field took the images from
+// 1.4 to 3.2 GiB and the RAM down to a few hundred MiB free, then the system swapped (frames of 0.3-0.9 s). While the
+// system has under OOT_TRIM_RAM_MB (3072) available, textures the game uploaded and nothing used for 900 frames let their
+// images go; used again, they are uploaded from the game's memory.
+void TrimIdleOnSharedMemory() {
+    static const u64 below = (std::getenv("OOT_TRIM_RAM_MB") ? std::strtoull(std::getenv("OOT_TRIM_RAM_MB"), nullptr, 10) : 3072) << 20;
+    if (!SharedMemoryGpu() || !below) return;
+    const u64 available = plist::AvailableMemory();
+    if (!available || available >= below) return;
+    const u64 now = CurrentFrameNumber();
+    // (the lower the RAM, the sooner: 900 frames under the limit, 300 under half of it, 90 under a quarter - Hyrule
+    // Castle after the Market went down to 212 MiB available with 900, and the system stalled for 10 s)
+    const u64 idle_frames = available < below / 4 ? 90 : available < below / 2 ? 300 : 900;
+    std::vector<Texture*> idle; u64 bytes = 0;
+    {
+        std::lock_guard lock{holders_mutex};
+        for (Texture* t : with_images)
+            if (t->image && t->allocation_size && t->uploaded && !t->gpu_written && now - t->used_frame >= idle_frames) idle.push_back(t);
+        for (Texture* t : idle) { auto it = holders.find(KeyOf(*t)); if (it != holders.end() && it->second == t) holders.erase(it); Unlist(t); }
+    }
+    if (idle.empty()) return;
+    for (Texture* t : idle) {
+        bytes += t->allocation_size;
+        auto* image = new Texture(*t);
+        t->image = VK_NULL_HANDLE; t->memory = VK_NULL_HANDLE; t->block = nullptr; t->view = VK_NULL_HANDLE; t->views.clear(); t->allocation_size = 0;
+        t->layout = VK_IMAGE_LAYOUT_UNDEFINED; t->uploaded = false; t->cleared_only = false; t->reupload_reason = 6;
+        image->object = 0; image->owner_finalized = false; image->gpu_retirement_pending = false;
+        DestroyLater(image);
+    }
+    ++binding_generation;
+    static u32 told = 0;
+    if (told++ < 20) RT_LOG("memory: %.0f MiB of RAM available - %zu images unused for %llu frames let go (%.0f MiB; uploaded again if used)",
+                            available / 1048576.0, idle.size(), (unsigned long long)idle_frames, bytes / 1048576.0);
+}
 void TrimClearedTargets() {
+    TrimIdleOnSharedMemory();
     static const bool off = std::getenv("OOT_KEEP_CLEARED_TARGETS") != nullptr;
     if (off || !SmallCard()) return;
     u64 used = 0, budget = 0;
@@ -1253,7 +1295,9 @@ void ReportImageCache() {
     // (a full card: what holds the memory, largest first, at most once a minute and six times - a log sent with a report
     // then says where the video memory went)
     {u64 used=0,budget=0;VideoMemoryTight(&used,&budget);static u64 last_frame=0;static u32 told=0;
-     if(budget&&used>budget&&told<6&&CurrentFrameNumber()-last_frame>3600){last_frame=CurrentFrameNumber();++told;
+     static const bool low_ram_report=std::getenv("OOT_LOW_RAM_REPORT")!=nullptr; // (diagnostic: the same list on an integrated GPU when the RAM runs low)
+     const bool low_ram=low_ram_report&&SharedMemoryGpu()&&plist::AvailableMemory()<(1536ull<<20);
+     if(((budget&&used>budget)||low_ram)&&told<6&&CurrentFrameNumber()-last_frame>(low_ram?600u:3600u)){last_frame=CurrentFrameNumber();++told;
         std::lock_guard l{live_kinds_mutex};std::vector<std::tuple<s64,s64,u32,u32,u32,bool,bool>> top;
         for(auto& [k,v]:live_kinds)if(v.first)top.push_back({v.second,v.first,std::get<0>(k),std::get<1>(k),std::get<2>(k),std::get<3>(k),std::get<4>(k)});
         std::sort(top.rbegin(),top.rend());

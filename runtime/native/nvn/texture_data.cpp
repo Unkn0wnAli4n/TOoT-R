@@ -1,4 +1,6 @@
 #include <memory>
+#include <filesystem>
+#include <string>
 #include <deque>
 #include <atomic>
 // CPU texel transfers and Vulkan image uploads, using the SDK's mip/layer layout.
@@ -158,6 +160,52 @@ u64 TexelStorageOffset(const Texture& t, u32 level, u32 x, u32 y, u32 z) {
 
 // A small pool for data-parallel texture work (deswizzling, ASTC decoding): uploads happen on the
 // GPU command thread, and a large texture decoded on one core stalls a frame for tens of ms.
+// ---- decoded texture cache (integrated GPUs) ---------------------------------------------------------------------------
+// Where the CPU decodes ASTC (integrated GPUs: the Steam Deck), each upload decoded its texels again and, for big ones,
+// encoded them to BC3: arriving in an area that was 0.4-1.3 s of a frame on the Deck (300-600 textures), and again for
+// every texture let go to save memory. The result of each level is kept on disk by the hash of its ASTC blocks, so a
+// texture is decoded once: the next time it is read back from <data>/texture_cache. At most OOT_TEXTURE_CACHE_MB (4096)
+// in all; 0: off.
+namespace texcache {
+u64 Hash(const u8* d, size_t n, u64 seed) {
+    u64 h = seed ^ (n * 0x9E3779B97F4A7C15ull);
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) { u64 v; std::memcpy(&v, d + i, 8); h ^= v * 0xff51afd7ed558ccdull; h = (h << 31 | h >> 33) * 0xc4ceb9fe1a85ec53ull; }
+    for (; i < n; ++i) h = (h ^ d[i]) * 0x100000001b3ull;
+    h ^= h >> 33; h *= 0xff51afd7ed558ccdull; h ^= h >> 33;
+    return h;
+}
+u64 Limit() { static const u64 v = (std::getenv("OOT_TEXTURE_CACHE_MB") ? std::strtoull(std::getenv("OOT_TEXTURE_CACHE_MB"), nullptr, 10) : 4096) << 20; return v; }
+const std::string& Dir() { static const std::string d = [] { std::string p = rt::DataDir() + "/texture_cache"; std::error_code ec; std::filesystem::create_directories(p, ec); return p; }(); return d; }
+std::string Path(u64 key) { char b[32]; std::snprintf(b, sizeof b, "/%016llx.bin", (unsigned long long)key); return Dir() + b; }
+std::atomic<u64> used{0}; std::atomic<bool> counted{false};
+std::atomic<u64> hits{0}, misses{0}, hit_bytes{0};
+void Count() { // (once: what the folder holds, on a thread of its own)
+    static std::once_flag once;
+    std::call_once(once, [] { std::thread([] { u64 total = 0; std::error_code ec;
+        for (auto& e : std::filesystem::directory_iterator(Dir(), ec)) { std::error_code e2; total += e.file_size(e2); }
+        used += total; counted = true; RT_LOG("texture cache: %.0f MiB of decoded textures kept (%s)", total / 1048576.0, Dir().c_str()); }).detach(); });
+}
+bool Read(u64 key, u8* out, size_t size) {
+    FILE* f = std::fopen(Path(key).c_str(), "rb"); if (!f) return false;
+    const bool ok = std::fread(out, 1, size, f) == size && std::fgetc(f) == EOF;
+    std::fclose(f); return ok;
+}
+// (written by a thread of its own: a frame never waits for the disk)
+std::mutex write_mutex; std::condition_variable write_cv; std::deque<std::pair<u64, std::vector<u8>>> writes; u64 queued_bytes = 0;
+void Write(u64 key, const u8* data, size_t size) {
+    if (!counted || used.load() + size > Limit()) return;
+    { std::lock_guard lock{write_mutex}; if (queued_bytes > (32ull << 20)) return; writes.emplace_back(key, std::vector<u8>(data, data + size)); queued_bytes += size; }
+    static std::once_flag once;
+    std::call_once(once, [] { std::thread([] { rt::SetThreadName("texture-cache"); for (;;) {
+        std::pair<u64, std::vector<u8>> item;
+        { std::unique_lock lock{write_mutex}; write_cv.wait(lock, [] { return !writes.empty(); }); item = std::move(writes.front()); writes.pop_front(); queued_bytes -= item.second.size(); }
+        const std::string path = Path(item.first), part = path + ".part";
+        if (FILE* f = std::fopen(part.c_str(), "wb")) { const bool ok = std::fwrite(item.second.data(), 1, item.second.size(), f) == item.second.size(); std::fclose(f);
+            if (ok && std::rename(part.c_str(), path.c_str()) == 0) used += item.second.size(); else std::remove(part.c_str()); } } }).detach(); });
+    write_cv.notify_one();
+}
+} // namespace texcache
 void ParallelFor(u32 count, const std::function<void(u32)>& fn) {
     static const u32 workers = std::max(2u, std::min(12u, std::thread::hardware_concurrency() - 2));
     if (count <= 1) { if (count) fn(0); return; }
@@ -761,6 +809,19 @@ void UploadTexelsNow(Texture& t) {
             upload_swizzle_ns+=(u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-_t_sw).count();
             upload_stats.count += 1; upload_stats.bytes += row_bytes * height * m.depth;
             const auto _t_dc=std::chrono::steady_clock::now();
+            // (the decoded texture cache: the result for these ASTC blocks, read instead of decoded and encoded)
+            u64 cache_key=0;u8* cache_out=nullptr;size_t cache_size=0;
+            if(t.decoded_astc&&texcache::Limit()){
+                texcache::Count();
+                cache_out=encode?staged:output;
+                cache_size=encode?(size_t)((m.width+3)/4)*((m.height+3)/4)*16:(size_t)m.width*m.height*m.depth*4;
+                cache_key=texcache::Hash(compressed.data(),compressed.size(),(u64)m.width<<40^(u64)m.height<<20^(u64)m.depth<<8^t.info.block_w<<4^t.info.block_h^(encode?1ull<<63:0));
+                if(texcache::Read(cache_key,cache_out,cache_size)){
+                    ++texcache::hits;texcache::hit_bytes+=cache_size;
+                    upload_decode_ns+=(u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-_t_dc).count();
+                    continue;}
+                ++texcache::misses;}
+            if(cache_key&&(texcache::hits+texcache::misses)%1000==0)RT_LOG("texture cache: %llu read (%.0f MiB), %llu decoded and kept",(unsigned long long)texcache::hits.load(),texcache::hit_bytes.load()/1048576.0,(unsigned long long)texcache::misses.load());
             if(t.decoded_astc){
                 // ASTC blocks decode independently: bands of block rows across the pool.
                 if(m.depth!=1)nvshader::DecodeAstc(compressed.data(),compressed.size(),m.width,m.height,m.depth,t.info.block_w,t.info.block_h,output);
@@ -782,6 +843,7 @@ void UploadTexelsNow(Texture& t) {
                 char path[512];std::snprintf(path,sizeof path,"%s/%016llx-%ux%u-f%u.rgba",dump,(unsigned long long)h,m.width,m.height,t.format);
                 if(FILE* f=std::fopen(path,"wb")){std::fwrite(px,1,(size_t)m.width*m.height*4,f);std::fclose(f);}}}
             if(encode)EncodeBc3(picture.data(),m.width,m.height,staged);
+            if(cache_key)texcache::Write(cache_key,cache_out,cache_size);
             if(t.decoded_rgb9e5)DecodeRgb9e5(compressed.data(),compressed.size()/4,reinterpret_cast<u16*>(output));
         }
     }
