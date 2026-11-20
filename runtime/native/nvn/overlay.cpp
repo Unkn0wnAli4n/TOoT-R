@@ -3,6 +3,7 @@
 // keyboard and gamepad (the game sees no input). Nothing is set up until it is first shown.
 #include "overlay.h"
 #include "present.h"
+#include "hud_stats.h"
 
 #include <algorithm>
 #include <atomic>
@@ -140,7 +141,7 @@ const std::vector<Row>& Rows() {
         {"Display", "HDR Highlights", &S::hdr_boost, {{"Off", 0}, {"25%", 25}, {"50%", 50}, {"75%", 75}, {"100%", 100}}, "How strongly the brightest parts of the picture are raised above paper white. Off shows the game's picture unchanged, only in the HDR signal.", false, false},
         {"Display", "Frame Rate Cap", &S::frame_cap, {{"15", 15}, {"20", 20}, {"30", 30}, {"40", 40}, {"45", 45}, {"60", 60}, {"90", 90}, {"120", 120}, {"144", 144}, {"165", 165}, {"240", 240}, {"Uncapped", 0}},
          "The most frames shown per second. The game keeps its normal speed at every cap. 40 suits a Steam Deck set to 40 Hz or 80 Hz.", true, false},
-        {"Display", "FPS Counter", &S::show_fps, {{"Off", 0}, {"On", 1}, {"With Graph", 2}, {"With Details", 3}}, "Shows the frame rate and frame time. With Graph adds the last frames' times as a plot (a flat line is a smooth game; the faint lines mark 60 and 30 frames a second), their average, the rate of the slowest hundredth and the longest one; With Details adds what a frame costs the GPU and the renderer, the video memory in use and the 3D resolution.", false, false},
+        {"Display", "FPS Counter", &S::show_fps, {{"Off", 0}, {"On", 1}, {"With Graph", 2}, {"With Details", 3}, {"HUD Compact", 4}, {"HUD Full", 5}, {"HUD Full + Cores", 6}}, "Shows the frame rate and frame time. The HUD levels show the hardware as well, in labelled rows: Compact on one line (GPU and CPU load and temperature, video memory, RAM, battery, frame rate); Full adds clocks, power, the frame-time graph and what a frame costs; Full + Cores adds each CPU core's load. With Graph adds the last frames' times as a plot (a flat line is a smooth game; the faint lines mark 60 and 30 frames a second), their average, the rate of the slowest hundredth and the longest one; With Details adds what a frame costs the GPU and the renderer, the video memory in use and the 3D resolution.", false, false},
         {"Display", "FPS Counter Position", &S::fps_corner, {{"Top Left", 0}, {"Top Right", 1}, {"Bottom Left", 2}, {"Bottom Right", 3}}, "The corner the FPS counter sits in.", false, false},
 
         {"Resolution and anti-aliasing", "Quality Profile", &S::handheld, {{"Console", 0}, {"Handheld", 1}}, "Handheld is the game's own lower-detail profile, as the console uses undocked. Takes effect after a restart.", true, true},
@@ -766,6 +767,121 @@ Usage SampleUsage() {
     return last;
 }
 
+// The last 240 frame times as a plot, and under it their average, the rate of the slowest hundredth and the longest one.
+void FrameGraph(const float* times, int at, float scale) {
+    // The last 240 frame times, drawn here rather than by ImGui's plot (whose label sat over the line): the line,
+    // faint guides where 60 and 30 frames a second lie, the scale's top, and under it the numbers that say how
+    // even the frames are - their average, the rate of the slowest hundredth, and the longest one.
+    float worst = 0, sum = 0; int counted = 0;
+    float slowest[3] = {0, 0, 0}; // (the three longest of 240: the slowest hundredth)
+    for (int k = 0; k < 240; ++k) { const float t = times[k];
+        if (t <= 0) continue;
+        worst = std::max(worst, t); sum += t; ++counted;
+        if (t > slowest[2]) { slowest[2] = t; if (slowest[2] > slowest[1]) std::swap(slowest[2], slowest[1]); if (slowest[1] > slowest[0]) std::swap(slowest[1], slowest[0]); }
+    }
+    const float average = counted ? sum / counted : 0.0f;
+    const float low_ms = (slowest[0] + slowest[1] + slowest[2]) / 3.0f;
+    const float top = std::max(20.0f, std::ceil(worst / 10.0f) * 10.0f);
+    char numbers[96]; std::snprintf(numbers, sizeof numbers, "avg %.1f ms   1%% low %.0f fps   worst %.1f ms", average, low_ms > 0 ? 1000.0f / low_ms : 0.0f, worst);
+    // (as wide as the row of numbers under it, so the two line up)
+    const ImVec2 size(std::max(250 * scale, ImGui::CalcTextSize(numbers).x), 58 * scale), p0 = ImGui::GetCursorScreenPos(), p1(p0.x + size.x, p0.y + size.y);
+    ImGui::Dummy(size);
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    ImFont* font = ImGui::GetFont(); const float small = ImGui::GetFontSize() * 0.78f;
+    draw->AddRectFilled(p0, p1, IM_COL32(0, 0, 0, 175), 3 * scale);
+    const auto y_of = [&](float ms) { return p1.y - size.y * std::min(ms, top) / top; };
+    for (const auto& [ms, name] : {std::pair<float, const char*>{1000.0f / 60, "60"}, {1000.0f / 30, "30"}}) {
+        if (ms >= top) continue;
+        draw->AddLine(ImVec2(p0.x, y_of(ms)), ImVec2(p1.x, y_of(ms)), IM_COL32(255, 255, 255, 46), 1.0f);
+        draw->AddText(font, small, ImVec2(p1.x - small * 1.4f, std::max(p0.y, y_of(ms) - small * 1.05f)), IM_COL32(255, 255, 255, 120), name);
+    }
+    ImVec2 points[240];
+    for (int i = 0; i < 240; ++i) points[i] = ImVec2(p0.x + size.x * i / 239.0f, y_of(times[(at + i) % 240]));
+    draw->AddPolyline(points, 240, IM_COL32(120, 230, 150, 255), 0, std::max(1.0f, 1.4f * scale));
+    char label[32]; std::snprintf(label, sizeof label, "%.0f ms", top);
+    draw->AddText(font, small, ImVec2(p0.x + 4 * scale, p0.y + 2 * scale), IM_COL32(255, 255, 255, 150), label);
+    ImGui::TextUnformatted(numbers);
+}
+
+
+// The stats HUD (the FPS Counter's HUD levels): the hardware's figures in labelled, coloured rows, as performance overlays
+// show them. 4 Compact: one line. 5 Full: GPU, CPU, video memory, RAM, battery, frame rate, the frame-time graph and what
+// a frame costs. 6 Full + Cores: also each CPU core's load. Unknown figures are left out.
+void Hud(int level, const float* times, int at, float scale) {
+    const hud::Stats s = hud::Current();
+    const ImVec4 gpu_col(0.18f, 0.59f, 0.38f, 1), cpu_col(0.18f, 0.59f, 0.80f, 1), vram_col(0.68f, 0.39f, 0.76f, 1), ram_col(0.76f, 0.40f, 0.58f, 1),
+                 bat_col(1.0f, 0.56f, 0.47f, 1), fps_col(0.92f, 0.36f, 0.36f, 1), dim(1, 1, 1, 0.55f);
+    const float fps = ImGui::GetIO().Framerate, shown = nvn::ShownFps();
+    const nvn::FrameCosts costs = nvn::LastFrameCosts();
+    u64 vram = 0, vram_budget = 0; nvn::VideoMemoryNow(&vram, &vram_budget);
+    // (no driver figure: the game's own GPU time a frame against the frame's time, marked as an estimate)
+    float gpu_load = s.gpu_load; bool estimated = false;
+    if (gpu_load < 0 && costs.gpu_ms > 0 && fps > 0) { gpu_load = std::min(100.0f, costs.gpu_ms * fps / 10.0f); estimated = true; }
+    const auto label = [&](const ImVec4& c, const char* t) { ImGui::TextColored(c, "%s", t); };
+    const auto gib = [](double b) { return b / 1073741824.0; };
+    if (level == 4) {
+        const auto sep = [&] { ImGui::SameLine(); ImGui::TextColored(dim, "|"); ImGui::SameLine(); };
+        if (gpu_load >= 0) { label(gpu_col, "GPU"); ImGui::SameLine(); ImGui::Text(estimated ? "~%.0f%%" : "%.0f%%", gpu_load);
+            if (s.gpu_temp >= 0) { ImGui::SameLine(); ImGui::Text("%.0f°C", s.gpu_temp); } sep(); }
+        if (s.cpu_load >= 0) { label(cpu_col, "CPU"); ImGui::SameLine(); ImGui::Text("%.0f%%", s.cpu_load);
+            if (s.cpu_temp >= 0) { ImGui::SameLine(); ImGui::Text("%.0f°C", s.cpu_temp); } sep(); }
+        if (vram_budget) { label(vram_col, "VRAM"); ImGui::SameLine(); ImGui::Text("%.1fG", gib((double)vram)); sep(); }
+        if (s.total_ram > 0) { label(ram_col, "RAM"); ImGui::SameLine(); ImGui::Text("%.1fG", gib(s.used_ram)); sep(); }
+        if (s.battery >= 0) { label(bat_col, "BAT"); ImGui::SameLine(); ImGui::Text("%.0f%%", s.battery); sep(); }
+        label(fps_col, "FPS"); ImGui::SameLine();
+        if (shown > fps * 1.2f) ImGui::Text("%.0f (game %.0f)  %.1f ms", shown, fps, fps > 0 ? 1000 / fps : 0.0f);
+        else ImGui::Text("%.0f  %.1f ms", fps, fps > 0 ? 1000 / fps : 0.0f);
+        return;
+    }
+    const ImGuiTableFlags flags = ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoSavedSettings;
+    if (ImGui::BeginTable("##hud", 5, flags)) {
+        const auto row = [&](const ImVec4& c, const char* name) { ImGui::TableNextRow(); ImGui::TableNextColumn(); label(c, name); };
+        const auto cell = [&](const char* fmt, double v, bool show = true) { ImGui::TableNextColumn(); if (show) ImGui::Text(fmt, v); };
+        row(gpu_col, "GPU");
+        cell(estimated ? "~%.0f%%" : "%.0f%%", gpu_load, gpu_load >= 0); cell("%.0f°C", s.gpu_temp, s.gpu_temp >= 0);
+        cell("%.0f MHz", s.gpu_clock, s.gpu_clock >= 0); cell("%.1f W", s.gpu_power, s.gpu_power >= 0);
+        row(cpu_col, "CPU");
+        cell("%.0f%%", s.cpu_load, s.cpu_load >= 0); cell("%.0f°C", s.cpu_temp, s.cpu_temp >= 0);
+        cell("%.0f MHz", s.cpu_clock, s.cpu_clock >= 0); cell("game %.0f%%", s.game_cpu, s.game_cpu >= 0);
+        if (vram_budget) {
+            row(vram_col, "VRAM"); cell("%.2f GiB", gib((double)vram)); cell("of %.1f", gib((double)vram_budget));
+            ImGui::TableNextColumn(); if (vram > vram_budget) ImGui::TextColored(ImVec4(1, 0.55f, 0.45f, 1), "full"); ImGui::TableNextColumn();
+        }
+        if (s.total_ram > 0) {
+            row(ram_col, "RAM"); cell("%.2f GiB", gib(s.used_ram)); cell("of %.1f", gib(s.total_ram));
+            cell("game %.1f", gib(s.game_ram)); cell("swap %.1f", gib(s.swap_used), s.swap_used > (64 << 20));
+        }
+        if (s.battery >= 0) {
+            row(bat_col, "BATT"); cell("%.0f%%", s.battery); cell("%.1f W", s.battery_watts, s.battery_watts > 0);
+            ImGui::TableNextColumn(); if (s.charging) ImGui::TextUnformatted("charging"); ImGui::TableNextColumn();
+        }
+        row(fps_col, "FPS");
+        cell("%.0f", shown > fps * 1.2f ? shown : fps); cell("%.1f ms", fps > 0 ? 1000 / fps : 0.0);
+        cell("game %.0f", fps, shown > fps * 1.2f); ImGui::TableNextColumn();
+        ImGui::EndTable();
+    }
+    FrameGraph(times, at, scale);
+    ImGui::TextColored(dim, "GPU %.1f ms  renderer %.1f ms  %.1f submits", costs.gpu_ms, costs.record_ms, costs.submissions);
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    if (const int render = gfx::EffectiveRenderScale(); render > 0 && render < 100) ImGui::TextColored(dim, "%.0f x %.0f  3D at %d%%", display.x, display.y, render);
+    else ImGui::TextColored(dim, "%.0f x %.0f", display.x, display.y);
+    if (level >= 6 && !s.core_loads.empty()) {
+        // (each core: a bar and its load, four to a row)
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        const float w = 70 * scale, h = ImGui::GetTextLineHeight();
+        for (size_t c = 0; c < s.core_loads.size(); ++c) {
+            if (c % 4) ImGui::SameLine();
+            const ImVec2 p0 = ImGui::GetCursorScreenPos();
+            const float v = s.core_loads[c] / 100.0f;
+            draw->AddRectFilled(p0, ImVec2(p0.x + w, p0.y + h), IM_COL32(255, 255, 255, 30), 2 * scale);
+            draw->AddRectFilled(p0, ImVec2(p0.x + w * v, p0.y + h), v > 0.9f ? IM_COL32(235, 91, 91, 200) : IM_COL32(46, 151, 203, 200), 2 * scale);
+            char t[16]; std::snprintf(t, sizeof t, "%zu %.0f%%", c, s.core_loads[c]);
+            draw->AddText(ImVec2(p0.x + 3 * scale, p0.y), IM_COL32(255, 255, 255, 230), t);
+            ImGui::Dummy(ImVec2(w, h));
+        }
+    }
+}
+
 // The FPS counter: a corner of the picture, no input. (ImGui's own average of the last frames.)
 // The FPS counter (the Display rows FPS Counter and FPS Counter Position): the rate and frame time; with Graph the last
 // 240 frame times as a plot; with Details also what a frame costs and the video memory in use.
@@ -781,43 +897,13 @@ void Counter() {
     times[at] = dt_ms; at = (at + 1) % 240;
     if (ImGui::Begin("##fps", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
                                           ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs)) {
+        if (level >= 4) { Hud(level, times, at, scale); ImGui::End(); return; }
         const float fps = ImGui::GetIO().Framerate;
         // (with frame generation: the rate shown on the display first, then the game's own)
         if (const float shown = nvn::ShownFps(); shown > fps * 1.2f) ImGui::Text("%.0f fps  (game %.0f, %.1f ms)", shown, fps, fps > 0 ? 1000.0f / fps : 0.0f);
         else ImGui::Text("%.0f fps  %.1f ms", fps, fps > 0 ? 1000.0f / fps : 0.0f);
         if (level >= 2) {
-            // The last 240 frame times, drawn here rather than by ImGui's plot (whose label sat over the line): the line,
-            // faint guides where 60 and 30 frames a second lie, the scale's top, and under it the numbers that say how
-            // even the frames are - their average, the rate of the slowest hundredth, and the longest one.
-            float worst = 0, sum = 0; int counted = 0;
-            float slowest[3] = {0, 0, 0}; // (the three longest of 240: the slowest hundredth)
-            for (float t : times) {
-                if (t <= 0) continue;
-                worst = std::max(worst, t); sum += t; ++counted;
-                if (t > slowest[2]) { slowest[2] = t; if (slowest[2] > slowest[1]) std::swap(slowest[2], slowest[1]); if (slowest[1] > slowest[0]) std::swap(slowest[1], slowest[0]); }
-            }
-            const float average = counted ? sum / counted : 0.0f;
-            const float low_ms = (slowest[0] + slowest[1] + slowest[2]) / 3.0f;
-            const float top = std::max(20.0f, std::ceil(worst / 10.0f) * 10.0f);
-            char numbers[96]; std::snprintf(numbers, sizeof numbers, "avg %.1f ms   1%% low %.0f fps   worst %.1f ms", average, low_ms > 0 ? 1000.0f / low_ms : 0.0f, worst);
-            // (as wide as the row of numbers under it, so the two line up)
-            const ImVec2 size(std::max(250 * scale, ImGui::CalcTextSize(numbers).x), 58 * scale), p0 = ImGui::GetCursorScreenPos(), p1(p0.x + size.x, p0.y + size.y);
-            ImGui::Dummy(size);
-            ImDrawList* draw = ImGui::GetWindowDrawList();
-            ImFont* font = ImGui::GetFont(); const float small = ImGui::GetFontSize() * 0.78f;
-            draw->AddRectFilled(p0, p1, IM_COL32(0, 0, 0, 175), 3 * scale);
-            const auto y_of = [&](float ms) { return p1.y - size.y * std::min(ms, top) / top; };
-            for (const auto& [ms, name] : {std::pair<float, const char*>{1000.0f / 60, "60"}, {1000.0f / 30, "30"}}) {
-                if (ms >= top) continue;
-                draw->AddLine(ImVec2(p0.x, y_of(ms)), ImVec2(p1.x, y_of(ms)), IM_COL32(255, 255, 255, 46), 1.0f);
-                draw->AddText(font, small, ImVec2(p1.x - small * 1.4f, std::max(p0.y, y_of(ms) - small * 1.05f)), IM_COL32(255, 255, 255, 120), name);
-            }
-            ImVec2 points[240];
-            for (int i = 0; i < 240; ++i) points[i] = ImVec2(p0.x + size.x * i / 239.0f, y_of(times[(at + i) % 240]));
-            draw->AddPolyline(points, 240, IM_COL32(120, 230, 150, 255), 0, std::max(1.0f, 1.4f * scale));
-            char label[32]; std::snprintf(label, sizeof label, "%.0f ms", top);
-            draw->AddText(font, small, ImVec2(p0.x + 4 * scale, p0.y + 2 * scale), IM_COL32(255, 255, 255, 150), label);
-            ImGui::TextUnformatted(numbers);
+            FrameGraph(times, at, scale);
         }
         if (level >= 3) {
             const nvn::FrameCosts costs = nvn::LastFrameCosts();

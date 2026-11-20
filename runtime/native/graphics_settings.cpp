@@ -60,7 +60,7 @@ Settings Sanitized(Settings s) {
     s.handheld = s.handheld ? 1 : 0;
     s.upscaling = std::clamp(s.upscaling, 0, 3);
     s.sharpness = std::clamp(s.sharpness / 25 * 25, 0, 200);
-    s.show_fps = std::clamp(s.show_fps, 0, 3);
+    s.show_fps = std::clamp(s.show_fps, 0, 6);
     s.ai_upscaler = std::clamp(s.ai_upscaler, 0, 2);
     s.volume = std::clamp((s.volume + 5) / 10 * 10, 0, 100);
     // (one Upscaler row since 2026-11-17: 0 the game's own, 1 NVIDIA DLSS, 3 AMD FSR 3.1, 4 AMD FSR 4, 6 none (a plain
