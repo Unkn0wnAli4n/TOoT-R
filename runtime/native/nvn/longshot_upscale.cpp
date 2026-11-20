@@ -1,3 +1,4 @@
+#include <algorithm>
 // The renderer's side of the vendored upscalers (third_party/longshot-upscale: Longshot's temporal chain, NVIDIA DLSS,
 // AMD FSR 3.1 and its frame interpolation; GPL-3.0-or-later, see its PROVENANCE.md). Those files are built unchanged;
 // what they take from Longshot's own renderer is declared in third_party/longshot-upscale/compat/vk_internal.h and
@@ -231,10 +232,13 @@ const char* FrameMaker() { return maker; }
 // Frames in a row for which frame generation was on and made nothing: a menu or a movie, which have no 3D scene to
 // make frames from. The presenter lifts a frame cap under 60 meanwhile (FramesHeld): with a cap of 30 and generated
 // frames the game showed 60 in play and its movies at 30, which read as stutter.
+namespace { float next_times[8]; int next_times_count = 0; }
+void NextFramesAt(const float* times, int count) { next_times_count = std::min(count, 8); for (int i = 0; i < next_times_count; ++i) next_times[i] = times[i]; }
 namespace { std::atomic<int> held_frames{0}; int MakeFramesNow(VkCommandBuffer cmd, VkImage color, VkImageView view, uint32_t w, uint32_t h, int count, const VkImage* out, const VkImageView* out_views, bool blend, uint64_t sequence); }
 bool FramesHeld() { return held_frames.load(std::memory_order_relaxed) >= 4; }
 int MakeFrames(VkCommandBuffer cmd, VkImage color, VkImageView view, uint32_t w, uint32_t h, int count, const VkImage* out, const VkImageView* out_views, bool blend, uint64_t sequence) {
     const int made = MakeFramesNow(cmd, color, view, w, h, count, out, out_views, blend, sequence);
+    next_times_count = 0;
     if (made > 0 || count <= 0 || !mkwvk::opts.framegen) held_frames.store(0, std::memory_order_relaxed);
     else held_frames.fetch_add(1, std::memory_order_relaxed);
     return made;
@@ -244,7 +248,8 @@ int MakeFramesNow(VkCommandBuffer cmd, VkImage color, VkImageView view, uint32_t
     using namespace mkwvk;
     maker = "";
     if (count <= 0 || !mkwvk::opts.framegen) { dlss_fg_idle(); return 0; }
-    if (dlss_fg_wanted() && dlss_fg_runs(count)) {
+    const bool placed = next_times_count == count; // (Dynamic: frames at given places - FSR 3.1's alone can)
+    if (!placed && dlss_fg_wanted() && dlss_fg_runs(count)) {
         const int made = dlss_fg_frames(cmd, color, view, w, h, count, out, out_views, blend, sequence);
         if (made == count) { maker = "DLSS FG"; return made; }
         if (dlss_fg_holds()) return 0; // (no 3D this frame - a menu, a movie: the game's frame alone)
@@ -256,7 +261,7 @@ int MakeFramesNow(VkCommandBuffer cmd, VkImage color, VkImageView view, uint32_t
     in.color = view; in.color_image = color; in.color_format = VK_FORMAT_R8G8B8A8_UNORM; in.width = w; in.height = h;
     in.depth = f.depth; in.motion = f.motion; in.render_width = f.width; in.render_height = f.height;
     in.jitter[0] = f.jitter[0]; in.jitter[1] = f.jitter[1]; in.camera = f.camera; in.frame_time_ms = f.frame_ms; in.reset = f.reset || !blend; in.sequence = sequence;
-    float times[kFsr3fiMaxMade]; for (int i = 0; i < count; ++i) times[i] = (float)(i + 1) / (float)(count + 1);
+    float times[kFsr3fiMaxMade]; for (int i = 0; i < count; ++i) times[i] = placed ? next_times[i] : (float)(i + 1) / (float)(count + 1);
     const int generated = (int)fsr3fi::generate(cmd, in, times, (uint32_t)count);
     { static const bool log = std::getenv("OOT_UPSCALER_LOG") != nullptr; static int shown = 0; if (log && shown++ < 20) RT_LOG("frame generation: asked %d, FSR 3.1 made %d (reset %d, blend %d, %ux%u from %ux%u, %.1f ms)", count, generated, (int)in.reset, (int)blend, w, h, f.width, f.height, f.frame_ms); }
     if (generated != count) return 0;

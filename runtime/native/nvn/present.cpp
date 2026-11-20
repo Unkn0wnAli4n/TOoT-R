@@ -242,11 +242,16 @@ int DynamicTarget() { // (the rate to be shown, or 0)
     const gfx::Settings& g = gfx::Current();
     static const char* forced = std::getenv("OOT_FRAME_GEN");
     if (forced || g.frame_gen != 7 || g.frame_cap <= 0) return 0;
+    static const bool whole = std::getenv("OOT_DYNAMIC_MULTIPLIER") != nullptr; (void)whole;
     int target = g.frame_cap;
     if (const double hz = gfx::display_refresh.load(std::memory_order_relaxed); hz > 30 && target > hz * 1.04) target = (int)(hz + 0.5);
     return target;
 }
 void UpdateDynamicFrames() {
+    // (the whole-multiplier Dynamic, the game held to cap / k: OOT_DYNAMIC_MULTIPLIER=1. Otherwise the game runs at its own
+    // rate and only the frames it misses are made: PresentWindowTexture)
+    static const bool whole = std::getenv("OOT_DYNAMIC_MULTIPLIER") != nullptr;
+    if (!whole) { dynamic_frames.store(0, std::memory_order_relaxed); return; }
     const int target = DynamicTarget();
     if (!target || achievable_ms <= 0) { dynamic_frames.store(0, std::memory_order_relaxed); return; }
     static int k = 1, pending = 0, held = 0;
@@ -281,7 +286,9 @@ int EffectiveFrameCap() {
         const int cap = gfx::Current().frame_cap; return cap && cap < 60 ? cap : 60; }
     if (uncapped) return 0;
     int cap = gfx::Current().frame_cap;
-    if (const int k = DynamicFrames(); k > 1) cap = std::max(1, DynamicTarget() / k); // (Dynamic: see dynamic_frames)
+    { static const bool whole = std::getenv("OOT_DYNAMIC_MULTIPLIER") != nullptr;
+      if (whole) { if (const int k = DynamicFrames(); k > 1) cap = std::max(1, DynamicTarget() / k); }
+      else if (const int target = DynamicTarget()) cap = target; } // (Dynamic: the game up to the cap; the frames it misses are made)
     // (with generated frames a cap is on the game's own frames - 30 shows as 60 - but menus and movies have no 3D scene
     // to make frames from and were shown at the bare cap: a title movie at 30. They get 60. OOT_CAP_MOVIES=1: the cap.)
     {static const bool keep = std::getenv("OOT_CAP_MOVIES") != nullptr;
@@ -603,6 +610,8 @@ std::mutex swap_mutex;
 struct FgPresenter {
     std::mutex m; std::condition_variable cv;
     int slot = -1, made = 0; double interval = 1.0 / 30; std::chrono::steady_clock::time_point posted_at; bool pending = false;
+    // (Dynamic: each picture's own time - the made ones, then the game's own if `own` - on the display's even clock)
+    bool placed = false, own = true; std::chrono::steady_clock::time_point at[output::fg::MostMade + 1];
     std::atomic<bool> rebuild_wanted{false};
     std::once_flag started;
     std::atomic<u64> shown{0};
@@ -626,13 +635,19 @@ void FgLoop() {
     }
     u64 cycles = 0, shown_before = 0, made_total = 0; auto report_at = std::chrono::steady_clock::now(), rate_at = report_at; u64 rate_before = 0; int said = -1;
     for (;;) {
-        int slot, made; double interval; std::chrono::steady_clock::time_point at;
-        { std::unique_lock lock{fgp.m}; fgp.cv.wait(lock, [] { return fgp.pending; }); fgp.pending = false; slot = fgp.slot; made = fgp.made; interval = fgp.interval; at = fgp.posted_at; }
+        int slot, made; double interval; std::chrono::steady_clock::time_point at; bool placed, own; std::chrono::steady_clock::time_point times[output::fg::MostMade + 1];
+        { std::unique_lock lock{fgp.m}; fgp.cv.wait(lock, [] { return fgp.pending; }); fgp.pending = false; slot = fgp.slot; made = fgp.made; interval = fgp.interval; at = fgp.posted_at;
+          placed = fgp.placed; own = fgp.own; std::copy(std::begin(fgp.at), std::end(fgp.at), times); }
+        { static const bool trace = std::getenv("OOT_FG_TRACE") != nullptr; static int shown = 0;
+          if (trace && (shown++ < 10 || shown % 100 == 0)) RT_LOG("fg set: made %d placed %d own %d, first at %+.2f ms", made, (int)placed, (int)own, std::chrono::duration<double, std::milli>(times[0] - std::chrono::steady_clock::now()).count()); }
         std::lock_guard swap{swap_mutex};
-        if (used) { VK_CHECK(vkWaitForFences(vk.device, (u32)used, fences, VK_TRUE, UINT64_MAX)); VK_CHECK(vkResetFences(vk.device, (u32)used, fences)); used = 0; }
+        // (only the fences of what was submitted: a set a newer one overtook skips its made frames, and waiting on their
+        // fences - never submitted - stopped this thread for good while the game ran on: the picture froze)
+        if (used) { VkFence wait[Steps]; int n = 0; for (int i = 0; i < Steps; ++i) if (used & (1 << i)) wait[n++] = fences[i];
+            VK_CHECK(vkWaitForFences(vk.device, (u32)n, wait, VK_TRUE, UINT64_MAX)); VK_CHECK(vkResetFences(vk.device, (u32)n, wait)); used = 0; }
         if (!sc.swapchain || fgp.rebuild_wanted.load()) continue;
         if (made != said) { said = made; if (made) RT_LOG("frame generation: %d made for each of the game's frames by %s (%.0f fps of the game's)", made, ls::FrameMaker(), 1.0 / interval); }
-        const int steps = made + 1;
+        const int steps = made + (placed && !own ? 0 : 1);
         bool failed = false;
         for (int i = 0; i < steps && !failed; ++i) {
             // (a newer set is waiting: the rest of this one is too late to show. Its own frame is shown in place of the
@@ -658,9 +673,10 @@ void FgLoop() {
             VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO}; submit.waitSemaphoreCount = 1; submit.pWaitSemaphores = &acquired[i]; submit.pWaitDstStageMask = &wait_stage;
             submit.commandBufferCount = 1; submit.pCommandBuffers = &cmd; submit.signalSemaphoreCount = 1; submit.pSignalSemaphores = &sc.rendered[image_index];
             { std::lock_guard queue{vk.queue_mutex}; VK_CHECK(vkQueueSubmit(vk.queue, 1, &submit, fences[i])); }
-            used = i + 1;
+            used |= 1 << i;
             // (its time: the set's pictures a frame time apart in all, the first at once)
-            if (i > 0) rt::SleepUntilNs(std::chrono::duration_cast<std::chrono::nanoseconds>((at + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(interval * i / steps))).time_since_epoch()).count());
+            if (placed) rt::SleepUntilNs(std::chrono::duration_cast<std::chrono::nanoseconds>(times[i].time_since_epoch()).count());
+            else if (i > 0) rt::SleepUntilNs(std::chrono::duration_cast<std::chrono::nanoseconds>((at + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(interval * i / steps))).time_since_epoch()).count());
             VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR}; present.waitSemaphoreCount = 1; present.pWaitSemaphores = &sc.rendered[image_index];
             present.swapchainCount = 1; present.pSwapchains = &sc.swapchain; present.pImageIndices = &image_index;
             VkResult shown;
@@ -669,6 +685,7 @@ void FgLoop() {
             else if (shown != VK_SUCCESS) failed = true;
             fgp.shown.fetch_add(1, std::memory_order_relaxed);
         }
+        { static const bool trace = std::getenv("OOT_FG_TRACE") != nullptr; static int n = 0; if (trace && ++n % 100 == 0) RT_LOG("fg set done: %d shown, failed %d", steps, (int)failed); }
         made_total += made;
         const auto now = std::chrono::steady_clock::now();
         if (const double secs = std::chrono::duration<double>(now - rate_at).count(); secs >= 0.5) { // (the counter's rate)
@@ -679,9 +696,10 @@ void FgLoop() {
         }
     }
 }
-void FgPost(int slot, int made, double interval) {
+void FgPost(int slot, int made, double interval, bool placed = false, bool own = true, const std::chrono::steady_clock::time_point* at = nullptr) {
     std::call_once(fgp.started, [] { std::thread(FgLoop).detach(); });
-    { std::lock_guard lock{fgp.m}; fgp.slot = slot; fgp.made = made; fgp.interval = interval; fgp.posted_at = std::chrono::steady_clock::now(); fgp.pending = true; }
+    { std::lock_guard lock{fgp.m}; fgp.slot = slot; fgp.made = made; fgp.interval = interval; fgp.posted_at = std::chrono::steady_clock::now(); fgp.pending = true;
+      fgp.placed = placed; fgp.own = own; if (at) std::copy(at, at + made + (own ? 1 : 0), fgp.at); }
     fgp.cv.notify_one();
 }
 } // namespace
@@ -880,7 +898,7 @@ void PresentWindowTexture(u64 window, s32 index) {
         last = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     }
     if (!fg && dst != swap_image) { output::ToSwapchain(sc.cmd, last, swap_image, sc.extent); last = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; }
-    int fg_made = 0; double fg_interval = 1.0 / 30;
+    int fg_made = 0; double fg_interval = 1.0 / 30; bool fg_placed = false, fg_own = true; std::chrono::steady_clock::time_point fg_at[output::fg::MostMade + 1];
     if (fg) { // the frame into fg's ring, and the frames between it and the one before
         static auto before = std::chrono::steady_clock::now(); static double interval = 1.0 / 30;
         const auto now = std::chrono::steady_clock::now(); const double dt = std::chrono::duration<double>(now - before).count(); before = now;
@@ -888,8 +906,39 @@ void PresentWindowTexture(u64 window, s32 index) {
         if (!gap) interval += (dt - interval) * 0.25;
         fg_interval = interval;
         output::fg::Stored(sc.cmd, fg_slot, last);
+        static const bool whole_dynamic = std::getenv("OOT_DYNAMIC_MULTIPLIER") != nullptr;
+        if (const int target = whole_dynamic ? 0 : DynamicTarget(); target > 0) {
+            // Dynamic: the game runs at its own rate up to the cap, and the pictures go out on an even clock at the cap's
+            // rate. Each picture is the game's motion at its own moment - shown one game frame late, as with any frame
+            // generation - so the clock's ticks before the next game frame are made between this frame and the one
+            // before, at their places (AMD FSR 3.1's frame interpolation takes any place; NVIDIA's spaces them evenly
+            // and sits this out), and a tick at the end of the span is the game's own frame. A game at the cap makes
+            // none: only the frames the game misses are made, 15 a second for a game at 45 with a cap of 60.
+            const double period = 1.0 / target; static auto grid = now;
+            const auto tick = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(period));
+            const auto span = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(interval));
+            // (never more than one of the game's frames ahead: a clock left running through a menu or a load - nothing made
+            // there - put the pictures 0.8 s late, and the display all but stopped)
+            if (grid < now || grid > now + span + tick) grid = now;
+            // (the ticks in this frame's span; the last shows the game's own frame - every one of them is shown - and the
+            // ones before it are made at their places: 45 of the game's and 15 made a second for a game at 45, cap 60)
+            std::chrono::steady_clock::time_point at[output::fg::MostMade + 1]; float places[output::fg::MostMade]; int ticks = 0;
+            const auto end = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(interval));
+            while (grid <= end && ticks <= output::fg::MostMade) { at[ticks] = grid; places[std::min(ticks, output::fg::MostMade - 1)] = (float)std::clamp(std::chrono::duration<double>(grid - now).count() / interval, 0.02, 0.98); ++ticks; grid += tick; }
+            if (!ticks) { at[0] = grid; ticks = 1; grid += tick; } // (no tick in the span: the frame at the next one)
+            const bool at_cap = interval <= period * 1.05; // (a game at the cap within its jitter: nothing to make)
+            int made = gap || !fg_have_before || at_cap ? 0 : ticks - 1; bool own = true;
+            if (!made) { at[0] = now; ticks = 1; grid = now + tick; } // (nothing to make: the frame at once, the clock from here)
+            // (a made frame's place: the game's motion as long before this frame as its tick is before the last one)
+            for (int i = 0; i < made; ++i) places[i] = (float)std::clamp(1.0 - std::chrono::duration<double>(at[ticks - 1] - at[i]).count() / interval, 0.02, 0.98);
+            if (made) { ls::NextFramesAt(places, made); const int got = output::fg::Generate(sc.cmd, fg_slot, made, fg_have_before && !gap, ++fg_sequence);
+                if (got != made) { at[0] = now; made = 0; own = true; grid = now + tick; } } // (none made: as above)
+            fg_made = made; fg_own = own; std::copy(at, at + made + (own ? 1 : 0), fg_at); fg_placed = true;
+            { static u64 n = 0, made_sum = 0; made_sum += made; if (++n % 600 == 0) { static int told = 0; if (told++ < 20) RT_LOG("frame generation: Dynamic shows %d: %.1f made for each of the game's frames (%.0f fps of the game's)", target, made_sum / 600.0, 1.0 / interval); made_sum = 0; } }
+        } else {
         const int n = output::fg::Multiplier(1.0 / interval);
         fg_made = output::fg::Generate(sc.cmd, fg_slot, n - 1, fg_have_before && !gap, ++fg_sequence);
+        }
         fg_have_before = true;
     } else {
         VkImageMemoryBarrier to_present = to_dst;
@@ -913,7 +962,7 @@ void PresentWindowTexture(u64 window, s32 index) {
     if (!fg) latency::FrameSubmitting();
     VK_CHECK(vkQueueSubmit(vk.queue, 1, &submit, sc.fence));
     if (!fg) latency::Submitted();
-    if (fg) FgPost(fg_slot, fg_made, fg_interval); // (shown by its thread, in the queue's order after this frame's recording)
+    if (fg) FgPost(fg_slot, fg_made, fg_interval, fg_placed, fg_own, fg_at); // (shown by its thread, in the queue's order after this frame's recording)
     VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     present.waitSemaphoreCount = 1;
     present.pWaitSemaphores = &sc.rendered[image_index];
