@@ -64,6 +64,12 @@ const std::string& DataDir();
 // Names the calling thread (debuggers, profilers, crash reports).
 void SetThreadName(const char* name);
 #ifdef _WIN32
+// The calling thread's id, and a thread's priority from a Unix nice value (0-1: normal; 2-6: below normal; 7 or more:
+// lowest). True when it was set.
+int HostThreadId();
+bool SetThreadNice(int thread_id, int nice);
+#endif
+#ifdef _WIN32
 // The name of the function at an offset in tootr.exe, from tootr.sym beside it (tools/build_game.py writes it): "" when
 // there is no such file. offset_out: how far into the function.
 const char* SymbolAt(unsigned long long rva, unsigned long long* offset_out);

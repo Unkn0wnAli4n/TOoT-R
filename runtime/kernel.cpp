@@ -634,6 +634,19 @@ void ApplyThreadPriority(KThread* t) {
         static std::atomic<int> said{0};
         if (said++ < 12) RT_LOG("thread %llu (entry %#llx): priority %d, host nice %d", (unsigned long long)t->id, (unsigned long long)t->entry, t->priority, nice);
     }
+#elif defined(_WIN32)
+    // (Windows: the same, as thread priorities, while it is tried: OOT_THREAD_NICE=10 turns it on there. On a laptop's
+    // few cores the game's loader and streaming threads take time from its main thread as equals. Windows lets a
+    // thread's priority go back up too. Its main thread, one step below the base, stays normal.)
+    static const int scale = std::getenv("OOT_THREAD_NICE") ? std::atoi(std::getenv("OOT_THREAD_NICE")) : 0;
+    if (scale <= 0 || !t || !t->host_tid) return;
+    const int nice = std::clamp((t->priority - 44) * scale / 10, 0, 15);
+    if (t->host_nice == nice) return;
+    if (rt::SetThreadNice(t->host_tid, nice)) {
+        t->host_nice = nice;
+        static std::atomic<int> said{0};
+        if (said++ < 12) RT_LOG("thread %llu (entry %#llx): priority %d, host nice %d", (unsigned long long)t->id, (unsigned long long)t->entry, t->priority, nice);
+    }
 #else
     (void)t;
 #endif
@@ -645,6 +658,8 @@ void RunThread(std::shared_ptr<KThread> t) {
     BindThread(t.get());
 #ifdef __linux__
     { std::lock_guard lock{k_lock}; t->host_tid = (int)syscall(SYS_gettid); ApplyThreadPriority(t.get()); }
+#elif defined(_WIN32)
+    { std::lock_guard lock{k_lock}; t->host_tid = rt::HostThreadId(); ApplyThreadPriority(t.get()); }
 #endif
     { // host name: guest thread id and entry (profiles and debuggers show it)
         char name[16]; std::snprintf(name, sizeof name, "g%u-%llx", t->id, (unsigned long long)(t->entry & 0xffffff));

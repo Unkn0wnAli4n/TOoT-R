@@ -201,6 +201,15 @@ void SetThreadName(const char* name) {
         DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &named_threads[slot].handle, 0, FALSE, DUPLICATE_SAME_ACCESS);
     }
 }
+int HostThreadId() { return (int)GetCurrentThreadId(); }
+bool SetThreadNice(int thread_id, int nice) {
+    HANDLE h = OpenThread(THREAD_SET_LIMITED_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)thread_id);
+    if (!h) return false;
+    const int priority = nice <= 1 ? THREAD_PRIORITY_NORMAL : nice < 7 ? THREAD_PRIORITY_BELOW_NORMAL : THREAD_PRIORITY_LOWEST;
+    const bool ok = GetThreadPriority(h) == priority || SetThreadPriority(h, priority);
+    CloseHandle(h);
+    return ok;
+}
 const char* SymbolAt(unsigned long long rva, unsigned long long* offset_out) {
     struct Entry { unsigned long long rva; std::string name; };
     static const std::vector<Entry> table = [] {

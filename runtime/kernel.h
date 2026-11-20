@@ -24,6 +24,7 @@ struct KThread : KObject {
     u64 affinity = 0;            // allowed cores (0: the ideal core only)
     Cpu* cpu = nullptr;
     std::thread host;
+    int host_nice = 0;           // (Windows: the priority last given, as a nice value)
     int host_tid = 0;            // the host thread's kernel id once it runs (its nice follows the priority)
     bool exited = false;
     bool cancel_wait = false;
