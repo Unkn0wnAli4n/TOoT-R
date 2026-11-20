@@ -504,7 +504,7 @@ void ToolRows(const char*& help) {
     if (ImGui::CollapsingHeader("Movement", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::BeginDisabled(!playing);
         ImGui::Checkbox("Flight (no clip)", &tools::flight);
-        hint("Link flies through everything: the left stick moves him, D-pad up and down change his height, B is faster. Off at every start.");
+        hint("Link flies through everything: the left stick moves him, D-pad up and down change his height, B is faster. Off at every start. After flying, Link can keep falling on steps and small rocks until the next area change: to travel, the Teleport list is the better way.");
         ImGui::SameLine();
         ImGui::Checkbox("Free Camera", &tools::free_camera);
         hint("The camera leaves Link: the left stick moves it, the right stick turns it, D-pad up and down change its height, B is faster. Link stands still meanwhile.");
