@@ -25,6 +25,8 @@
 #include "graphics_settings.h"
 #include "input_settings.h"
 
+void oot_note_link(unsigned long long components); // (engine_hooks.cpp: Link's body, for the ledge fix above 60 fps)
+
 namespace tools {
 namespace {
 constexpr u64 Main = 0x800000000ull;
@@ -544,6 +546,7 @@ void PlayerUpdate(Cpu* c, unsigned long long actor) {
     const u64 components = Load<u64>(actor + 624);
     const u64 movement = Readable(components) ? Load<u64>(components + 800) : 0;
     if (!Readable(movement) || Load<u64>(movement + 24) != actor || !IsPlayer(movement - 0x1d50)) return;
+    ::oot_note_link(components);
     // (Link can be updated by different worker threads on successive frames)
     static std::mutex one;
     std::unique_lock lock{one, std::try_to_lock};

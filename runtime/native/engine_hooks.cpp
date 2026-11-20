@@ -569,8 +569,144 @@ void TurnRate(Cpu* c) {
 // The movie player counts its updates, and a cutscene with a movie places its narration, rumble and end by that count:
 // above 60 fps they ran ahead of the picture. The count grows by the frames' time. (w8: the count plus one.)
 void MovieFrames(Cpu* c) { c->x[8] = (u32)((u32)c->x[8] - 1 + Whole(c->x[20] + 760, StepNow())); }
+
+// A character on a moving floor is carried by the floor's velocity; three update modules first test the physics' 1/dt
+// against 100 and above it take a tenth of that velocity (meant for slowed time: at 60 fps 1/dt is 60). Above 100 fps
+// that fired every frame, and Link stood still on the Shadow Temple's barge while it sailed off under him. While the
+// frame's step is a part of one, the test is the game's as it would be at 60 fps: 1/dt times the step. Slowed time still
+// takes the tenth. Sites 107-109, at the tenth's block (1/dt in s0): true goes on as if the test had failed.
+// (OOT_FPS_LOG=1: how often each of these changed the game's way, every 600 times)
+void Fired(const char* what) {
+    static const bool on = Switch("OOT_FPS_LOG", false);
+    if (!on) return;
+    static std::mutex m; static std::unordered_map<std::string, u64> n;
+    std::lock_guard lock{m};
+    if (++n[what] % 600 == 1) RT_LOG("above 60 fps: %s (%llu times)", what, (unsigned long long)n[what]);
+}
+bool FloorCarryFull(Cpu* c) {
+    const float step = StepNow();
+    if (!Partial(step)) return false;
+    const float rate = LowFloat(c->v[0]);
+    const bool full = std::isfinite(rate) && rate * step <= 100.0f;
+    if (full) Fired("a moving floor's full carry kept");
+    return full;
+}
+
+// A horse's jump sets the blend into its jump animation each frame so the blend ends at takeoff; on a step under 1
+// (slow motion at 60 fps) it adds the step to last frame's blend instead. Above 60 fps every step is under 1, the blend
+// never ended, and Epona galloped through fences while her body jumped. A step that is the frame's own is not slow
+// motion: site 110 (the slow-motion path; the horse's step in s10) goes on to the normal one.
+bool HorseWholeStep(Cpu* c) {
+    const float frame = StepNow(), step = LowFloat(c->v[10]);
+    const bool whole = Partial(frame) && std::fabs(step - frame) <= 0.001f * frame;
+    if (whole) Fired("a horse's jump blend at the normal rate");
+    return whole;
+}
+
+// An animation that loops over one frame or less is one pose (the frozen Zoras under the ice: start 0, end 1). At 60 fps
+// every update lands on the same phase; above it the phase moved by a part of a frame each update and the pose twitched.
+// Such a loop's clock takes whole frames of the step (the rest kept per entry), and its drawn time is its start.
+bool OneFramePose(float start, float end) { return end > start && end - start <= 1.0f; }
+struct LoopCarry { u64 at; float rest; };
+LoopCarry loop_carries[4096];
+// Sites 111, 112: a clock advance, step (s8) times the speed in s1 / s0; x20 the entry (start +16, end +20).
+void LoopStep(Cpu* c, int speed_reg) {
+    const float step = LowFloat(c->v[8]);
+    if (!Partial(StepNow()) || !(step > 0.0f)) return;
+    const u64 entry = c->x[20];
+    if (!Readable(entry) || !OneFramePose(Load<float>(entry + 16), Load<float>(entry + 20))) return;
+    float whole;
+    {
+        std::lock_guard lock{mutex};
+        u32 h = (u32)((entry * 0x9E3779B97F4A7C15ull) >> 40) % 4096, k = 0;
+        while (k < 32 && loop_carries[(h + k) % 4096].at && loop_carries[(h + k) % 4096].at != entry) ++k;
+        LoopCarry& slot = loop_carries[(h + (k < 32 ? k : 0)) % 4096];
+        if (slot.at != entry) { slot.at = entry; slot.rest = 0.0f; }
+        const float sum = slot.rest + step;
+        whole = std::floor(sum);
+        slot.rest = sum - whole;
+    }
+    V128& speed = c->v[speed_reg];
+    SetLowFloat(speed, LowFloat(speed) * (whole / step)); // (step * this = whole * the speed)
+    Fired("a one-frame loop's clock in whole frames");
+}
+// Site 113: the time a skeleton is drawn at, in s0, about to be stored at x22 (its range at +4, +8).
+void LoopPose(Cpu* c) {
+    if (!Partial(StepNow()) || !Readable(c->x[22])) return;
+    const float start = Load<float>(c->x[22] + 4), end = Load<float>(c->x[22] + 8);
+    if (OneFramePose(start, end)) { SetLowFloat(c->v[0], start); Fired("a one-frame loop drawn at its start"); }
+}
+
+// Pulling up onto a ledge, Link's animation drives his body: each update the game sets a target (his position plus this
+// frame's move) and asks the physics for the velocity that reaches it. At 60 fps he lands on it; above 60 the solver
+// delivers only part of the move (0.86 at 120 fps), the next target starts from where he ended up, and the shortfall is
+// never made up: he slid back off the lip. While the step is a part of a frame Link's target also carries what the physics
+// left of the last one (at most three of this frame's moves). A climb starts from the game's own target: the carry needs
+// the update before. Site 95 notes Link's body; sites 114, 115 (the two copies of the driven path, the controller in x20,
+// its body at +0xf0, the target at +0x3c, the flags at +0x100).
+std::atomic<u64> link_body{0};
+std::atomic<u32> link_updates{0};
+struct DriveCarry { float target[3], game[3]; u64 body; u32 update; bool held; } drive;
+void DriveTarget(Cpu* c) {
+    const u64 controller = c->x[20];
+    if (!Readable(controller)) return;
+    const u64 body = Load<u64>(controller + 0xf0);
+    if (!body || body != link_body.load(std::memory_order_relaxed) || !Readable(body)) return;
+    const float step = StepNow();
+    if (!Partial(step) || (Load<u64>(controller + 0x100) & 0x180) != 0x180) return; // (the gap: the next driven call starts again)
+    float at[3] = {Load<float>(body + 0x8c), Load<float>(body + 0x9c), Load<float>(body + 0xac)};
+    float target[3], game[3];
+    std::memcpy(target, reinterpret_cast<const void*>(controller + 0x3c), sizeof target);
+    std::memcpy(game, target, sizeof game);
+    for (int i = 0; i < 3; ++i) if (!std::isfinite(target[i]) || !std::isfinite(at[i]) || std::fabs(target[i]) > 1e30f || std::fabs(at[i]) > 1e30f) return;
+    const u32 update = link_updates.load(std::memory_order_relaxed);
+    {
+        std::lock_guard lock{mutex};
+        const bool same = drive.held && drive.body == body && update - drive.update <= 1u;
+        drive.update = update;
+        if (same && (!std::memcmp(drive.game, target, sizeof target) || !std::memcmp(drive.target, target, sizeof target))) {
+            std::memcpy(target, drive.target, sizeof target); // (run again, or not renewed: the target given)
+        } else {
+            std::memcpy(drive.game, target, sizeof target);
+            if (same) {
+                float carry[3], carried = 0.0f, move = 0.0f;
+                for (int i = 0; i < 3; ++i) {
+                    carry[i] = drive.target[i] - at[i];
+                    carried += carry[i] * carry[i];
+                    move += (target[i] - at[i]) * (target[i] - at[i]);
+                }
+                const float scale = carried > 9.0f * move ? 3.0f * std::sqrt(move / carried) : 1.0f;
+                for (int i = 0; i < 3 && carried > 0.0f; ++i) target[i] += carry[i] * scale;
+            }
+            std::memcpy(drive.target, target, sizeof target);
+            drive.body = body; drive.held = true;
+        }
+    }
+    if (std::memcmp(game, target, sizeof target)) { std::memcpy(reinterpret_cast<void*>(controller + 0x3c), target, sizeof target); Fired("Link's driven body given its shortfall"); }
+}
+
+// The texture data manager asks for a compaction round every frame it has gaps: each round moves textures and makes them
+// again (11-22 re-made per 300 frames standing in Castle Town). Site 116 (the request) lets it ask at most once a second.
+// OOT_TEX_COMPACT_MS=<ms>: another gap (0: every frame, as the game has it).
+bool CompactNotDue() {
+    static const long long gap_ms = std::getenv("OOT_TEX_COMPACT_MS") ? std::atoll(std::getenv("OOT_TEX_COMPACT_MS")) : 1000;
+    if (gap_ms <= 0) return false;
+    static std::atomic<long long> last{0};
+    const long long now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    long long was = last.load(std::memory_order_relaxed);
+    if (was && now - was < gap_ms) { Fired("a texture compaction request held"); return true; }
+    return !last.compare_exchange_strong(was, now);
+}
 } // namespace highfps
 } // namespace
+
+// (debug_tools.cpp's player hook: Link's components, at each of his updates)
+void oot_note_link(unsigned long long components) {
+    highfps::link_updates.fetch_add(1, std::memory_order_relaxed);
+    u64 p = components;
+    for (u64 off : {0x50ull, 0x20ull, 0x10ull, 8ull, 0x20ull}) p = Readable(p) ? Load<u64>(p + off) : 0;
+    if (Readable(p)) highfps::link_body.store(p, std::memory_order_relaxed);
+}
 
 extern "C" void oot_site(Cpu* c, int id) {
     switch (id) {
@@ -611,6 +747,10 @@ extern "C" void oot_site(Cpu* c, int id) {
     case 81: case 82: case 83: case 84: highfps::MusicFlags(c); break;
     case 85: highfps::TurnRate(c); break;
     case 86: highfps::MovieFrames(c); break;
+    case 111: highfps::LoopStep(c, 1); break;
+    case 112: highfps::LoopStep(c, 0); break;
+    case 113: highfps::LoopPose(c); break;
+    case 114: case 115: highfps::DriveTarget(c); break;
     case 87: tools::Life(c, true); break;
     case 88: tools::Life(c, false); break;
     case 89: case 90: tools::Speed(c, c->x[0], false); break;
@@ -982,6 +1122,9 @@ extern "C" bool oot_fn(Cpu* c, int id) {
     case 99: return tools::SaveRequest(c);
     case 93: return highfps::SoundGate(c);
     case 94: highfps::MusicBegin(); return false;
+    case 107: case 108: case 109: return highfps::FloorCarryFull(c);
+    case 110: return highfps::HorseWholeStep(c);
+    case 116: return highfps::CompactNotDue();
     // Site 56: the camera's turn back behind Link as he walks (its follow state's movement path) is left out when the
     // Auto-centre Camera row is Off: x25 gets the parameter base that path would restore, and the game goes on where
     // the camera's other yaw paths meet (Longshot's patch_camera_centering). Pitch, collision and Z-targeting stay.

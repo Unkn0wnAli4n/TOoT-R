@@ -119,6 +119,9 @@ BLOCK_SITES = (  # (block start, id)
     # constants 1920.0 and 1080.0 in w8; the render targets' pool size at x19+1464; a module heap's use in x0 (its budget
     # at x21 + x22 * 8); the display-size object's set-up (its config in x20: the docked size at +8, +12)
     (0xe83000, 101), (0xe83040, 102), (0xe83048, 103), (0x36aea54, 104), (0x3b5b4e0, 105), (0x1087b90, 106),
+    # above 60 frames a second: an animation clock's two advances (x20 the entry; the step in s8, the speed in s1 / s0) and
+    # the drawn time's store (s0, at x22); the two copies of the driven-body path (Link's ledge pull-up; x20 the controller)
+    (0x2afe04, 111), (0x2b01d0, 112), (0x924e50, 113), (0x4d51e4, 114), (0x4d5e9c, 115),
 )
 CALL_SITES = ((0x436910, 30), (0x436da4, 31), (0x436f1c, 32), (0x437098, 33), (0xa7ca9c, 34),
               (0x3b5b440, 35), (0xb523ac, 36))  # the Graphics module heap being made (its size in x0), and the heap made of its rest  # (the call's return address, id)
@@ -131,7 +134,12 @@ HEAD_SITES = ((0x624c80, 50), (0xf5c80, 51), (0xeb380, 52), (0xd7a820, 53), (0x3
               (0xba72d0, 99))                                     # a save request (the reason in w1, the mode in w2)
 # (a block's start, where to go on when oot_fn says so, id): the player camera's turn back behind Link as he walks
 # (state 3's movement path; the join is where the camera's other yaw paths meet)
-JUMP_SITES = ((0x627210, 0x625ad8, 56),)
+JUMP_SITES = ((0x627210, 0x625ad8, 56),
+              # above 60 frames a second: the floor carry's tenth (1/dt in s0) in its three update modules, back to the
+              # full carry; a horse's slow-motion jump blend (its step in s10), back to the normal one
+              (0x13a39c, 0x13a074, 107), (0x13dad4, 0x13d714, 108), (0x389af24, 0x389ac30, 109), (0x2c3ae24, 0x2c3ae48, 110),
+              # the texture data manager's compaction request (+0x308 = 1), left out until a second has passed
+              (0x77727c, 0x777288, 116))
 
 # What each hook is for, as the settings window names it (a game version without a hook's site: that is off).
 FEATURES = (
@@ -143,7 +151,8 @@ FEATURES = (
     ((62, 64), "DLSS and FSR (their camera jitter)"), ((70, 86), "correct game logic above 60 frames a second"),
     ((87, 88), "Damage Taken and Infinite Health"), ((89, 92), "Movement Speed"), ((93, 94), "sound above 60 frames a second"),
     ((95, 98), "the Cheats tab's tools (teleport, flight, free camera, ...)"), ((99, 99), "the Autosave switch"),
-    ((101, 106), "Output Resolution"),
+    ((101, 106), "Output Resolution"), ((107, 115), "correct game logic above 60 frames a second"),
+    ((116, 116), "texture heap repacking once a second"),
 )
 
 
