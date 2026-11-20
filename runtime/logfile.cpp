@@ -51,6 +51,18 @@ void OpenLogFile() {
         fs::rename(dir / "tootr.2.log", dir / "tootr.3.log", ec);
         fs::rename(dir / "tootr.1.log", dir / "tootr.2.log", ec);
         fs::rename(path, dir / "tootr.1.log", ec);
+        // (Windows refuses to rename a file another program has open - the log being read in an editor or sent in a
+        // browser - and the last run's log was then lost from the names while this run's went after it in the same
+        // file: it is copied instead, and this run's starts empty)
+        if (ec && fs::exists(path)) {
+            std::error_code copied;
+            fs::copy_file(path, dir / "tootr.1.log", fs::copy_options::overwrite_existing, copied);
+#ifdef _WIN32
+            if (!copied) if (FILE* t = _wfopen(path.wstring().c_str(), L"wb")) std::fclose(t);
+#else
+            if (!copied) if (FILE* t = std::fopen(path.string().c_str(), "wb")) std::fclose(t);
+#endif
+        }
     }
     std::fflush(stdout); std::fflush(stderr);
     const int console = dup(fileno(stderr)); // (may be -1: a start without any console)
