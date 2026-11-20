@@ -4629,7 +4629,8 @@ void ExecuteSegmentsParallel(const std::vector<ParallelSegment>& segments,const 
             // between the queue's segments; a group holds the batch lock from end to end). Castle Town's main pass was 7 ms
             // of committing with nothing submitted, then 11 ms of GPU work in one batch that the game's next frame
             // waited for (Steam Deck, 2026-11-17). OOT_GROUP_SUBMIT_US=<us> (0: only between groups).
-            static const u64 every=std::getenv("OOT_GROUP_SUBMIT_US")?std::strtoull(std::getenv("OOT_GROUP_SUBMIT_US"),nullptr,10)*1000:PoolsInGpuMemory()?500'000:0;
+            // (1.5 ms since 2026-11-20: with 0.5 the Deck submitted 30 times a frame, each costly in the kernel - see SubmitWhileRecording)
+            static const u64 every=std::getenv("OOT_GROUP_SUBMIT_US")?std::strtoull(std::getenv("OOT_GROUP_SUBMIT_US"),nullptr,10)*1000:PoolsInGpuMemory()?1'500'000:0;
             if(every&&k+1<segments.size()){
                 static auto last=std::chrono::steady_clock::now();static u64 flushes_seen=0;
                 const auto now=std::chrono::steady_clock::now();

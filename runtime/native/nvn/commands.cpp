@@ -160,7 +160,9 @@ void SubmitWhileRecording() {
     // driver checking each import. With the pools as GPU memory in place a submission is 0.12 ms, and the Deck's GPU
     // stood idle for almost half of a frame waiting for the next piece: every 1 ms there too, Castle Town 21.8 -> 23.6
     // fps, 2026-11-17.)
-    static const u64 every = std::getenv("OOT_SUBMIT_EVERY_US") ? std::strtoull(std::getenv("OOT_SUBMIT_EVERY_US"), nullptr, 10) * 1000 : Vk().properties.vendorID == 0x10DE || nvn::PoolsInGpuMemory() ? 1'000'000 : 4'000'000;
+    // (2026-11-20, Steam Deck, Castle Town: 30 submissions a frame were 17% of the executor in the kernel's submit and the
+    // driver's checks; every 2.5 ms, 14 a frame: 19.5 -> 23.2 fps over five pairs. NVIDIA's 1 ms stays.)
+    static const u64 every = std::getenv("OOT_SUBMIT_EVERY_US") ? std::strtoull(std::getenv("OOT_SUBMIT_EVERY_US"), nullptr, 10) * 1000 : Vk().properties.vendorID == 0x10DE ? 1'000'000 : nvn::PoolsInGpuMemory() ? 2'500'000 : 4'000'000;
     if (!every) return;
     static auto last = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
