@@ -1,3 +1,4 @@
+#include <unordered_map>
 #include <sched.h>
 #include <deque>
 #include <bit>
@@ -406,6 +407,19 @@ void Init() {
 void Push(u64 page, u32 shadow) {
     if (dirty_count == MaxDirty) { overflow = true; if (shadow != NoShadow) free_slots[free_count++] = shadow; return; }
     dirty[dirty_count++] = {page, shadow};
+}
+// (lock held) Pages written in many captures: left writable (CapturePoolWrites). On by default on Windows, where a write
+// fault is expensive; OOT_HOT_PAGES=1 / 0 elsewhere or to turn it off.
+std::unordered_map<u64, u32> heat, hot; u64 hot_generation = 0;
+bool HotPagesOn() {
+    static const bool on = [] { const char* e = std::getenv("OOT_HOT_PAGES");
+#ifdef _WIN32
+        return !e || std::atoi(e) != 0;
+#else
+        return e && std::atoi(e) != 0;
+#endif
+    }();
+    return on;
 }
 // ---- CPU writes to uploaded texture memory ------------------------------------------------------
 // Pages of CPU-uploaded textures are write-protected ("armed") before their texels are read. The
@@ -1290,19 +1304,34 @@ void* CapturePoolWrites() {
         if (!track::dirty_count) return nullptr;
         entries.assign(track::dirty, track::dirty + track::dirty_count);
         track::dirty_count = 0;
+        if (++track::hot_generation % 600 == 0) track::heat.clear(); // (how often each page was written: in windows of 600 captures)
         // Protect again first: later writes fault and are queued with a fresh shadow.
         for (const auto& e : entries) {
             u8& state = *track::State(e.page);
             if (state != track::Dirty) continue;
+            if (u64* back = track::BackSerial(e.page); back && *back > 1) { state = track::Protected; continue; } // (stays inaccessible until its copy)
+            if (track::HotPagesOn()) {
+                // A page the game writes all the time (a movie's pictures: 800 pages a frame) stays writable: its contents
+                // are compared with a fresh shadow at each capture instead. On Windows each write fault cost ~1 ms there,
+                // and a movie after a long session ran at 1 fps (issue #21). One unchanged for 1200 captures is protected again.
+                auto hot = track::hot.find(e.page);
+                if (hot == track::hot.end() && ++track::heat[e.page] >= 8 && track::hot.size() < 8192) hot = track::hot.emplace(e.page, 0u).first;
+                if (hot != track::hot.end() && hot->second < 1200) {
+                    u32 slot = track::NoShadow;
+                    if (track::free_count) { slot = track::free_slots[--track::free_count]; std::memcpy(track::shadows + (u64)slot * track::PageSize, reinterpret_cast<void*>(e.page), track::PageSize); }
+                    track::Push(e.page, slot); // (still Dirty and writable: captured again next time)
+                    continue;
+                }
+                if (hot != track::hot.end()) track::hot.erase(hot);
+            }
             state = track::Protected;
-            if (u64* back = track::BackSerial(e.page); back && *back > 1) continue; // (stays inaccessible until its copy)
             mprotect(reinterpret_cast<void*>(e.page), track::PageSize, PROT_READ);
         }
     }
     struct Range { std::shared_ptr<Pool> pool; u64 from, to; };
     std::vector<Range> ranges; std::vector<u32> freed; u64 bytes = 0;
     for (const auto& e : entries) {
-        bool covered = false;
+        bool covered = false; const u64 bytes_before = bytes;
         auto it = pools_by_address.upper_bound(e.page + track::PageSize - 1);
         while (it != pools_by_address.begin()) {
             --it;
@@ -1325,11 +1354,13 @@ void* CapturePoolWrites() {
                 else if (!changed && open) { add(run, g); open = false; }
             }
             if (open) add(run, hi);
+            if (track::HotPagesOn()) { track::Guard guard; if (auto hot = track::hot.find(e.page); hot != track::hot.end()) hot->second = bytes == bytes_before ? hot->second + 1 : 0; }
         }
         if (!covered) { // the pool went away: leave the page to the game
             track::Guard guard;
             u8& state = *track::State(e.page);
             if (state == track::Protected) { track::MakeWritable(e.page); state = track::Untracked; }
+            if (state == track::Dirty && track::hot.erase(e.page)) state = track::Untracked; // (a hot page: dropped from the list next time)
         }
         if (e.shadow != track::NoShadow) freed.push_back(e.shadow);
     }
@@ -1688,6 +1719,7 @@ void ReportPoolStats() {
     if (const u64 faults = track::texture_write_faults.exchange(0)) RT_LOG("texture memory: %llu CPU-written pages, %llu re-uploads in 300 frames",
         (unsigned long long)faults, (unsigned long long)cpu_reuploads.exchange(0));
     if (!MirrorEnabled()) return;
+    if (track::HotPagesOn()) { track::Guard g; RT_LOG("hot pages: %zu left writable, %zu seen", track::hot.size(), track::heat.size()); }
     RT_LOG("device pool copies: %.0f MiB; per frame %.2f MiB uploaded (%.0f regions, %.0f write faults), %.2f MiB written back",
            mirrored_bytes / 1048576.0, track::uploaded.exchange(0) / 300.0 / 1048576.0, track::upload_regions.exchange(0) / 300.0,
            track::faults.exchange(0) / 300.0, track::written_back.exchange(0) / 300.0 / 1048576.0);
