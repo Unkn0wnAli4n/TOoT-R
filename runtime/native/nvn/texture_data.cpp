@@ -685,6 +685,7 @@ void UploadTexelsNow(Texture& t) {
             // CPU code: what its memory holds here is not a picture. In Castle Town a 3840x2160 one was "uploaded" 10 to
             // 30 times in 20 s of turning, 22 ms each: most of the hitches left there. OOT_UPLOAD_TARGETS=1: as before.)
             static const bool upload_targets = std::getenv("OOT_UPLOAD_TARGETS") != nullptr;
+            t.cleared_only = false;
             const bool target = !upload_targets && (t.flags & 0x8) && (range.pool->flags & 0x80);
             const bool depth = t.info.depth || t.info.stencil; // (a depth target: only as a target, never by its memory's look)
             u64 i = 0; if (!target && !depth) while (i < n && !w[i]) ++i;
@@ -696,7 +697,7 @@ void UploadTexelsNow(Texture& t) {
                     VkClearColorValue zero{}; if (t.decoded_rgb9e5) zero.float32[3] = 1.0f; // (RGB9E5 kept as RGBA16F: its alpha reads 1)
                     vkCmdClearColorImage(cmd, t.image, t.layout, &zero, 1, &all);
                 });
-                t.uploaded = true;
+                t.uploaded = true; t.cleared_only = true;
                 static std::atomic<u32> told{0}; if (told++ < 5) RT_LOG("texture %ux%u fmt %u (%.0f MiB): %s, cleared instead of uploaded", t.width, t.height, t.format, t.storage_size / 1048576.0, target ? "a render target the GPU has not drawn yet" : "its memory is empty");
                 return;
             }

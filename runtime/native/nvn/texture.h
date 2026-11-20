@@ -43,6 +43,7 @@ struct Texture : std::enable_shared_from_this<Texture> {
     VkImageUsageFlags usage = 0;
     bool gpu_written = false; // rendered to: contents live on the host GPU
     bool uploaded = false;
+    bool cleared_only = false; // (a render target nothing has drawn yet: its image only holds the clear it was given)
     bool lost_gpu_image = false; // (its image, drawn by the GPU, was let go while idle: a new one has nothing to upload)
     bool ahead_queued = false; // (texture_data.cpp: queued once for an upload ahead of its first draw)
     u64 registered_frame = 0;  // (when the game registered it for sampling)

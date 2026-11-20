@@ -835,6 +835,7 @@ void CreateImage(Texture& t) {
 
 } // namespace
 bool StealLiveImage(Texture& t); void NoteHolder(Texture& t); void ReportImageAges(); void ReuseOverlapping(Texture& t, bool take);
+void TrimClearedTargets();
 void EnsureImage(Texture& t) {
     // A finalized texture still used by recorded work keeps its image until that batch. One no shared owner
     // holds any more (a stale reference to an object on its way out, destroyed with its image) is not
@@ -1134,6 +1135,42 @@ void WantFullImage(Texture& t) {
     }
     t.skip = 0;
 }
+// A card short of memory (under 6 GB, its budget nearly used): a render target the GPU never drew into, unused for
+// 600 frames, lets its image go. It only held the clear it was given, and a new one is given the same clear when it is
+// used again, so nothing is lost. (A 12288x12288 depth target of 288 MiB is made and cleared once and then never used
+// in the fields and towns: 8% of a 4 GB card, whose new render targets went to the PC's memory for want of room.)
+// From the executor (the frame's report), as ReuseOverlapping lets go of idle images. OOT_KEEP_CLEARED_TARGETS=1: kept.
+void TrimClearedTargets() {
+    static const bool off = std::getenv("OOT_KEEP_CLEARED_TARGETS") != nullptr;
+    if (off || !SmallCard()) return;
+    u64 used = 0, budget = 0;
+    if (!VideoMemoryTight(&used, &budget)) return;
+    const u64 now = CurrentFrameNumber();
+    std::vector<Texture*> idle;
+    {
+        std::lock_guard lock{holders_mutex};
+        for (Texture* t : with_images)
+            if (t->image && t->allocation_size && t->cleared_only && !t->gpu_written && now - t->used_frame >= 600) idle.push_back(t);
+        for (Texture* t : idle) {
+            auto it = holders.find(KeyOf(*t)); if (it != holders.end() && it->second == t) holders.erase(it);
+            Unlist(t);
+        }
+    }
+    if (idle.empty()) return;
+    u64 bytes = 0;
+    for (Texture* t : idle) {
+        bytes += t->allocation_size;
+        auto* image = new Texture(*t);
+        t->image = VK_NULL_HANDLE; t->memory = VK_NULL_HANDLE; t->block = nullptr; t->view = VK_NULL_HANDLE; t->views.clear(); t->allocation_size = 0;
+        t->layout = VK_IMAGE_LAYOUT_UNDEFINED; t->uploaded = false; t->cleared_only = false; t->reupload_reason = 6;
+        image->object = 0; image->owner_finalized = false; image->gpu_retirement_pending = false;
+        DestroyLater(image);
+    }
+    ++binding_generation;
+    static u32 told = 0;
+    if (told++ < 20) RT_LOG("video memory tight (%llu of %llu MiB): %zu render targets nothing drew into released (%.0f MiB; made and cleared again if used)",
+                            (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20), idle.size(), bytes / 1048576.0);
+}
 void ReportImageAges() {
     std::lock_guard lock{holders_mutex};
     const u64 now = CurrentFrameNumber();
@@ -1219,6 +1256,7 @@ void ReportImageCache() {
      // (short of video memory: what is only kept for speed goes before an allocation fails and the picture stalls)
      if(tight){if(!KeepSparesWhenTight())DropSpareImages(8, 128ull << 20);static u32 told=0;if(told++<8)RT_LOG("video memory tight: %llu of %llu MiB the system allows in use; spare render targets released",(unsigned long long)(used>>20),(unsigned long long)(budget>>20));}
      if(budget)RT_LOG("video memory: %llu MiB in use of %llu MiB allowed",(unsigned long long)(used>>20),(unsigned long long)(budget>>20));}
+    TrimClearedTargets();
     RT_LOG("render target memory: %.1f per frame from spares, %.0f MiB spare", stat_memory_reused.exchange(0) / 300.0, spare_memory_bytes / 1048576.0);
     RT_LOG("images per frame: %.1f created (%.1f render targets), %.1f from spares; spares: %.1f kept, %.1f dropped over the budget, %.1f not kept; %.0f MiB spare",
            stat_images_created.exchange(0) / 300.0, stat_targets_created.exchange(0) / 300.0, stat_spare_hits.exchange(0) / 300.0,
