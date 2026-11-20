@@ -60,6 +60,11 @@ report what you find. PC (Linux and Windows) is the supported way to play for no
 
 - An x86-64 PC with a Vulkan 1.3 GPU and driver supporting `VK_EXT_external_memory_host`
   (current NVIDIA and AMD drivers do). 16 GB of RAM recommended for the build.
+- A graphics card with **6 GB of video memory or more** is recommended. Cards with **4 GB** run the
+  game at Texture Detail Lowest (picked automatically there), but busy areas such as Hyrule Field and
+  the Market can fill the card: expect lower frame rates and, after a while, the odd graphical glitch
+  (HUD pieces or the minimap drawn wrong) until the next area change. Future updates may improve
+  low-memory cards further, but that isn't promised.
 - Linux, or Windows 10 1809+ / Windows 11.
 - Your dump of the game as a single **`.nup`** file (title ID `0400486024DEC000`). Update **v131072**
   is the version this port is made and tested with. Other updates are not refused: the build finds
