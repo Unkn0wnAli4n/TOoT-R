@@ -53,6 +53,7 @@ struct Camera {
     float jitter[2]{};        // (the projection's offset of the picture's centre, in clip space: nx2/oot_jitter.py)
     uint32_t width = 0, height = 0;
     Texture* depth = nullptr;
+    Texture* color = nullptr;   // (TOoT:R: the scene's colour target, for prepare_from_scene)
     uint64_t depth_gen = 0;   // (texture_destroy_generation when taken: a depth texture destroyed since is not used)
     uint64_t frame = 0;       // (texture_frame_no when taken)
     bool valid = false;
@@ -69,6 +70,8 @@ struct State {
     bool tried = false;
     std::unordered_map<VkImage, VkImageView> depth_views;
     uint64_t depth_views_gen = 0;
+    std::unordered_map<VkImage, VkImageView> color_views;   // (TOoT:R: prepare_from_scene's)
+    uint64_t color_views_gen = 0;
     float last_vp[16]{};      // (the frame before's view-projection, and its jitter)
     float last_jitter[2]{};
     uint64_t last_frame = 0;  // (the frame prepare last ran, 0: none)
@@ -238,7 +241,9 @@ bool colour_pair(VkFormat input, VkFormat output) {
 
 void note_scene_draw(const Texture* color0, uint32_t width, uint32_t height, Texture* depth, uint64_t camera,
                      uint64_t camera_size) {
-    if (!color0 || !depth || !camera || camera_size < 0x230 || width < 640 || height < 360) return;
+    // (TOoT:R: from 320x180, not 640x360 - a Steam Deck in the Handheld profile at 38% draws its scene at 549x309; the
+    // camera's own target size below still tells a scene draw from the rest)
+    if (!color0 || !depth || !camera || camera_size < 0x230 || width < 320 || height < 180) return;
     if (!scene_format(color0->format) || !wanted()) return;
     State& s = st();
     std::lock_guard lk(s.mu);
@@ -256,7 +261,7 @@ void note_scene_draw(const Texture* color0, uint32_t width, uint32_t height, Tex
     std::memcpy(k.projection, c + 0x70 / 4, sizeof k.projection);
     // (the offset sead's projection gave the frustum, in its third column: 2 * offset, which moves the picture by -that)
     k.jitter[0] = -c[0x78 / 4], k.jitter[1] = -c[0x88 / 4];
-    k.width = width, k.height = height, k.depth = depth, k.depth_gen = texture_destroy_generation(), k.frame = now;
+    k.width = width, k.height = height, k.depth = depth, k.color = const_cast<Texture*>(color0), k.depth_gen = texture_destroy_generation(), k.frame = now;
     k.valid = true;
 }
 
@@ -369,6 +374,38 @@ bool prepare(VkCommandBuffer cmd, Texture* in, VkImageView in_view, Frame& out) 
     }
     out = f;
     return true;
+}
+
+// TOoT:R: the inputs made from the scene's own colour target, for frame generation alone, when the game's upscale did not
+// take the scene (prepare above needs its input to be the scene: in the Handheld profile at a low Render Resolution the
+// game first scales the scene up by a pass of its own - 549x309 into 1920x1080 on a Steam Deck at 38% - and frame
+// generation then had no inputs and made nothing). Called before the frames are made; nothing if this frame has them.
+bool prepare_from_scene(VkCommandBuffer cmd) {
+    Texture* color = nullptr; VkImageView view = VK_NULL_HANDLE;
+    {
+        State& s = st();
+        std::lock_guard lk(s.mu);
+        const uint64_t now = texture_frame_no();
+        if (s.have_frame && now - s.frame.frame <= 1) return true;
+        if (!s.cam.valid || now - s.cam.frame > 1 || !s.cam.color || s.cam.depth_gen != texture_destroy_generation()) return false;
+        color = s.cam.color;
+        if (auto it = s.color_views.find(color->image); it != s.color_views.end() && s.color_views_gen == texture_destroy_generation()) view = it->second;
+        else {
+            if (s.color_views_gen != texture_destroy_generation()) {
+                auto old = std::move(s.color_views); s.color_views.clear();
+                later([old] { for (const auto& [image, v] : old) vkDestroyImageView(dev.device, v, nullptr); });
+                s.color_views_gen = texture_destroy_generation();
+            }
+            VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vc.image = color->image, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = color->format;
+            vc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            if (vkCreateImageView(dev.device, &vc, nullptr, &view) != VK_SUCCESS) view = VK_NULL_HANDLE;
+            s.color_views[color->image] = view;
+        }
+    }
+    if (!view) return false;
+    Frame f;
+    return prepare(cmd, color, view, f);
 }
 
 bool take(Frame& out) {

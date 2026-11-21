@@ -255,6 +255,7 @@ int MakeFramesNow(VkCommandBuffer cmd, VkImage color, VkImageView view, uint32_t
         if (dlss_fg_holds()) return 0; // (no 3D this frame - a menu, a movie: the game's frame alone)
     }
     if (!fsr3fi::frames_wanted()) return 0;
+    fsr3_inputs::prepare_from_scene(cmd); // (the scene's own, when the game's upscale did not take it this frame)
     fsr3_inputs::Frame f;
     if (!fsr3_inputs::take(f)) { { static const bool log = std::getenv("OOT_UPSCALER_LOG") != nullptr; static int shown = 0; if (log && shown++ < 20) RT_LOG("frame generation: no inputs to take (frame %llu)", (unsigned long long)texture_frame_no()); } static bool said = false; if (!said) { said = true; RT_LOG("frame generation: no scene depth and motion this frame (a menu or a movie): the game's frames alone meanwhile"); } return 0; }
     fsr3fi::Inputs in;

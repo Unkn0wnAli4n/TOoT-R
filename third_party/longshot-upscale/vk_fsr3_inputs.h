@@ -64,6 +64,8 @@ bool prepare(VkCommandBuffer cmd, Texture* in, VkImageView in_view, Frame& out);
 
 /// The frame prepare made last, for frame interpolation at the present, once: false when none was made since the last take
 /// (or it is older than the frame before), so a present never interpolates with another frame's depth and motion
+/// (TOoT:R) The inputs from the scene's own colour target when the upscale did not make them this frame: true if there are some
+bool prepare_from_scene(VkCommandBuffer cmd);
 bool take(Frame& out);
 
 /// (longshot) The temporal chain's motion for this frame (vk_temporal.cpp: an engine's, or temporal_fg_inputs' with none), the

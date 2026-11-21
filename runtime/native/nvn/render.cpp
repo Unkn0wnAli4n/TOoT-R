@@ -3258,11 +3258,14 @@ void LsNoteDraw(Texture* colour, Texture* depth, VkExtent2D extent, u64 camera, 
         if (in_frame++ < 3) { ++shown; float c[0x230 / 4]{}; const bool read = camera_size >= 0x230 && LsReadSubmitted(camera, c, sizeof c);
             RT_LOG("upscaler: draw into %ux%u vk format %d (ours %u), depth %ux%u; camera %#llx+%#llx read %d: size %.0fx%.0f, w row %.1f %.1f %.1f %.1f; scene size ok %d", extent.width, extent.height, (int)colour->info.vk, colour->format, depth->width, depth->height,
                    (unsigned long long)camera, (unsigned long long)camera_size, (int)read, c[0x120 / 4], c[0x124 / 4], c[0xa0 / 4], c[0xa4 / 4], c[0xa8 / 4], c[0xac / 4], (int)mkwvk::temporal_scene_size(extent.width, extent.height)); } }
+    // (frame generation's inputs first: they check the draw against the camera's own target size and keep the frame's largest,
+    // so they need no upscaler's size rule - a scene a third of the output or smaller, as on a Steam Deck in the Handheld
+    // profile at 38% (732 wide, a 2560-wide output), was never taken, and frame generation made nothing)
+    mkwvk::fsr3_inputs::note_scene_draw(LsColour(*colour), extent.width, extent.height, ls::Texture(*depth), camera, camera_size);
     if (!mkwvk::temporal_scene_size(extent.width, extent.height)) return;
     if (ls_scene_frame != CurrentFrameNumber() || extent.width * extent.height >= ls_scene_w * ls_scene_h) { ls_scene_frame = CurrentFrameNumber(); ls_scene_depth = depth; ls_scene_w = extent.width; ls_scene_h = extent.height; }
     ls::SceneDepth(depth);
     mkwvk::temporal_note_scene_draw(LsColour(*colour), extent.width, extent.height, ls::Texture(*depth), camera, camera_size);
-    mkwvk::fsr3_inputs::note_scene_draw(LsColour(*colour), extent.width, extent.height, ls::Texture(*depth), camera, camera_size); // (frame generation's inputs)
 }
 // A skinned draw into the scene, for the chain's actor motion (Longshot's vk_draw.cpp skin_check, for this renderer's
 // state): the game's characters and what moves by itself are indexed draws of one vertex stream - the position at
