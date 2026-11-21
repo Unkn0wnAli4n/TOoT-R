@@ -2644,6 +2644,7 @@ thread_local SegmentOutput* resolve_out=nullptr;
 // the scene by - some 250 draws a frame in Castle Town, a tenth of all. The settings window's Light Probe row draws it
 // every 2nd or 4th frame instead: its clears and draws are left out in the frames between, so it keeps the last one's
 // picture (the passes that filter it run as before). OOT_PROBE_RATE=<n> overrides.
+bool PassClearsWanted(){static const bool on=[]{const char* e=std::getenv("OOT_PASS_CLEARS");return e&&std::atoi(e)!=0&&!std::getenv("OOT_PASS_HAZARDS");}();return on;}
 bool ProbeFrameSkipped(){
     static const int env=std::getenv("OOT_PROBE_RATE")?std::atoi(std::getenv("OOT_PROBE_RATE")):0;
     const int every=env?env:gfx::Current().probe_rate;
@@ -3116,8 +3117,11 @@ void Draw(const Command& command) {
         static const bool no_copy=std::getenv("OOT_ASYNC_NOCOPY")!=nullptr; // (diagnosis, with OOT_ASYNC_SYNC or _INLINE only)
         if(async_draw&&pk.write_count&&!no_copy)pk.OwnWrites();
         const auto pass_cpu_start = profile_cpu ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        {std::array<VkImageView,8> views{};for(u32 i=0;i<(*tls_state).color_count;++i)views[i]=attachments[i].imageView;
+         PrepareHeldClears(key,views.data(),(*tls_state).color_count,depth?da.imageView:VK_NULL_HANDLE,depth&&depth->info.depth,depth&&depth->info.stencil,extent);}
         PassDraw(key,[&](VkCommandBuffer cmd){
             begin(cmd);
+            {std::array<VkImageView,8> views{};for(u32 i=0;i<(*tls_state).color_count;++i)views[i]=attachments[i].imageView;ApplyHeldClears(cmd,views.data(),(*tls_state).color_count,extent);}
             if(count_samples){ // the pass instance's first occlusion segment
                 const u32 q=samples.next++;vkCmdBeginQuery(cmd,samples.pool,q,VK_QUERY_CONTROL_PRECISE_BIT);gpu_counters.segment_query=q;
                 SetPassEndHook([q](VkCommandBuffer c){vkCmdEndQuery(c,samples.pool,q);gpu_counters.segment_query=~0u;});}
@@ -3735,6 +3739,13 @@ bool ExecuteRenderCommand(const Command& command) {
         if(LogThisFrame()){float f[4];std::memcpy(f,data,16);RT_LOG("clear color %llu target %#llx %ux%u fmt %u to (%g %g %g %g)",(unsigned long long)x[0],(unsigned long long)object,t.width,t.height,t.format,f[0],f[1],f[2],f[3]);}
         if(x[2]!=15)Fatal("partial color clear requires attachment clear");
         if(predicate!=~0u){PredicatedClear(predicate,inverted,&t,(*tls_state).targets.color_views[x[0]],VK_IMAGE_ASPECT_COLOR_BIT,data,0,0);t.gpu_written=true;break;}
+        {// (OOT_PASS_CLEARS: held for the next pass, when it is the whole of one layer and the image is ready to draw into)
+         const auto& view=(*tls_state).targets.color_views[x[0]];
+         if(PassClearsWanted()&&t.layout==VK_IMAGE_LAYOUT_GENERAL&&view.layers_count<=1){
+            const VkImageView v=AttachmentView(t,view);VkClearValue value{};std::memcpy(&value.color,data,16);
+            const VkImage image=t.image;const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,view.levels_base,1,view.layers_base,1};const VkClearColorValue color=value.color;
+            if(v&&HoldClear(v,VK_IMAGE_ASPECT_COLOR_BIT,value,{std::max(1u,t.width>>view.levels_base),std::max(1u,t.height>>view.levels_base)},
+                [image,range,color](VkCommandBuffer cmd){vkCmdClearColorImage(cmd,image,VK_IMAGE_LAYOUT_GENERAL,&color,1,&range);})){t.gpu_written=true;break;}}}
         Immediate([&](VkCommandBuffer cmd){Transition(cmd,t,VK_IMAGE_LAYOUT_GENERAL);VkClearColorValue color;std::memcpy(&color,data,16);
             const auto& view=(*tls_state).targets.color_views[x[0]];VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,view.levels_base,1,view.layers_base,view.layers_count?view.layers_count:1};
             vkCmdClearColorImage(cmd,t.image,t.layout,&color,1,&range);});t.gpu_written=true;break;
@@ -3747,6 +3758,11 @@ bool ExecuteRenderCommand(const Command& command) {
         const auto& view=(*tls_state).targets.depth_view;
         VkImageAspectFlags aspect=(x[0]?VK_IMAGE_ASPECT_DEPTH_BIT:0)|(x[2]?VK_IMAGE_ASPECT_STENCIL_BIT:0);aspect &= AspectOf(t);if(!aspect)break;
         if(predicate!=~0u){++frame_clears_predicated;PredicatedClear(predicate,inverted,&t,view,aspect,nullptr,command.f[0],(u32)x[1]);t.gpu_written=true;break;}
+        if(PassClearsWanted()&&t.layout==VK_IMAGE_LAYOUT_GENERAL&&view.layers_count<=1){ // (OOT_PASS_CLEARS: as the colour clear)
+            const VkImageView v=AttachmentView(t,view);VkClearValue cv{};cv.depthStencil={command.f[0],(u32)x[1]};
+            const VkImage image=t.image;const VkImageSubresourceRange range{aspect,view.levels_base,1,view.layers_base,1};const VkClearDepthStencilValue value=cv.depthStencil;
+            if(v&&HoldClear(v,aspect,cv,{std::max(1u,t.width>>view.levels_base),std::max(1u,t.height>>view.levels_base)},
+                [image,range,value](VkCommandBuffer cmd){vkCmdClearDepthStencilImage(cmd,image,VK_IMAGE_LAYOUT_GENERAL,&value,1,&range);})){t.gpu_written=true;break;}}
         Immediate([&](VkCommandBuffer cmd){Transition(cmd,t,VK_IMAGE_LAYOUT_GENERAL);VkClearDepthStencilValue value{command.f[0],(u32)x[1]};
             VkImageSubresourceRange range{aspect,view.levels_base,1,view.layers_base,view.layers_count?view.layers_count:1};vkCmdClearDepthStencilImage(cmd,t.image,t.layout,&value,1,&range);});t.gpu_written=true;break;
     }
@@ -4392,6 +4408,8 @@ void CommitResolvedDraw(DrawPacket& pk){
     if(pk.depth_target)pk.depth_target->gpu_written=true;
     const bool count_samples=gpu_counters.ready&&samples.enabled;
     static const bool async_enabled=AsyncDrawsEnabled();
+    {std::array<VkImageView,8> views{};for(u32 i=0;i<pk.color_count;++i)views[i]=pk.attachments[i].imageView;
+     PrepareHeldClears(pk.key,views.data(),pk.color_count,pk.depth_target?pk.da.imageView:VK_NULL_HANDLE,pk.depth_target&&pk.depth_target->info.depth,pk.depth_target&&pk.depth_target->info.stencil,pk.extent);}
     PassDraw(pk.key,[&](VkCommandBuffer cmd){
         for(auto* color:pk.colors)if(color&&color->layout!=VK_IMAGE_LAYOUT_GENERAL)Transition(cmd,*color,VK_IMAGE_LAYOUT_GENERAL);
         Texture* const depth=pk.depth_target;
@@ -4399,6 +4417,7 @@ void CommitResolvedDraw(DrawPacket& pk){
         VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};ri.renderArea.extent=pk.extent;ri.layerCount=1;ri.colorAttachmentCount=pk.color_count;ri.pColorAttachments=pk.attachments.data();
         if(depth&&depth->info.depth)ri.pDepthAttachment=&pk.da;if(depth&&depth->info.stencil)ri.pStencilAttachment=&pk.da;
         vkCmdBeginRendering(cmd,&ri);
+        {std::array<VkImageView,8> views{};for(u32 i=0;i<pk.color_count;++i)views[i]=pk.attachments[i].imageView;ApplyHeldClears(cmd,views.data(),pk.color_count,pk.extent);}
         if(count_samples){ // the pass instance's first occlusion segment (as Draw)
             const u32 q=samples.next++;vkCmdBeginQuery(cmd,samples.pool,q,VK_QUERY_CONTROL_PRECISE_BIT);gpu_counters.segment_query=q;
             SetPassEndHook([q](VkCommandBuffer c){vkCmdEndQuery(c,samples.pool,q);gpu_counters.segment_query=~0u;});}

@@ -25,6 +25,11 @@ bool GpuProfilingNow();
 // ends the instance. Within an instance rasterization order keeps attachment accesses ordered.
 // Whether the open batch has a render pass instance open with this key (PassDraw would reuse it).
 bool PassOpenWithKey(const std::vector<u64>& key);
+// Clears held for the next pass (OOT_PASS_CLEARS): HoldClear true = held (`record` runs as before if it cannot go into
+// the pass); before a draw pass PrepareHeldClears records the ones it cannot take, and its begin calls ApplyHeldClears.
+bool HoldClear(VkImageView view, VkImageAspectFlags aspect, const VkClearValue& value, VkExtent2D extent, std::function<void(VkCommandBuffer)> record);
+void PrepareHeldClears(const std::vector<u64>& key, const VkImageView* colors, u32 count, VkImageView depth, bool has_depth, bool has_stencil, VkExtent2D extent);
+void ApplyHeldClears(VkCommandBuffer cmd, const VkImageView* colors, u32 count, VkExtent2D extent);
 // What a draw accesses (textures by host object, guest memory ranges): a render pass whose first draw
 // conflicts with nothing recorded since the last full barrier begins without one (no pipeline drain).
 struct PassAccess {

@@ -233,7 +233,22 @@ struct Unsynced {
         global_read |= a.global_read; global_write |= a.global_write;
     }
 } unsynced;
-u64 stat_passes_unbarriered = 0;
+u64 stat_passes_unbarriered = 0, stat_passes_relaxed = 0;
+// Draw passes only since the last full barrier (nothing else recorded: no copy, clear, dispatch or upload). A new pass then
+// starts with a barrier that waits only for fragment work, not everything (RelaxedPassBarriers). draw_begin_pending: the
+// full barrier being made is for a draw pass.
+bool only_draws_since_full = false, draw_begin_pending = false;
+// OOT_RELAXED_PASS_BARRIERS=1: passes that follow only draw passes start with the fragment-stage barrier.
+bool RelaxedPassBarriers() { static const bool on = [] { const char* e = std::getenv("OOT_RELAXED_PASS_BARRIERS"); return e && std::atoi(e) != 0; }(); return on; }
+
+// ---- clears in the pass that follows (OOT_PASS_CLEARS=1) ----
+// A clear of a draw target was its own piece of work: the open pass ended, a full barrier, the clear, and a new pass with
+// another full barrier for the draws into it. Held instead, it becomes the first command of the next pass when that pass
+// draws into the cleared view at its size (as the other renderer of this game does); in every other case - other work,
+// a submission, the pass already open, a different target - it is recorded as before, ahead of that.
+struct HeldClear { VkImageView view; VkImageAspectFlags aspect; VkClearValue value; VkExtent2D extent; std::function<void(VkCommandBuffer)> record; };
+std::vector<HeldClear> held_clears; std::vector<u64> held_key; bool flushing_held = false; u64 stat_clears_in_pass = 0, stat_clears_held = 0;
+bool PassClears() { static const bool on = [] { const char* e = std::getenv("OOT_PASS_CLEARS"); return e && std::atoi(e) != 0 && !std::getenv("OOT_PASS_HAZARDS"); }(); return on; }
 } // namespace
 // ---- the recorder thread (PassDraw's async draws) ----
 namespace {
@@ -422,12 +437,15 @@ void EndPass() {
     EndPassLocked();
 }
 
+void FlushHeldClears(); // (batch lock held)
 // Opens the batch command buffer, or orders the next work after everything recorded so far.
 void BeginWork() {
     auto& vk = Vk();
+    if (!held_clears.empty() && !draw_begin_pending) FlushHeldClears(); // (a draw pass's own: its begin takes them)
     ++record_serial;
     ++other_serial;
     EndPassLocked();
+    only_draws_since_full = draw_begin_pending; draw_begin_pending = false; // (a full barrier follows: what comes after it decides)
     if (!batch.cmd) {
         VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
         FreeDeadCommands(); // (no batch is open: nothing records)
@@ -467,6 +485,50 @@ void BeginWork() {
     }
 }
 
+void FlushHeldClears() {
+    if (flushing_held) return;
+    flushing_held = true;
+    auto held = std::move(held_clears); held_clears.clear();
+    for (auto& c : held) Immediate(c.record);
+    flushing_held = false;
+}
+bool HoldClear(VkImageView view, VkImageAspectFlags aspect, const VkClearValue& value, VkExtent2D extent, std::function<void(VkCommandBuffer)> record) {
+    if (!PassClears() || !view || GpuProfiling()) return false;
+    std::lock_guard lock{BatchMutex()};
+    if (!batch.cmd) return false;
+    for (const auto& c : held_clears) if (c.view == view) { FlushHeldClears(); break; } // (a second clear of it: in order)
+    EndPassLocked(); // (no draw of the open pass may come after the clear unseen)
+    held_clears.push_back({view, aspect, value, extent, std::move(record)});
+    ++stat_clears_held;
+    return true;
+}
+void PrepareHeldClears(const std::vector<u64>& key, const VkImageView* colors, u32 count, VkImageView depth, bool has_depth, bool has_stencil, VkExtent2D extent) {
+    std::lock_guard lock{BatchMutex()};
+    if (held_clears.empty()) return;
+    held_key = key;
+    // (the pass still open: these clears come after its draws - recorded as before, which ends it)
+    if (batch.cmd && batch.pass_open && batch.pass_key == key) { FlushHeldClears(); return; }
+    const auto fits = [&](const HeldClear& c) {
+        if (c.extent.width != extent.width || c.extent.height != extent.height) return false;
+        if (c.aspect == VK_IMAGE_ASPECT_COLOR_BIT) { for (u32 i = 0; i < count; ++i) if (colors[i] == c.view) return true; return false; }
+        return c.view == depth && (!(c.aspect & VK_IMAGE_ASPECT_DEPTH_BIT) || has_depth) && (!(c.aspect & VK_IMAGE_ASPECT_STENCIL_BIT) || has_stencil);
+    };
+    bool all = true; for (const auto& c : held_clears) all = all && fits(c);
+    if (!all) FlushHeldClears(); // (keep it simple: any that does not fit, all in order as before)
+}
+void ApplyHeldClears(VkCommandBuffer cmd, const VkImageView* colors, u32 count, VkExtent2D extent) {
+    // (batch lock held: inside PassDraw's begin)
+    if (held_clears.empty() || flushing_held) return;
+    for (const auto& c : held_clears) {
+        VkClearAttachment a{}; a.aspectMask = c.aspect; a.clearValue = c.value;
+        if (c.aspect == VK_IMAGE_ASPECT_COLOR_BIT) { for (u32 i = 0; i < count; ++i) if (colors[i] == c.view) a.colorAttachment = i; }
+        const VkClearRect rect{{{0, 0}, extent}, 0, 1};
+        vkCmdClearAttachments(cmd, 1, &a, 1, &rect);
+        ++stat_clears_in_pass;
+    }
+    held_clears.clear();
+}
+
 bool PassOpenWithKey(const std::vector<u64>& key) {
     if (resolve_worker) return true; // (its draws go into one pass per key when they are committed)
     std::lock_guard lock{BatchMutex()};
@@ -486,6 +548,7 @@ void PassDraw(const std::vector<u64>& key, const std::function<void(VkCommandBuf
             vkCmdEndRendering(cmd); }, profile_key);
         return;
     }
+    if (!held_clears.empty() && (held_key != key || (batch.pass_open && batch.pass_key == key))) FlushHeldClears(); // (not prepared for this pass)
     if (!batch.cmd || !batch.pass_open || batch.pass_key != key) {
         if (batch.cmd && !batch.pass_open && batch.light_only && batch.ended_pass_key == key) {
             // Same attachments as the pass that just ended, with only light work in between:
@@ -506,7 +569,17 @@ void PassDraw(const std::vector<u64>& key, const std::function<void(VkCommandBuf
             if (batch.cmd && (no_barrier || (!always_barrier && access && !unsynced.Conflicts(*access)))) {
                 // (independent of everything since the last full barrier: no drain)
                 EndPassLocked(); ++record_serial; ++other_serial; ++stat_passes_unbarriered;
-            } else { work_kind = 2; BeginWork(); }
+            } else if (batch.cmd && only_draws_since_full && RelaxedPassBarriers()) {
+                // (only draw passes since the last full barrier: their attachment and storage writes ordered before this
+                // pass's fragment work - the barrier the other renderer of this game uses there)
+                EndPassLocked(); ++record_serial; ++other_serial; ++stat_passes_relaxed;
+                VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+                barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+                vkCmdPipelineBarrier(batch.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                     VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+                batch.light_only = false;
+            } else { work_kind = 2; draw_begin_pending = true; BeginWork(); }
         }
         if (batch.hoist_live) { if (batch.hoist_pass_begun) batch.hoist_live = false; else batch.hoist_pass_begun = true; } // (the split's own pass, once)
         if (batch_trace_fd >= 0) TraceItem('p', profile_key);
@@ -528,8 +601,10 @@ u64 OtherWorkSerial() { return other_serial; } // (batch lock held by the caller
 
 bool ImmediateUnordered(const std::function<void(VkCommandBuffer)>& record, u64 serial) {
     std::lock_guard lock{BatchMutex()};
+    if (!held_clears.empty()) return false; // (ordered work, after the held clears)
     if (GpuProfiling() || !batch.cmd || batch.pass_open || serial != record_serial) return false;
     ++stat_items; ++stat_unordered;
+    only_draws_since_full = false;
     batch.hoist_live = false;
     batch.light_only = false;
     unsynced.unknown = true;
@@ -541,9 +616,11 @@ bool ImmediateUnordered(const std::function<void(VkCommandBuffer)>& record, u64 
 
 void ImmediateLight(const std::function<void(VkCommandBuffer)>& record) {
     std::lock_guard lock{BatchMutex()};
+    if (!held_clears.empty()) FlushHeldClears();
     ++stat_items;
     if (GpuProfiling() || !batch.cmd) { Immediate(record); return; }
     const bool light = batch.pass_open || batch.light_only;
+    only_draws_since_full = false;
     batch.hoist_live = false;
     if (batch_trace_fd >= 0) TraceItem('l', TraceCaller(__builtin_return_address(0)));
     EndPassLocked();
@@ -557,7 +634,8 @@ void ImmediateLight(const std::function<void(VkCommandBuffer)>& record) {
 VkCommandBuffer SplitForHoist() {
     std::lock_guard lock{BatchMutex()};
     auto& vk = Vk();
-    if (!batch.cmd || batch.pass_open || GpuProfiling()) return VK_NULL_HANDLE;
+    if (!batch.cmd || batch.pass_open || GpuProfiling() || !held_clears.empty()) return VK_NULL_HANDLE;
+    only_draws_since_full = false; // (a new command buffer: its first pass takes the full barrier)
     VkCommandBuffer made[2];
     {
         VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -650,9 +728,10 @@ std::atomic<u64> flush_count{0};
 u64 FlushCount() { return flush_count.load(); }
 void ReportDeviceAhead();
 void ReportBatchStats() {
-    RT_LOG("batch structure per frame: %.1f render passes (%.1f reopened cheaply), %.1f full barriers (%.1f compute dispatches recorded without one), %.1f other items",
-           stat_passes / 300.0, stat_reopens / 300.0, stat_full_barriers / 300.0, stat_unordered / 300.0, stat_items / 300.0);
-    stat_unordered = 0;
+    RT_LOG("batch structure per frame: %.1f render passes (%.1f reopened cheaply, %.1f with a fragment-stage barrier), %.1f full barriers (%.1f compute dispatches recorded without one), %.1f other items",
+           stat_passes / 300.0, stat_reopens / 300.0, stat_passes_relaxed / 300.0, stat_full_barriers / 300.0, stat_unordered / 300.0, stat_items / 300.0);
+    if (stat_clears_held) RT_LOG("clears held for the next pass: %.1f per frame, %.1f of them made in it", stat_clears_held / 300.0, stat_clears_in_pass / 300.0);
+    stat_unordered = 0; stat_passes_relaxed = 0; stat_clears_held = stat_clears_in_pass = 0;
     ReportPoolStats();
     ReportDeviceAhead();
     RT_LOG("guest blocked on the GPU per frame: %.2f ms in sync waits, %.2f ms in readbacks, %.2f ms in queue finishes",
@@ -785,6 +864,7 @@ void StartRetirer();
 void Submit() {
     std::lock_guard lock{BatchMutex()};
     auto& vk = Vk();
+    if (!held_clears.empty()) FlushHeldClears();
     if (batch.cmd && batch.pre_submit_hook) batch.pre_submit_hook();
     if (!batch.cmd) return;
     ++flush_count; ++record_serial; ++other_serial;
